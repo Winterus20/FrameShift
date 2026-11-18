@@ -324,6 +324,40 @@ Medya kütüphanesi, çok katmanlı timeline, önizleme, seçili öğenin özell
 
 Önce motor odağı korunur; UI bağımsız çekirdeğin üzerine gelir. Başlangıç stack'i Rust + wgpu/WGSL + FFmpeg + OpenColorIO ve Skia/uygun text-vector alternatifi olarak korunuyor. Bu kayıt kod yazma, dependency kurma veya prototip başlatma yetkisi değildir; yalnız tasarım notları güncellenmiştir.
 
+## Anlamsal edit işlemleri: olay ve kısıt tabanlı zamanlama
+
+Kullanıcı bu yaklaşımın proje tasarımına eklenmesini onayladı. Bu bir tasarım hedefidir; çalışan bir işlem/API veya genel amaçlı çözücü henüz yoktur.
+
+### Sorumluluk ayrımı
+
+- Serbest metindeki niyeti agent yorumlar. Motor doğal dil veya estetik yargı üretmek zorunda değildir.
+- Agent niyeti açık kaynak/hedef işaretleri, parametreler ve ölçülebilir kısıtlara dönüştürür.
+- Motor kaynak-zaman haritasını, bağımlılıkları ve teknik geçerliliği deterministik olarak hesaplar; sonuç görsel/işitsel incelemeyle ayrıca değerlendirilir.
+
+### İlk odak: kaynak impact işaretini hedef zamana hizalama
+
+1. Klipte önemli kaynak anı işaretlenir; örneğin yumruğun temas ettiği kare. İnsan, görsel model veya analiz aracı bu işareti sağlayabilir. İşaretin anlamını otomatik doğru bulma garantisi yoktur.
+2. Müzikte hedef beat/drop/impact zamanı seçilir; otomatik tespit ile kullanıcı işareti ayırt edilir.
+3. Agent kullanılabilir kaynak aralığını, çıktı aralığını, hız sınırlarını ve önerilen hız eğrisini belirtir.
+4. Motor hedef çıktı anındaki kaynak-zaman eşlemesinin kaynak impact işaretine karşılık gelmesini sağlar. Hızlanma/yavaşlama bu ankrajı koruyacak biçimde kurulmalıdır.
+5. Zaman tabanı, kaynak kare/PTS seçimi, kesirli zaman ve tolerans sözleşmeleri henüz belirlenmedi; birebir kare doğruluğu uygulanmadan garanti edilmiş sayılmaz.
+
+### Olaylara bağlı animasyonlar
+
+Glow, flash, shake veya yazı yalnız sabit bir saniyeye değil, bir olay kimliğine göre zaman ofsetiyle bağlanabilir. Olay çıktı zamanında taşınırsa bağlı animasyonların zamanlaması yeniden hesaplanır; ilgisiz keyframe'ler kendiliğinden taşınmaz. Kaynak görüntüyü izleyen maske/tracking verisi kaynak zamanı üzerinden değerlendirilir; çıktı olayına bağlı animasyonla karıştırılmaz. Bağımlılıklar ve kısıtlar sorgulanabilir olmalıdır.
+
+### Geçersiz veya çelişkili istekler
+
+Yetersiz kaynak aralığı, izin verilen hız sınırları veya çelişkili ankrajlar nedeniyle çözüm bulunamayabilir. Motor ihlal edilen koşulları ve değiştirilebilecek seçenekleri raporlamalı; kaynak aralığı, hedef zaman veya hız sınırını agent/kullanıcı izni olmadan sessizce değiştirmemeli. Değişiklik sürüm/undo ve etkilenen aralık raporuyla ilişkilendirilmeli.
+
+### Öznel isteklerin sınırı
+
+Yüzün okunabilir kalması gibi hedefler; yüzün kadrajda bulunması, boyutu, korunacak süre ve blur sınırı gibi ölçülebilir koşullara agent tarafından ayrıştırılabilir. Bu kontroller estetik okunabilirliğin tam kanıtı değildir. Kaynak marker tespiti, motorun kısıtları uygulaması ve son render'ın değerlendirilmesi ayrı doğrulama katmanlarıdır.
+
+### Aşamalı kapsam
+
+Başlangıçta genel amaçlı evrensel bir kısıt çözücü yerine kaynak işaretini hedef zamana hizalama ve açıkça bağlı efektleri taşıma işlemi hedeflenir. İşaret kimlikleri, zaman aralıkları, hız eğrileri ve doğrulama raporlarının kesin şemaları motor tasarımında belirlenecektir. Kod veya dependency eklenmedi.
+
 ## Açık kararlar
 
 - Nihai ürün adı ve hedef kullanıcı kapsamı.
