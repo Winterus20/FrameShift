@@ -358,6 +358,40 @@ Yüzün okunabilir kalması gibi hedefler; yüzün kadrajda bulunması, boyutu, 
 
 Başlangıçta genel amaçlı evrensel bir kısıt çözücü yerine kaynak işaretini hedef zamana hizalama ve açıkça bağlı efektleri taşıma işlemi hedeflenir. İşaret kimlikleri, zaman aralıkları, hız eğrileri ve doğrulama raporlarının kesin şemaları motor tasarımında belirlenecektir. Kod veya dependency eklenmedi.
 
+## Yaratıcı yönetmen katmanı: karar üretme ve değerlendirme döngüsü
+
+Kullanıcı yaratıcı kararları agent'ın vermesi gerektiğini vurguladı ve bu sistem önerisinin tasarım notlarına eklenmesini istedi. Bu bölüm uygulanmış özellik veya iyi edit garantisi değildir. Motorun teknik yetenekleri ile agent'ın yaratıcı değerlendirmesi ayrı sorumluluklardır.
+
+### Materyali anlama
+
+Agent kaynakları karakter/olay, hareket başlangıcı ve zirvesi, bakış/hareket yönü, kompozisyondaki boş alan, duygu ve görsel yoğunluk bakımından inceleyebilmeli. Kod teknik ölçümleri, uygun görsel/video/ses modeli anlam ve yorumları sağlayabilir. Gözlem, tahmin, güven düzeyi ve kaynak zamanları ayrılmalı; yorum kesin gerçek sayılmamalı.
+
+### Referanstan görsel dil çıkarma
+
+Efekt adlarını kopyalamak yerine dikkat odağı, yoğunluğun değişimi, sahneler arası görsel süreklilik, sade bırakılan bölümler ve hareketin geçişlerde devamı analiz edilmeli. Çıktı bir efekt listesi değil, materyale uyarlanabilir bir görsel yaklaşım olmalı. Referansın yaratıcı niyeti kesin bilinemeyeceği için çıkarımlar taslak render'larla sınanmalı.
+
+### Alternatif yaklaşımlar ve hedefli denemeler
+
+Agent aynı materyale farklı yaratıcı yaklaşımlar üretebilmeli: karakter odaklı, grafik/kolaj odaklı veya impact/velocity odaklı gibi. Bunlar sabit zorunlu kategoriler değildir. Agent seçimin materyal ve brief'e neden uyduğunu açıklayabilmeli; her kararda kullanıcı onayı beklemesi gerekmez, mevcut yetki ve maliyet sınırları korunur. Önemli veya belirsiz bölüm için farklı kısa taslaklar render edilip karşılaştırılabilir; tüm videoyu her denemede yeniden üretmek zorunlu değildir.
+
+### Yaratıcı karar kaydı
+
+Her önemli karar; seçilen yaklaşım, gerekçe, kanıt/kaynak, korunacak özellikler ve kontrol edilecek risklerle ilişkilendirilmeli. Bu kayıt uzun kullanıcı raporu olmak zorunda değildir. Amaç sonraki revizyonda gerekçenin kaybolmaması ve onaylı kararların ilgisiz değişikliklerle bozulmamasıdır. Örnek: yüz ifadesi ana odak olduğundan yüzü kapatan grafik yoğunluğunu azalt; sonraki yoğun sahneye geçişi ayrıca kontrol et.
+
+### Eleştiri ve revizyon
+
+İnceleme aşaması şu sorularla somut sorun aramalı: dikkat odağı doğru mu; efekt hareketi destekliyor mu gizliyor mu; sahne ve geçişler anlamlı mı; yoğunluk değişiyor mu; referansın mantığı mı yoksa yalnız yüzeyi mi aktarılmış? Teknik doğruluk ve estetik değerlendirme ayrı tutulmalı. Ayrı bir modelin beğenmesi objektif kalite kanıtı değildir. Görsel/video/ses erişimi olmayan model ilgili niteliği doğrulanmış saymamalı. Eleştiri belirli bölüm ve proje sürümüne bağlanmalı.
+
+### Kullanıcı tercihlerini öğrenme
+
+Kullanıcının geri bildirimi ilgili bölüm, alternatif ve değişiklikle ilişkilendirilmeli. Genel kullanıcı tercihi, projeye özgü tercih ve tek sahne kararı ayrı tutulmalı. Bir sahnede shake azaltılması gelecekteki bütün editlerde shake yasağına dönüştürülmemeli. Tercih modeli başlangıçta açık, düzenlenebilir kayıtlar olabilir; ayrı eğitim/fine-tuning sistemi seçilmiş değildir.
+
+### Yaratıcı yönergenin özü
+
+Efekt sayısını kaliteyle eşitleme. Materyali ve müziği incele; odak, ritim ve görsel dil için yaklaşım seç. Önemli efektin yaklaşımda bir görevi olsun. Belirsiz kararları kısa alternatif render'larla sınayıp karşılaştır. Onaylı kararları koru; görmediğin/duymadığın niteliği doğrulanmış sayma. Bu yönerge tek başına yeterli değildir; gerçek medya inceleme ve render araçlarıyla desteklenmelidir.
+
+Önerilen döngü: materyali anla -> görsel yaklaşım seç -> sahne planla -> hedefli kısa taslaklar üret -> karşılaştır -> revize et -> kullanıcı geri bildirimiyle tercih kayıtlarını güncelle. Bu tasarım genel bir başarı garantisi değil, yaratıcı kararları gerekçeli ve geliştirilebilir hâle getirme hedefidir. Kod veya dependency eklenmedi.
+
 ## Açık kararlar
 
 - Nihai ürün adı ve hedef kullanıcı kapsamı.
