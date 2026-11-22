@@ -1,0 +1,13 @@
+[package]
+name = "frameshift-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Media I/O, PTS probing, frame decoding, audio mixing/retime, and encoding for FrameShift"
+
+[dependencies]
+frameshift-time = { workspace = true }
+png = "0.18"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

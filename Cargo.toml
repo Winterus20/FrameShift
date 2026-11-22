@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/frameshift-time",
+    "crates/frameshift-schema",
+    "crates/frameshift-media",
+    "crates/frameshift-render",
+    "crates/frameshift-vector",
+    "crates/frameshift-core",
+    "crates/frameshift-cli",
+    "crates/frameshift-mcp",
+    "crates/frameshift-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+
+frameshift-time = { path = "crates/frameshift-time" }
+frameshift-schema = { path = "crates/frameshift-schema" }
+frameshift-media = { path = "crates/frameshift-media" }
+frameshift-render = { path = "crates/frameshift-render" }
+frameshift-vector = { path = "crates/frameshift-vector" }
+frameshift-core = { path = "crates/frameshift-core" }
+frameshift-mcp = { path = "crates/frameshift-mcp" }
+frameshift-app = { path = "crates/frameshift-app" }

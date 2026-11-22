@@ -1,0 +1,27 @@
+# Cargo / Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Local test media (copyrighted anime clips / music)
+/local_media
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.wav
+*.mp3
+*.flac
+*.aac
+
+# OS / Editor / Logs
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+*.tmp

@@ -1,0 +1,17 @@
+[package]
+name = "frameshift-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless wgpu/WGSL GPU compositor and temporal motion blur engine for FrameShift"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+frameshift-schema = { workspace = true }
+frameshift-time = { workspace = true }
+frameshift-vector = { workspace = true }
+glam = { version = "0.29", features = ["bytemuck"] }
+half = "2.7.1"
+pollster = "1.0.1"
+thiserror = { workspace = true }
+wgpu = "30.0.1"

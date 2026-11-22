@@ -1,0 +1,15 @@
+[package]
+name = "frameshift-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "JSON-RPC 2.0 MCP server and autonomous Agent Director verification for FrameShift"
+
+[dependencies]
+frameshift-core = { workspace = true }
+frameshift-media = { workspace = true }
+frameshift-schema = { workspace = true }
+frameshift-time = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
