@@ -11,6 +11,12 @@ struct SlugUniform {
     color_bottom: vec4<f32>,
     // x = gradient_angle_rad, y = hdr_intensity, z = opacity, w = dilate_px
     style_params: vec4<f32>,
+    // x = enabled, y = unit (0 grapheme, 1 word), z = range start, w = end-exclusive
+    selector: vec4<u32>,
+    // x = current time, y = start, z = duration, w = per-unit delay (seconds)
+    timing_seconds: vec4<f32>,
+    // x/y = initial position (canvas-height units), z = initial scale, w = initial opacity
+    from_style: vec4<f32>,
 }
 
 struct SlugGlyph {
@@ -20,6 +26,7 @@ struct SlugGlyph {
     vband_base: u32,
     hband_count: u32,
     vband_count: u32,
+    unit_ranges: vec4<u32>,
 }
 
 struct SlugBand {
@@ -60,12 +67,53 @@ struct VertexOutput {
     @location(0) em_pos: vec2<f32>,
     @location(1) block_uv: vec2<f32>,
     @location(2) @interpolate(flat) glyph_index: u32,
+    @location(3) @interpolate(flat) animation_opacity: f32,
+}
+
+fn glyph_animation(glyph: SlugGlyph) -> vec4<f32> {
+    if (u.selector.x == 0u) {
+        return vec4<f32>(0.0, 0.0, 1.0, 1.0);
+    }
+
+    var unit_start = glyph.unit_ranges.x;
+    var unit_end = glyph.unit_ranges.y;
+    if (u.selector.y == 1u) {
+        unit_start = glyph.unit_ranges.z;
+        unit_end = glyph.unit_ranges.w;
+    }
+    let selected = unit_end > unit_start
+        && unit_end > u.selector.z
+        && unit_start < u.selector.w;
+    if (!selected) {
+        return vec4<f32>(0.0, 0.0, 1.0, 1.0);
+    }
+
+    let selected_start = max(unit_start, u.selector.z);
+    let stagger = f32(selected_start - u.selector.z) * max(u.timing_seconds.w, 0.0);
+    let elapsed = u.timing_seconds.x - (u.timing_seconds.y + stagger);
+    var progress = 0.0;
+    if (u.timing_seconds.z > 0.0) {
+        progress = clamp(elapsed / u.timing_seconds.z, 0.0, 1.0);
+    } else if (elapsed >= 0.0) {
+        progress = 1.0;
+    }
+    let from_amount = 1.0 - progress;
+    return vec4<f32>(
+        u.from_style.x * from_amount,
+        u.from_style.y * from_amount,
+        mix(1.0, u.from_style.z, from_amount),
+        mix(1.0, u.from_style.w, from_amount),
+    );
 }
 
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     let dilate = max(u.style_params.w, 0.75);
-    let dilated = in.pos + in.normal_dir * dilate;
+    let glyph = glyphs[in.glyph_index];
+    let animation = glyph_animation(glyph);
+    let center = (glyph.bounds.xy + glyph.bounds.zw) * 0.5;
+    let shift = vec2<f32>(animation.x, -animation.y) * u.canvas_anchor.y;
+    let dilated = center + (in.pos - center) * animation.z + shift + in.normal_dir * dilate;
 
     let canvas_x = u.canvas_anchor.z + dilated.x;
     let canvas_y_down = u.canvas_anchor.w - dilated.y;
@@ -80,6 +128,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.em_pos = in.em_pos + in.normal_dir * dilate;
     out.block_uv = block_uv;
     out.glyph_index = in.glyph_index;
+    out.animation_opacity = animation.w;
     return out;
 }
 
@@ -226,7 +275,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let hdr = max(u.style_params.y, 0.0);
     let op = clamp(u.style_params.z, 0.0, 1.0);
 
-    let alpha = clamp(fill.a * cov * op, 0.0, 1.0);
+    let alpha = clamp(fill.a * cov * op * in.animation_opacity, 0.0, 1.0);
     let rgb = max(fill.rgb, vec3<f32>(0.0)) * hdr * alpha;
     return vec4<f32>(rgb, alpha);
 }

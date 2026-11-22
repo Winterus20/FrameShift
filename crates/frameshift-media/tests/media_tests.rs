@@ -288,6 +288,8 @@ fn ffmpeg_bridge_mp4_roundtrip_probe_and_seek() {
     let probe = FfmpegBridge::probe_media_info(&mp4_path).unwrap();
     assert_eq!(probe.width, width);
     assert_eq!(probe.height, height);
+    assert_eq!(probe.video_codec.as_deref(), Some("h264"));
+    assert_eq!(probe.pixel_format.as_deref(), Some("yuv420p"));
     assert!(probe.has_audio);
     assert_eq!(probe.pts_index.len(), frame_count);
 
@@ -549,6 +551,18 @@ fn proxy_manager_downscales_deterministically_and_preserves_pts_index() {
         .unwrap()
         .expect("proxy should resolve from cache");
     assert_eq!(resolved, synth_artifact);
+    let shifted_pts = PtsIndex::new(
+        expected_pts
+            .as_slice()
+            .iter()
+            .map(|tick| Flicks(tick.0 + 1))
+            .collect(),
+    )
+    .unwrap();
+    assert!(manager
+        .resolve_proxy("clip_a", spec, &shifted_pts)
+        .unwrap()
+        .is_none());
 
     // On-disk MP4 proxy generation preserves exact source PtsIndex.
     let source_mp4 = temp_dir.join("source.mp4");

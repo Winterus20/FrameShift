@@ -4,7 +4,31 @@
 
 FrameShift, mevcut video klipleri, görseller ve seslerden programatik olarak düzenlenebilir editler oluşturmayı hedefleyen bir masaüstü uygulaması ve headless motor projesidir. İlk görsel odak anime editleri, AMV ve yoğun motion graphics içeren kısa videolardır.
 
-> **Durum: tasarım ve araştırma aşaması.** Bu repo şu an yalnızca dokümantasyon içerir. Çalışan motor, masaüstü uygulaması, CLI/API, demo render veya kurulum paketi henüz yoktur. Aşağıdaki özellikler mevcut yetenekler değil, tasarım hedefleridir.
+> **Durum:** Rust GPU motoru ve headless CLI/MCP depoda yer alıyor. Güncel ürün kapsamı ve doğrulamalar [proje durumunda](brain/state.md) kayıtlı.
+
+Bu yol haritası dilimi headless API ve CLI kapsamındadır. `frameshift-app` ortak oturum, timeline projeksiyonu ve komut denetleyicisini sağlar; etkileşimli timeline penceresi henüz yoktur.
+
+## Headless hızlı başlangıç
+
+Rust, FFmpeg/ffprobe ve bir wgpu adaptörüyle sentetik Impact Cut akışını çalıştır:
+
+```sh
+cargo build --locked -p frameshift-cli
+target/debug/frameshift-cli init-impact --out target/impact.json
+target/debug/frameshift-cli preflight target/impact.json
+target/debug/frameshift-cli timeline target/impact.json
+target/debug/frameshift-cli autocut target/impact.json --range 1s..9s
+target/debug/frameshift-cli retarget target/impact.json drop_impact 4.25s 1 --out target/retimed.json
+target/debug/frameshift-cli speed-graph target/retimed.json clip_a 17
+target/debug/frameshift-cli export target/retimed.json target/impact.mp4 --profile draft --range 2s..6s
+```
+
+`retarget` hedef vuruşu ve klibin kaynak-zaman eşlemesini aynı revizyonda günceller. `autocut` vuruşlardan kesim noktaları önerir. `--write-events` işaretleri yazar; klip kesmek için `author_hard_cuts` komutu kullanılır.
+
+- **Oturum ve ajan kaydı.** `mcp-stdio <project.json> --out <edited.json>` aynı revizyon kontrollü proje komutlarını sunar. Geçerli `mutate_project` komutları otomatik uygulanır; eski revizyon reddedilir. Her başarılı değişiklik, önce/sonra yapısal anlık görüntüleri içeren fiş döndürür. MCP fişindeki sesli/görsel kanıt varsayılan olarak `not_generated` durumundadır; `--out` ile sunucu kapandığında düzenlenen proje ve `.edits.json` fiş/inceleme notu kaydı yazılır. `edit-run <project.json> <actions.json> --out <edited.json>` insan/ajan adımları, undo/redo, isteğe bağlı önce/sonra önizlemesi ve export kuyruğunu tek headless oturumda yürütür.
+- **Sabit export.** `export` proje revizyonu ile medya/font/LUT bağımlılık baytlarını iş başında sabitler; başarılı MP4'ü ffprobe ile doğrular ve `.export.json` raporu üretir. `export-set` ayrı kompozisyon geçişleri olarak birden fazla hedefi ve aynı süreç içindeki yerel yeniden denemeyi destekler. Kuyruk kalıcı bir servis değildir; süreç kapanınca bekleyen işler için yeniden başlatma kurtarması yoktur.
+- **Düzenlenebilir örnek.** `init-impact-template --out <package.json>` yerel Impact Cut paketini üretir. `template-open <package.json> <slots.json> --out <project.json>` tipli girdilerle bağımsız bir proje açar. `{}` paket varsayılanlarını kullanır. Paket grafikleri, iç içe precomp dâhil `CustomWgsl` çalışma zamanı shader düğümü içeremez; loader paket kodu çalıştırmaz.
+- **İnceleme ve efektler.** `timeline`, `speed-graph`, `snap`, `effect-presets`, `effect-inspect`, `effect-apply`, `effect-set-enabled`, `preview-benchmark`, `proxy`, `proxy-preview`, `media-manifest` ve `media-relink` JSON çıktısı verir. Gerçek video proxy'sinin önbellek anahtarı kaynak baytlarının SHA-256'sına bağlıdır; proxy önizlemesi varsayılan export kaynağı değildir. Sözdizimi için `frameshift-cli --help` kullan.
 
 ## Temel fikir
 
@@ -43,7 +67,7 @@ Kapsam aşamalı geliştirilecektir. Tam 3D, otomatik rotoskopi, tracking ve opt
 | Text/vector | Skia veya uygun alternatif; entegrasyon henüz seçilmedi |
 | Proje modeli | Bize ait sürümlenmiş edit formatı; şema henüz tasarlanmadı |
 
-Bu bileşenler henüz kurulmuş veya entegre edilmiş değildir. Desteklenecek işletim sistemleri/GPU'lar, donanım decode/encode, zero-copy yolları ve bağımlılık dağıtım koşulları doğrulanacaktır. UI teknolojisi seçilmemiştir.
+Bu tablo projenin başlangıç tasarımını gösterir. Güncel crate'ler, sözleşmeler ve doğrulama sonuçları [proje durumunda](brain/state.md) bulunur.
 
 ## Agent için geri bildirim
 

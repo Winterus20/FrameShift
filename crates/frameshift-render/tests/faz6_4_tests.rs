@@ -1409,6 +1409,7 @@ fn vector_text_renders_real_ttf_multiline_alignment_and_propagates_font_not_foun
                 glow_rgba: [0.0; 4],
                 hdr_intensity: 1.0,
                 gpu_slug: true,
+                text_animator: None,
             },
             inputs: vec![],
             enabled: true,

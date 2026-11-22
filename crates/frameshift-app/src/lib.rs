@@ -9,7 +9,9 @@
 pub mod controller;
 pub mod error;
 pub mod jobs;
+pub mod proposal;
 pub mod snapshot;
+pub mod timeline;
 
 pub use controller::{
     ActorKind, ClipEditAction, OptimisticLockGuard, UiActivityEntry, WorkspaceUiController,
@@ -19,4 +21,14 @@ pub use jobs::{
     BackgroundJob, BackgroundJobSupervisor, JobId, JobKind, JobState, WindowClosePolicy,
     WindowCloseReport,
 };
+pub use proposal::{
+    AgentActor, AgentEditReceipt, EventPosition, MovedEvent, NamedTickRange, NewReviewNote,
+    PreviewArtifactState, ProjectPreviewSnapshot, ReceiptPreview, ReviewNote, ReviewNoteFreshness,
+    ReviewNoteStore, ReviewNoteView, TickRange, apply_agent_command,
+};
 pub use snapshot::render_desktop_ui_snapshot;
+pub use timeline::{
+    PreviewRequestGate, PreviewTicket, SnapKind, SnapResult, SpeedGraphPoint,
+    TimelineAudioClipProjection, TimelineClipProjection, TimelineEventProjection,
+    TimelineProjection, snap_tick, source_output_speed_graph,
+};

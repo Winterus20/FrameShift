@@ -161,6 +161,62 @@ pub enum MatteMode {
     Luma,
 }
 
+/// Text range unit used by the headless `VectorText` animator.
+///
+/// `Grapheme` follows Unicode combining marks and joiner sequences; when shaping
+/// merges multiple units into a ligature, the selected range expands to the full
+/// shaped cluster. `Word` groups non-whitespace graphemes in logical text order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextSelectorUnit {
+    #[default]
+    Grapheme,
+    Word,
+}
+
+/// A deterministic in-animation applied to a logical range of shaped text units.
+///
+/// Tick values are integer FrameShift Flicks. Selected units start at `position_from_norm`,
+/// `scale_from`, and `opacity_from`; each advances toward the normal text style over
+/// `duration_ticks`, with `delay_ticks` staggered between adjacent units.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextAnimatorDef {
+    #[serde(default)]
+    pub unit: TextSelectorUnit,
+    #[serde(default)]
+    pub range_start: u32,
+    #[serde(default)]
+    pub range_end: Option<u32>,
+    #[serde(default)]
+    pub start_tick: i64,
+    #[serde(default)]
+    pub duration_ticks: i64,
+    #[serde(default)]
+    pub delay_ticks: i64,
+    #[serde(default)]
+    pub position_from_norm: [f32; 2],
+    #[serde(default = "default_one")]
+    pub scale_from: f32,
+    #[serde(default = "default_one")]
+    pub opacity_from: f32,
+}
+
+impl Default for TextAnimatorDef {
+    fn default() -> Self {
+        Self {
+            unit: TextSelectorUnit::Grapheme,
+            range_start: 0,
+            range_end: None,
+            start_tick: 0,
+            duration_ticks: 0,
+            delay_ticks: 0,
+            position_from_norm: [0.0, 0.0],
+            scale_from: 1.0,
+            opacity_from: 1.0,
+        }
+    }
+}
+
 /// Compositing blend modes for `Blend`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -478,6 +534,9 @@ pub enum NodeKind {
         hdr_intensity: f32,
         #[serde(default = "default_true")]
         gpu_slug: bool,
+        /// Optional grapheme/word range animator, evaluated at the current output tick.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text_animator: Option<TextAnimatorDef>,
     },
     /// Anti-aliased 2D vector path & HUD overlay generator with trim-path, dashes,
     /// node junction dots, and numeric data readout (0 inputs).
@@ -1699,6 +1758,7 @@ impl RenderGraphDef {
                 glow_radius_norm,
                 glow_rgba,
                 hdr_intensity,
+                text_animator,
                 ..
             } = &node.kind
             {
@@ -1809,7 +1869,9 @@ impl RenderGraphDef {
                 if !gradient_angle_deg.is_finite() {
                     return Err(SchemaError::InvalidVectorText {
                         node_id: node.id.clone(),
-                        message: format!("gradient_angle_deg ({gradient_angle_deg}) must be finite"),
+                        message: format!(
+                            "gradient_angle_deg ({gradient_angle_deg}) must be finite"
+                        ),
                     });
                 }
                 if !outer_outline_width_norm.is_finite() || *outer_outline_width_norm < 0.0 {
@@ -1857,6 +1919,41 @@ impl RenderGraphDef {
                             "hdr_intensity ({hdr_intensity}) must be finite and >= 0.0"
                         ),
                     });
+                }
+                if let Some(animator) = text_animator {
+                    if font_family.is_none() && font_path.is_none() {
+                        return Err(SchemaError::InvalidVectorText {
+                            node_id: node.id.clone(),
+                            message: "text_animator requires a TTF/OTF font_family or font_path for shaped cluster mapping".into(),
+                        });
+                    }
+                    if animator
+                        .range_end
+                        .is_some_and(|end| end < animator.range_start)
+                    {
+                        return Err(SchemaError::InvalidVectorText {
+                            node_id: node.id.clone(),
+                            message: "text_animator range_end must be >= range_start".into(),
+                        });
+                    }
+                    if animator.duration_ticks < 0 || animator.delay_ticks < 0 {
+                        return Err(SchemaError::InvalidVectorText {
+                            node_id: node.id.clone(),
+                            message: "text_animator duration_ticks and delay_ticks must be >= 0"
+                                .into(),
+                        });
+                    }
+                    if animator.position_from_norm.iter().any(|v| !v.is_finite())
+                        || !animator.scale_from.is_finite()
+                        || animator.scale_from < 0.0
+                        || !animator.opacity_from.is_finite()
+                        || !(0.0..=1.0).contains(&animator.opacity_from)
+                    {
+                        return Err(SchemaError::InvalidVectorText {
+                            node_id: node.id.clone(),
+                            message: "text_animator position, scale, and opacity must be finite; scale >= 0 and opacity in [0, 1]".into(),
+                        });
+                    }
                 }
                 if outer_outline_rgba.iter().any(|v| !v.is_finite())
                     || shadow_rgba.iter().any(|v| !v.is_finite())
@@ -1942,7 +2039,9 @@ impl RenderGraphDef {
                         if !(2..=128).contains(lut_size) {
                             return Err(SchemaError::InvalidLut3D {
                                 node_id: node.id.clone(),
-                                message: format!("lut_source.lut_size ({lut_size}) must be in 2..=128"),
+                                message: format!(
+                                    "lut_source.lut_size ({lut_size}) must be in 2..=128"
+                                ),
                             });
                         }
                     }
@@ -1950,7 +2049,9 @@ impl RenderGraphDef {
                         if !(2..=128).contains(lut_size) {
                             return Err(SchemaError::InvalidLut3D {
                                 node_id: node.id.clone(),
-                                message: format!("lut_source.lut_size ({lut_size}) must be in 2..=128"),
+                                message: format!(
+                                    "lut_source.lut_size ({lut_size}) must be in 2..=128"
+                                ),
                             });
                         }
                     }
@@ -2046,7 +2147,9 @@ impl RenderGraphDef {
                 ..
             } = &node.kind
             {
-                if points_norm.iter().any(|p| !p[0].is_finite() || !p[1].is_finite())
+                if points_norm
+                    .iter()
+                    .any(|p| !p[0].is_finite() || !p[1].is_finite())
                     || bezier_segments.iter().any(|seg| {
                         [seg.p0, seg.c1, seg.c2, seg.p1]
                             .into_iter()
@@ -2151,10 +2254,7 @@ impl RenderGraphDef {
                 if !camera.near.is_finite() || camera.near <= 0.0 {
                     return Err(SchemaError::InvalidScene3D {
                         node_id: node.id.clone(),
-                        message: format!(
-                            "camera.near ({}) must be finite and > 0.0",
-                            camera.near
-                        ),
+                        message: format!("camera.near ({}) must be finite and > 0.0", camera.near),
                     });
                 }
                 if !camera.far.is_finite() || camera.far <= camera.near {

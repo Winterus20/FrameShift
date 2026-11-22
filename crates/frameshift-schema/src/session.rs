@@ -1,9 +1,14 @@
 use crate::error::SchemaError;
-use crate::graph::{BlendMode, ColorSpace, GraphNodeDef, NodeId, NodeKind, SourceFit};
+use crate::graph::{
+    BlendMode, ColorSpace, GraphNodeDef, NodeId, NodeKind, RenderGraphDef, SourceFit,
+};
 use crate::project::{
     AssetDef, ClipDef, CreativeDecisionRecord, EventAnchorDef, PreferenceEntry, Project,
 };
-use frameshift_time::{Flicks, Rational32, SpeedCurve, TimeError};
+use frameshift_time::{
+    Flicks, ImpactCurveStyle, ImpactSolveRequest, ImpactSolver, Rational32, SourceFitMode,
+    SpeedCurve, SpeedCurveSpec, SpeedKeyframe, TimeError,
+};
 use serde::{Deserialize, Serialize};
 
 /// One shot in a hard-cut list.
@@ -37,6 +42,20 @@ pub enum ProjectCommand {
     RemoveClip {
         id: String,
     },
+    /// Updates the timeline bounds of a clip, advancing its source map when the
+    /// head is trimmed so the same source moment remains at the new start.
+    TrimClip {
+        clip_id: String,
+        new_timeline_start: Option<Flicks>,
+        new_timeline_end: Option<Flicks>,
+    },
+    /// Splits one clip into left and right ranges and routes every source node
+    /// that referenced the original clip through a transparent-aware blend.
+    SplitClip {
+        clip_id: String,
+        split_tick: Flicks,
+        right_clip_id: String,
+    },
     /// Writes an ordered, non-overlapping hard-cut list as the picture.
     ///
     /// Each cut becomes a `ClipDef` and a `SourceVideo`. Every cut after the
@@ -56,6 +75,31 @@ pub enum ProjectCommand {
     MoveEventTarget {
         event_id: String,
         new_target_output_tick: Flicks,
+    },
+    /// Moves an event target and, when the event has a linked source clip and
+    /// source anchor, solves a new bounded speed curve that aligns the source
+    /// impact with the requested output tick. The source bounds, speed range,
+    /// curve style, and fit policy are explicit so headless clients never rely
+    /// on implicit trim or speed choices. Anchors without a linked source keep
+    /// the simple move behavior.
+    RetargetEvent {
+        event_id: String,
+        new_target_output_tick: Flicks,
+        source_bounds_start: Flicks,
+        source_bounds_end: Flicks,
+        min_speed: f64,
+        max_speed: f64,
+        curve_style: ImpactCurveStyle,
+        source_fit: SourceFitMode,
+    },
+    /// Groups a node selection into one precomp graph node.
+    Precompose {
+        selected_node_ids: Vec<NodeId>,
+        precomp_node_id: NodeId,
+    },
+    /// Expands one precomp graph node back into its parent graph.
+    Unprecompose {
+        precomp_node_id: NodeId,
     },
     UpsertGraphNode(GraphNodeDef),
     RemoveGraphNode {
@@ -242,6 +286,20 @@ fn apply_to_project(project: &mut Project, cmd: ProjectCommand) -> Result<(), Sc
                 .ok_or_else(|| SchemaError::MissingClip(id.clone()))?;
             project.timeline.clips.remove(pos);
         }
+        ProjectCommand::TrimClip {
+            clip_id,
+            new_timeline_start,
+            new_timeline_end,
+        } => {
+            trim_clip(project, &clip_id, new_timeline_start, new_timeline_end)?;
+        }
+        ProjectCommand::SplitClip {
+            clip_id,
+            split_tick,
+            right_clip_id,
+        } => {
+            split_clip(project, &clip_id, split_tick, &right_clip_id)?;
+        }
         ProjectCommand::AuthorHardCuts { cuts } => {
             author_hard_cuts(project, &cuts)?;
         }
@@ -278,6 +336,65 @@ fn apply_to_project(project: &mut Project, cmd: ProjectCommand) -> Result<(), Sc
                 .find(|e| e.event_id == event_id)
                 .ok_or_else(|| SchemaError::MissingEvent(event_id.clone()))?;
             ev.target_output_tick = new_target_output_tick;
+        }
+        ProjectCommand::RetargetEvent {
+            event_id,
+            new_target_output_tick,
+            source_bounds_start,
+            source_bounds_end,
+            min_speed,
+            max_speed,
+            curve_style,
+            source_fit,
+        } => {
+            let event_index = project
+                .events
+                .iter()
+                .position(|event| event.event_id == event_id)
+                .ok_or_else(|| SchemaError::MissingEvent(event_id.clone()))?;
+
+            let linked_source = project.events[event_index]
+                .source_clip_id
+                .clone()
+                .zip(project.events[event_index].source_anchor_tick);
+            if let Some((source_clip_id, source_anchor_tick)) = linked_source {
+                let clip = project
+                    .timeline
+                    .clips
+                    .iter_mut()
+                    .find(|clip| clip.id == source_clip_id)
+                    .ok_or_else(|| SchemaError::MissingClip(source_clip_id.clone()))?;
+                let request = ImpactSolveRequest {
+                    source_bounds_start,
+                    source_bounds_end,
+                    source_impact: source_anchor_tick,
+                    output_start: clip.timeline_start,
+                    output_end: clip.timeline_end,
+                    target_output: new_target_output_tick,
+                    min_speed,
+                    max_speed,
+                    style: curve_style,
+                    fit_mode: source_fit,
+                };
+                let solution = ImpactSolver::solve(&request).map_err(|violation| {
+                    SchemaError::InvalidTimeline(format!(
+                        "cannot retarget event '{event_id}': {violation}"
+                    ))
+                })?;
+                clip.source_start = solution.effective_source_start;
+                clip.speed_curve = solution.speed_curve;
+            }
+
+            project.events[event_index].target_output_tick = new_target_output_tick;
+        }
+        ProjectCommand::Precompose {
+            selected_node_ids,
+            precomp_node_id,
+        } => {
+            crate::precomp::precompose(&mut project.graph, &selected_node_ids, precomp_node_id)?;
+        }
+        ProjectCommand::Unprecompose { precomp_node_id } => {
+            crate::precomp::unprecompose(&mut project.graph, &precomp_node_id)?;
         }
         ProjectCommand::UpsertGraphNode(node) => {
             if let Some(existing) = project.graph.nodes.iter_mut().find(|n| n.id == node.id) {
@@ -339,6 +456,225 @@ fn apply_to_project(project: &mut Project, cmd: ProjectCommand) -> Result<(), Sc
         }
     }
     Ok(())
+}
+
+fn trim_clip(
+    project: &mut Project,
+    clip_id: &str,
+    new_timeline_start: Option<Flicks>,
+    new_timeline_end: Option<Flicks>,
+) -> Result<(), SchemaError> {
+    let clip = project
+        .timeline
+        .clips
+        .iter_mut()
+        .find(|clip| clip.id == clip_id)
+        .ok_or_else(|| SchemaError::MissingClip(clip_id.to_owned()))?;
+    let target_start = new_timeline_start.unwrap_or(clip.timeline_start);
+    let target_end = new_timeline_end.unwrap_or(clip.timeline_end);
+    if target_start < Flicks::ZERO || target_start >= target_end {
+        return Err(SchemaError::InvalidClipBounds {
+            clip_id: clip_id.to_owned(),
+            start: target_start,
+            end: target_end,
+        });
+    }
+    if target_start > clip.timeline_start {
+        let delta = target_start - clip.timeline_start;
+        clip.source_start = clip
+            .source_start
+            .saturating_add(clip.speed_curve.source_offset_at(delta));
+        clip.speed_curve = shift_speed_curve(&clip.speed_curve, delta)?;
+    }
+    clip.timeline_start = target_start;
+    clip.timeline_end = target_end;
+    Ok(())
+}
+
+fn split_clip(
+    project: &mut Project,
+    clip_id: &str,
+    split_tick: Flicks,
+    right_clip_id: &str,
+) -> Result<(), SchemaError> {
+    if right_clip_id.is_empty() {
+        return Err(SchemaError::InvalidTimeline(
+            "right_clip_id must not be empty".into(),
+        ));
+    }
+    if project
+        .timeline
+        .clips
+        .iter()
+        .any(|clip| clip.id == right_clip_id)
+        || project
+            .timeline
+            .audio_clips
+            .iter()
+            .any(|clip| clip.id == right_clip_id)
+    {
+        return Err(SchemaError::DuplicateId {
+            entity: "clip",
+            id: right_clip_id.to_owned(),
+        });
+    }
+    let index = project
+        .timeline
+        .clips
+        .iter()
+        .position(|clip| clip.id == clip_id)
+        .ok_or_else(|| SchemaError::MissingClip(clip_id.to_owned()))?;
+    let original = project.timeline.clips[index].clone();
+    if split_tick <= original.timeline_start || split_tick >= original.timeline_end {
+        return Err(SchemaError::InvalidTimeline(format!(
+            "split_tick {split_tick} must lie strictly inside [{}, {})",
+            original.timeline_start, original.timeline_end
+        )));
+    }
+
+    let split_offset = split_tick - original.timeline_start;
+    let right_source_start = original
+        .source_start
+        .saturating_add(original.speed_curve.source_offset_at(split_offset));
+    let right_curve = shift_speed_curve(&original.speed_curve, split_offset)?;
+    project.timeline.clips[index].timeline_end = split_tick;
+    project.timeline.clips.insert(
+        index + 1,
+        ClipDef {
+            id: right_clip_id.to_owned(),
+            asset_id: original.asset_id,
+            timeline_start: split_tick,
+            timeline_end: original.timeline_end,
+            source_start: right_source_start,
+            speed_curve: right_curve,
+            linked_event_id: original.linked_event_id,
+            event_animations: Vec::new(),
+        },
+    );
+
+    for event in &mut project.events {
+        if event.source_clip_id.as_deref() == Some(clip_id)
+            && event.target_output_tick >= split_tick
+        {
+            event.source_clip_id = Some(right_clip_id.to_owned());
+        }
+    }
+
+    split_graph_source_routes(&mut project.graph, clip_id, right_clip_id)?;
+    Ok(())
+}
+
+fn split_graph_source_routes(
+    graph: &mut RenderGraphDef,
+    left_clip_id: &str,
+    right_clip_id: &str,
+) -> Result<(), SchemaError> {
+    // Only visit the nodes that existed on entry. The left SourceVideo clones
+    // retain `left_clip_id` and must not be recursively split a second time.
+    let original_len = graph.nodes.len();
+    for index in 0..original_len {
+        if let NodeKind::Precomp { sub_graph, .. } = &mut graph.nodes[index].kind {
+            split_graph_source_routes(sub_graph, left_clip_id, right_clip_id)?;
+        }
+
+        let original_node = graph.nodes[index].clone();
+        let NodeKind::SourceVideo {
+            asset_id,
+            clip_id: Some(source_clip_id),
+            color_space,
+            fit,
+        } = &original_node.kind
+        else {
+            continue;
+        };
+        if source_clip_id != left_clip_id {
+            continue;
+        }
+
+        let left_source_id = fresh_split_source_id(
+            graph,
+            &format!("{}_split_left_{}", original_node.id.0, right_clip_id),
+        );
+        let right_source_id = fresh_split_source_id(
+            graph,
+            &format!("{}_split_right_{}", original_node.id.0, right_clip_id),
+        );
+        let source_node = |id: NodeId, clip_id: &str| GraphNodeDef {
+            id,
+            kind: NodeKind::SourceVideo {
+                asset_id: asset_id.clone(),
+                clip_id: Some(clip_id.to_owned()),
+                color_space: *color_space,
+                fit: *fit,
+            },
+            inputs: Vec::new(),
+            // A disabled source clears to transparency. Keep both branches
+            // disabled and the routing blend enabled to preserve that result.
+            enabled: original_node.enabled,
+        };
+        graph.nodes[index].kind = NodeKind::Blend {
+            mode: BlendMode::Normal,
+            opacity: 1.0,
+        };
+        graph.nodes[index].inputs = vec![left_source_id.clone(), right_source_id.clone()];
+        graph.nodes[index].enabled = true;
+        graph.nodes.push(source_node(left_source_id, left_clip_id));
+        graph
+            .nodes
+            .push(source_node(right_source_id, right_clip_id));
+    }
+    Ok(())
+}
+
+fn fresh_split_source_id(graph: &RenderGraphDef, base: &str) -> NodeId {
+    let mut candidate = NodeId::new(base);
+    let mut suffix = 1u64;
+    while graph.find_node_recursive(&candidate).is_some() {
+        candidate = NodeId::new(format!("{base}_{suffix}"));
+        suffix += 1;
+    }
+    candidate
+}
+
+fn shift_speed_curve(curve: &SpeedCurve, delta: Flicks) -> Result<SpeedCurve, SchemaError> {
+    let map_error = |error: TimeError| {
+        SchemaError::InvalidTimeline(format!("could not shift clip speed curve: {error}"))
+    };
+    match curve.spec() {
+        SpeedCurveSpec::Freeze => Ok(SpeedCurve::freeze()),
+        SpeedCurveSpec::Constant { speed } => SpeedCurve::constant(*speed).map_err(map_error),
+        SpeedCurveSpec::PiecewiseLinear { keyframes } => {
+            SpeedCurve::piecewise_linear(shift_keyframes(curve, keyframes, delta))
+                .map_err(map_error)
+        }
+        SpeedCurveSpec::CubicHermite { keyframes } => {
+            SpeedCurve::cubic_hermite(shift_keyframes(curve, keyframes, delta)).map_err(map_error)
+        }
+    }
+}
+
+fn shift_keyframes(
+    curve: &SpeedCurve,
+    keyframes: &[SpeedKeyframe],
+    delta: Flicks,
+) -> Vec<SpeedKeyframe> {
+    let tangent = matches!(curve.spec(), SpeedCurveSpec::CubicHermite { .. })
+        .then_some(curve.instant_speed_derivative_at(delta));
+    let mut shifted = vec![SpeedKeyframe {
+        output_offset: Flicks::ZERO,
+        speed: curve.instant_speed_at(delta),
+        tangent,
+    }];
+    for keyframe in keyframes {
+        if keyframe.output_offset > delta {
+            shifted.push(SpeedKeyframe {
+                output_offset: keyframe.output_offset - delta,
+                speed: keyframe.speed,
+                tangent: keyframe.tangent,
+            });
+        }
+    }
+    shifted
 }
 
 fn author_hard_cuts(project: &mut Project, cuts: &[HardCut]) -> Result<(), SchemaError> {
@@ -702,10 +1038,7 @@ fn validate_autocut_request(
     let ratio = options.cuts_per_beat.reduced().map_err(|err| {
         SchemaError::InvalidTimeline(format!("autocut cuts_per_beat is invalid: {err}"))
     })?;
-    if !matches!(
-        (ratio.num, ratio.den),
-        (1, 1) | (2, 1) | (1, 2) | (1, 4)
-    ) {
+    if !matches!((ratio.num, ratio.den), (1, 1) | (2, 1) | (1, 2) | (1, 4)) {
         return Err(SchemaError::InvalidTimeline(format!(
             "autocut cuts_per_beat {}/{} is unsupported; use 1, 2, 1/2 or 1/4",
             ratio.num, ratio.den
@@ -793,10 +1126,7 @@ fn advance_asset_cursor(
 }
 
 fn frame_ceil(fps: Rational32, tick: Flicks) -> Result<Flicks, SchemaError> {
-    let frame = match fps
-        .ticks_to_frame_exact(tick)
-        .map_err(autocut_time_error)?
-    {
+    let frame = match fps.ticks_to_frame_exact(tick).map_err(autocut_time_error)? {
         Some(frame) => frame,
         None => fps
             .ticks_to_frame_floor(tick)
@@ -808,9 +1138,7 @@ fn frame_ceil(fps: Rational32, tick: Flicks) -> Result<Flicks, SchemaError> {
 }
 
 fn frame_floor(fps: Rational32, tick: Flicks) -> Result<Flicks, SchemaError> {
-    let frame = fps
-        .ticks_to_frame_floor(tick)
-        .map_err(autocut_time_error)?;
+    let frame = fps.ticks_to_frame_floor(tick).map_err(autocut_time_error)?;
     fps.frame_to_ticks(frame).map_err(autocut_time_error)
 }
 

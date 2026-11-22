@@ -367,6 +367,7 @@ fn text2d_jfa_sdf_renders_thick_smooth_outlines_and_shadow_deterministically() {
                 glow_rgba: [0.3, 0.9, 1.0, 0.7],
                 hdr_intensity: 1.2,
                 gpu_slug: true,
+                text_animator: None,
             },
             inputs: vec![],
             enabled: true,

@@ -3,19 +3,19 @@ use crate::inspection::{
     InspectionPackManifest, MaterialGalleryManifest, export_fx_showcase_pack_impl,
     export_inspection_pack_impl, export_material_gallery_impl,
 };
+use crate::progress::RenderProgress;
+use crate::range::RenderRange;
 use crate::report::{
     AudioImpactSyncReport, DeterminismCheckReport, M1VerificationReport, MotionBlurCheckReport,
     Phase5VerificationReport, SeekIndependenceCheckReport, VideoRenderSummary,
 };
-use crate::progress::RenderProgress;
-use crate::range::RenderRange;
 use crate::resolver::{
     MediaResolver, ProjectFrameProvider, ResolvedAssetSource, slice_audio_buffer,
 };
 use frameshift_media::{
     AlphaMode, AudioBuffer, DEFAULT_AUDIO_SAMPLE_RATE, DecoderPoolTelemetry, EncodeBackend,
     FfmpegBridge, LruFrameCache, Mp4FrameEncoder, ProxyManager, ProxySpec, Rgba8Frame,
-    SyntheticMediaGenerator, downscale_frame_nearest_or_box,
+    SyntheticMediaGenerator, VideoEncodingSettings, downscale_frame_nearest_or_box,
 };
 use frameshift_render::{
     AudioRmsEnvelope, GpuCompositor, OutputAlphaMode, RenderOptions, ShutterOverride,
@@ -30,9 +30,16 @@ use frameshift_time::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_CACHE_CAPACITY: usize = 128;
 const DEFAULT_CACHE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+pub(crate) struct VideoRenderSettings<'a> {
+    pub(crate) options: &'a RenderOptions,
+    pub(crate) encoding: &'a VideoEncodingSettings,
+    pub(crate) cancel: Option<&'a AtomicBool>,
+}
 
 /// Unified M1 headless FrameShift orchestration engine.
 ///
@@ -259,6 +266,57 @@ impl Engine {
         options: &RenderOptions,
         on_progress: &mut dyn FnMut(RenderProgress),
     ) -> Result<VideoRenderSummary, CoreError> {
+        self.render_video_mp4_internal(
+            project,
+            profile,
+            out_path,
+            range,
+            VideoRenderSettings {
+                options,
+                encoding: &VideoEncodingSettings::default(),
+                cancel: None,
+            },
+            on_progress,
+        )
+    }
+
+    /// Renders to MP4 with a per-frame cancellation check for local export jobs.
+    pub(crate) fn render_video_mp4_cancellable(
+        &mut self,
+        project: &Project,
+        profile: RenderProfileKind,
+        out_path: &Path,
+        range: Option<RenderRange>,
+        settings: VideoRenderSettings<'_>,
+        on_progress: &mut dyn FnMut(RenderProgress),
+    ) -> Result<VideoRenderSummary, CoreError> {
+        self.render_video_mp4_internal(
+            project,
+            profile,
+            out_path,
+            range,
+            settings,
+            on_progress,
+        )
+    }
+
+    fn render_video_mp4_internal(
+        &mut self,
+        project: &Project,
+        profile: RenderProfileKind,
+        out_path: &Path,
+        range: Option<RenderRange>,
+        settings: VideoRenderSettings<'_>,
+        on_progress: &mut dyn FnMut(RenderProgress),
+    ) -> Result<VideoRenderSummary, CoreError> {
+        let VideoRenderSettings {
+            options,
+            encoding,
+            cancel,
+        } = settings;
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(CoreError::Cancelled);
+        }
         let profile_def = select_profile(project, profile).clone();
         project.validate()?;
 
@@ -269,6 +327,9 @@ impl Engine {
 
         on_progress(RenderProgress::audio_mix(0, 1));
         let full_audio = self.resolver.mix_project_audio(project)?;
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(CoreError::Cancelled);
+        }
         let audio = match range {
             None => full_audio,
             Some(range) => {
@@ -307,22 +368,30 @@ impl Engine {
         // Stream one frame at a time into ffmpeg. The previous implementation
         // buffered every output frame in a Vec<Rgba8Frame>; at 1280x720/60 fps
         // for 32 s that alone was ~6.6 GiB (1920 frames x 3.5 MiB).
-        let mut encoder = Mp4FrameEncoder::new(
+        let mut encoder = Mp4FrameEncoder::new_with_settings(
             profile_def.resolution.width,
             profile_def.resolution.height,
             audio.as_ref(),
             project.timeline.fps,
             out_path,
             "libx264",
+            encoding,
         )?;
         let total = ticks.len();
         let mut hashes = Vec::with_capacity(total);
         on_progress(RenderProgress::frames(0, total));
         for (index, tick) in ticks.iter().enumerate() {
-            let frame = self.render_frame_with_profile_def(project, &profile_def, *tick, options)?;
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err(CoreError::Cancelled);
+            }
+            let frame =
+                self.render_frame_with_profile_def(project, &profile_def, *tick, options)?;
             hashes.push(frame.fnv1a_hash64());
             encoder.write_frame(&frame)?;
             on_progress(RenderProgress::frames(index + 1, total));
+        }
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(CoreError::Cancelled);
         }
         on_progress(RenderProgress::encode(0, 1));
         encoder.finish()?;
@@ -921,7 +990,7 @@ fn audio_envelope_cache_key(project: &Project) -> String {
     key
 }
 
-fn resolve_disk_audio_envelope<'a>(
+pub(crate) fn resolve_disk_audio_envelope<'a>(
     cache_slot: &'a mut Option<(String, AudioRmsEnvelope)>,
     resolver: &MediaResolver,
     project: &Project,
@@ -1053,7 +1122,10 @@ mod tests {
             let mut guard = PartialOutputGuard::new(&path);
             guard.disarm();
         }
-        assert!(path.exists(), "disarmed guard must keep the finished output");
+        assert!(
+            path.exists(),
+            "disarmed guard must keep the finished output"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1149,11 +1221,18 @@ mod tests {
         assert_ne!(stretch.data, cover.data);
         assert!(engine.cache_telemetry().current_entries > after_stretch);
 
-        let stretch_key = format!("asset_clip_a@{dst_w}x{dst_h}:stretch");
-        let cover_key = format!("asset_clip_a@{dst_w}x{dst_h}:cover");
-        let cached_stretch = engine.cache.peek(&stretch_key, 0).expect("stretch buffer");
-        let cached_cover = engine.cache.peek(&cover_key, 0).expect("cover buffer");
-        assert_ne!(cached_stretch.data, cached_cover.data);
+        let hits_before = engine.cache_telemetry().hits;
+        project.graph.output_node = NodeId::from("src_stretch");
+        let stretch_cached = engine
+            .render_frame_at(&project, RenderProfileKind::Draft, Flicks::ZERO)
+            .expect("cached stretch node");
+        project.graph.output_node = NodeId::from("src_cover");
+        let cover_cached = engine
+            .render_frame_at(&project, RenderProfileKind::Draft, Flicks::ZERO)
+            .expect("cached cover node");
+        assert_eq!(stretch_cached.data, stretch.data);
+        assert_eq!(cover_cached.data, cover.data);
+        assert_eq!(engine.cache_telemetry().hits, hits_before + 2);
 
         engine.clear_cache();
         assert_eq!(engine.decoder_telemetry().active_streams, 0);

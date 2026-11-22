@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use frameshift_schema::{TextAlign2D, WritingMode2D};
+use frameshift_schema::{TextAlign2D, TextAnimatorDef, TextSelectorUnit, WritingMode2D};
 use harfrust::{Buffer, Direction, Feature, ShapeOptions, ShaperFont, Tag};
 use lyon_tessellation::math::{Point, point};
 use lyon_tessellation::path::Path as LyonPath;
 use skrifa::font::{Blob, Font, Variation};
 use skrifa::{DrawMemory, PathSink, ScalerFont};
+use frameshift_time::Flicks;
 
 use crate::error::VectorError;
 use crate::font_locator::ResolvedFont;
@@ -50,6 +51,13 @@ pub struct QuadraticCurve {
 #[derive(Debug, Clone)]
 pub struct ShapedGlyphOutline {
     pub char_index: u32,
+    /// Logical grapheme range in the source string covered by this shaped glyph.
+    /// A ligature can span more than one grapheme, so range selection expands to it.
+    pub grapheme_start: u32,
+    pub grapheme_end: u32,
+    /// Logical whitespace-delimited word range covered by this shaped glyph.
+    pub word_start: u32,
+    pub word_end: u32,
     pub glyph_id: u32,
     pub font_index: usize,
     pub x: f32,
@@ -69,6 +77,8 @@ pub struct ShapedTextBlock {
     pub bounds_max: [f32; 2],
     pub line_count: usize,
     pub char_count: u32,
+    pub grapheme_count: u32,
+    pub word_count: u32,
     pub font_size: f32,
 }
 
@@ -82,6 +92,64 @@ pub struct TextLayoutOptions {
     pub line_height_em: Option<f32>,
     pub variations: VariationAxes,
     pub enable_ligatures: bool,
+}
+
+/// Evaluated per-glyph transform produced by a `TextAnimatorDef`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GlyphAnimationState {
+    pub position_norm: [f32; 2],
+    pub scale: f32,
+    pub opacity: f32,
+}
+
+impl Default for GlyphAnimationState {
+    fn default() -> Self {
+        Self {
+            position_norm: [0.0, 0.0],
+            scale: 1.0,
+            opacity: 1.0,
+        }
+    }
+}
+
+/// Evaluates a text animator for a shaped glyph's grapheme/word ranges.
+pub fn evaluate_text_animator(
+    animator: Option<&TextAnimatorDef>,
+    grapheme_range: (u32, u32),
+    word_range: (u32, u32),
+    tick: Flicks,
+) -> GlyphAnimationState {
+    let Some(animator) = animator else {
+        return GlyphAnimationState::default();
+    };
+    let (unit_start, unit_end) = match animator.unit {
+        TextSelectorUnit::Grapheme => grapheme_range,
+        TextSelectorUnit::Word => word_range,
+    };
+    let range_end = animator.range_end.unwrap_or(u32::MAX);
+    if unit_end <= unit_start || unit_end <= animator.range_start || unit_start >= range_end {
+        return GlyphAnimationState::default();
+    }
+
+    let selected_start = unit_start.max(animator.range_start);
+    let stagger = i128::from(selected_start.saturating_sub(animator.range_start))
+        * i128::from(animator.delay_ticks.max(0));
+    let begin = i128::from(animator.start_tick).saturating_add(stagger);
+    let elapsed = i128::from(tick.0) - begin;
+    let progress = if animator.duration_ticks <= 0 {
+        if elapsed >= 0 { 1.0 } else { 0.0 }
+    } else {
+        (elapsed as f64 / animator.duration_ticks as f64).clamp(0.0, 1.0) as f32
+    };
+    let from_amount = 1.0 - progress;
+    GlyphAnimationState {
+        position_norm: [
+            animator.position_from_norm[0] * from_amount,
+            animator.position_from_norm[1] * from_amount,
+        ],
+        scale: 1.0 + (animator.scale_from - 1.0) * from_amount,
+        opacity: 1.0 + (animator.opacity_from - 1.0) * from_amount,
+    }
 }
 
 impl Default for TextLayoutOptions {
@@ -202,6 +270,8 @@ pub fn shape_text_block(
             bounds_max: [0.0, 0.0],
             line_count,
             char_count: 0,
+            grapheme_count: 0,
+            word_count: 0,
             font_size: options.font_size,
         });
     }
@@ -230,6 +300,10 @@ pub fn shape_text_block(
 
     struct RawPlacedGlyph {
         char_index: u32,
+        grapheme_start: u32,
+        grapheme_end: u32,
+        word_start: u32,
+        word_end: u32,
         glyph_id: u32,
         font_idx: usize,
         x: f32,
@@ -239,6 +313,7 @@ pub fn shape_text_block(
 
     let mut placed_glyphs = Vec::new();
     let mut global_char_idx = 0u32;
+    let unit_map = TextUnitMap::new(&normalized);
 
     match options.writing_mode {
         WritingMode2D::HorizontalTb => {
@@ -247,6 +322,9 @@ pub fn shape_text_block(
 
             for (line_idx, line) in lines.iter().enumerate() {
                 if line.is_empty() {
+                    if line_idx + 1 < lines.len() {
+                        global_char_idx = global_char_idx.saturating_add(1);
+                    }
                     continue;
                 }
                 let runs = split_into_font_runs(line, &prepared_fonts);
@@ -273,6 +351,7 @@ pub fn shape_text_block(
                     let infos = buf.glyph_infos();
                     let positions = buf.glyph_positions();
                     let run_glyph_count = infos.len();
+                    let clusters = cluster_char_ranges(run_text, infos);
 
                     for i in 0..run_glyph_count {
                         let info = infos[i];
@@ -280,11 +359,24 @@ pub fn shape_text_block(
                         let gx = pen_x + (pos.x_offset as f32) * scale;
                         let gy = pen_y + (pos.y_offset as f32) * scale;
                         let adv = (pos.x_advance as f32) * scale;
+                        let (cluster_char_start, cluster_char_end) = clusters[i];
+                        let (grapheme_start, grapheme_end) = unit_map.grapheme_range(
+                            global_char_idx + cluster_char_start,
+                            global_char_idx + cluster_char_end,
+                        );
+                        let (word_start, word_end) = unit_map.word_range(
+                            global_char_idx + cluster_char_start,
+                            global_char_idx + cluster_char_end,
+                        );
                         let is_very_last = run_idx + 1 == run_count && i + 1 == run_glyph_count;
                         let extra_track = if is_very_last { 0.0 } else { tracking_px };
 
                         line_placed.push(RawPlacedGlyph {
-                            char_index: global_char_idx + i as u32,
+                            char_index: global_char_idx + cluster_char_start,
+                            grapheme_start,
+                            grapheme_end,
+                            word_start,
+                            word_end,
                             glyph_id: info.glyph_id,
                             font_idx,
                             x: gx,
@@ -309,6 +401,9 @@ pub fn shape_text_block(
                     g.y += baseline_y;
                     placed_glyphs.push(g);
                 }
+                if line_idx + 1 < lines.len() {
+                    global_char_idx = global_char_idx.saturating_add(1);
+                }
             }
         }
         WritingMode2D::VerticalRl => {
@@ -317,6 +412,9 @@ pub fn shape_text_block(
 
             for (col_idx, line) in lines.iter().enumerate() {
                 if line.is_empty() {
+                    if col_idx + 1 < lines.len() {
+                        global_char_idx = global_char_idx.saturating_add(1);
+                    }
                     continue;
                 }
                 let runs = split_into_font_runs(line, &prepared_fonts);
@@ -343,6 +441,7 @@ pub fn shape_text_block(
                     let infos = buf.glyph_infos();
                     let positions = buf.glyph_positions();
                     let run_glyph_count = infos.len();
+                    let clusters = cluster_char_ranges(run_text, infos);
 
                     for i in 0..run_glyph_count {
                         let info = infos[i];
@@ -355,11 +454,24 @@ pub fn shape_text_block(
                         } else {
                             -options.font_size * 1.05
                         };
+                        let (cluster_char_start, cluster_char_end) = clusters[i];
+                        let (grapheme_start, grapheme_end) = unit_map.grapheme_range(
+                            global_char_idx + cluster_char_start,
+                            global_char_idx + cluster_char_end,
+                        );
+                        let (word_start, word_end) = unit_map.word_range(
+                            global_char_idx + cluster_char_start,
+                            global_char_idx + cluster_char_end,
+                        );
                         let is_very_last = run_idx + 1 == run_count && i + 1 == run_glyph_count;
                         let extra_track = if is_very_last { 0.0 } else { tracking_px };
 
                         col_placed.push(RawPlacedGlyph {
-                            char_index: global_char_idx + i as u32,
+                            char_index: global_char_idx + cluster_char_start,
+                            grapheme_start,
+                            grapheme_end,
+                            word_start,
+                            word_end,
                             glyph_id: info.glyph_id,
                             font_idx,
                             x: gx,
@@ -383,6 +495,9 @@ pub fn shape_text_block(
                     g.x += col_x;
                     g.y += col_top_y;
                     placed_glyphs.push(g);
+                }
+                if col_idx + 1 < lines.len() {
+                    global_char_idx = global_char_idx.saturating_add(1);
                 }
             }
         }
@@ -417,6 +532,10 @@ pub fn shape_text_block(
 
         glyphs.push(ShapedGlyphOutline {
             char_index: pg.char_index,
+            grapheme_start: pg.grapheme_start,
+            grapheme_end: pg.grapheme_end,
+            word_start: pg.word_start,
+            word_end: pg.word_end,
             glyph_id: pg.glyph_id,
             font_index: pg.font_idx,
             x: pg.x,
@@ -442,8 +561,151 @@ pub fn shape_text_block(
         bounds_max: [block_max_x, block_max_y],
         line_count,
         char_count: global_char_idx,
+        grapheme_count: unit_map.grapheme_count,
+        word_count: unit_map.word_count,
         font_size: options.font_size,
     })
+}
+
+#[derive(Debug)]
+pub(crate) struct TextUnitMap {
+    grapheme_by_char: Vec<u32>,
+    word_by_char: Vec<Option<u32>>,
+    grapheme_count: u32,
+    word_count: u32,
+}
+
+impl TextUnitMap {
+    pub(crate) fn new(text: &str) -> Self {
+        let mut grapheme_by_char = Vec::new();
+        let mut word_by_char = Vec::new();
+        let mut grapheme_count = 0u32;
+        let mut word_count = 0u32;
+        let mut in_word = false;
+        let mut join_next = false;
+        let mut regional_run = 0u8;
+
+        for ch in text.chars() {
+            let is_line_break = ch == '\n';
+
+            let extend = !is_line_break
+                && (is_grapheme_extend(ch) || join_next || ch == '\u{200d}');
+            if !grapheme_by_char.is_empty() && !extend {
+                if is_regional_indicator(ch) && regional_run % 2 == 1 {
+                    // Pair regional indicators into one flag grapheme.
+                } else {
+                    grapheme_count = grapheme_count.saturating_add(1);
+                }
+            }
+            if grapheme_by_char.is_empty() {
+                grapheme_count = 1;
+            }
+            grapheme_by_char.push(grapheme_count.saturating_sub(1));
+
+            if is_line_break || ch.is_whitespace() {
+                word_by_char.push(None);
+                in_word = false;
+            } else {
+                if !in_word {
+                    word_count = word_count.saturating_add(1);
+                    in_word = true;
+                }
+                word_by_char.push(Some(word_count - 1));
+            }
+
+            if is_line_break {
+                join_next = false;
+                regional_run = 0;
+                continue;
+            }
+
+            if is_regional_indicator(ch) {
+                regional_run = regional_run.saturating_add(1);
+            } else if !is_grapheme_extend(ch) && ch != '\u{200d}' {
+                regional_run = 0;
+            }
+            join_next = ch == '\u{200d}';
+        }
+
+        Self {
+            grapheme_by_char,
+            word_by_char,
+            grapheme_count,
+            word_count,
+        }
+    }
+
+    pub(crate) fn grapheme_range(&self, start: u32, end: u32) -> (u32, u32) {
+        let first = start as usize;
+        let last = end.saturating_sub(1) as usize;
+        let Some(&a) = self.grapheme_by_char.get(first) else {
+            return (0, 0);
+        };
+        let b = self.grapheme_by_char.get(last).copied().unwrap_or(a);
+        (a, b.saturating_add(1))
+    }
+
+    pub(crate) fn word_range(&self, start: u32, end: u32) -> (u32, u32) {
+        let first = start as usize;
+        let last = end.saturating_sub(1) as usize;
+        let mut found = self.word_by_char.get(first).copied().flatten();
+        let mut last_word = found;
+        for value in self
+            .word_by_char
+            .get(first..=last.min(self.word_by_char.len().saturating_sub(1)))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            found.get_or_insert(*value);
+            last_word = Some(*value);
+        }
+        found.map_or((0, 0), |a| (a, last_word.unwrap_or(a).saturating_add(1)))
+    }
+}
+
+fn cluster_char_ranges(text: &str, infos: &[harfrust::GlyphInfo]) -> Vec<(u32, u32)> {
+    let mut byte_starts: Vec<usize> = infos
+        .iter()
+        .map(|info| (info.cluster as usize).min(text.len()))
+        .collect();
+    byte_starts.sort_unstable();
+    byte_starts.dedup();
+
+    infos
+        .iter()
+        .map(|info| {
+            let start_byte = (info.cluster as usize).min(text.len());
+            let end_byte = byte_starts
+                .iter()
+                .copied()
+                .find(|&candidate| candidate > start_byte)
+                .unwrap_or(text.len());
+            let start_char = text[..start_byte].chars().count() as u32;
+            let end_char = text[..end_byte].chars().count() as u32;
+            (start_char, end_char.max(start_char.saturating_add(1)))
+        })
+        .collect()
+}
+
+fn is_regional_indicator(ch: char) -> bool {
+    matches!(ch as u32, 0x1f1e6..=0x1f1ff)
+}
+
+fn is_grapheme_extend(ch: char) -> bool {
+    matches!(ch as u32,
+        0x0300..=0x036f | 0x0483..=0x0489 | 0x0591..=0x05bd | 0x05bf..=0x05bf |
+        0x05c1..=0x05c2 | 0x05c4..=0x05c5 | 0x0610..=0x061a | 0x064b..=0x065f |
+        0x0670..=0x0670 | 0x06d6..=0x06ed | 0x0711..=0x0711 | 0x0730..=0x074a |
+        0x07a6..=0x07b0 | 0x07eb..=0x07f3 | 0x0816..=0x082d | 0x0859..=0x085b |
+        0x08d3..=0x0903 | 0x093a..=0x093c | 0x093e..=0x094f | 0x0951..=0x0957 |
+        0x0962..=0x0963 | 0x0981..=0x0983 | 0x09bc..=0x09bc | 0x09be..=0x09cd |
+        0x0a01..=0x0a03 | 0x0a3c..=0x0a4d | 0x0abc..=0x0acd | 0x0b01..=0x0b03 |
+        0x0b3c..=0x0b4d | 0x0c00..=0x0c04 | 0x0c3e..=0x0c56 | 0x0d00..=0x0d03 |
+        0x0d3b..=0x0d4d | 0x0e31..=0x0e4e | 0x0f18..=0x0fbc | 0x102b..=0x103e |
+        0x135d..=0x135f | 0x1712..=0x1734 | 0x17b4..=0x17d3 | 0x180b..=0x180d |
+        0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20ff | 0xfe00..=0xfe0f |
+        0xfe20..=0xfe2f | 0x1f3fb..=0x1f3ff | 0xe0100..=0xe01ef)
 }
 
 fn split_into_font_runs<'a>(
@@ -700,5 +962,71 @@ fn eval_cubic_deriv_ctrl(
         [pt[0] + deriv[0] * dt, pt[1] + deriv[1] * dt]
     } else {
         [pt[0] - deriv[0] * dt, pt[1] - deriv[1] * dt]
+    }
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::{TextUnitMap, evaluate_text_animator};
+    use frameshift_schema::{TextAnimatorDef, TextSelectorUnit};
+    use frameshift_time::Flicks;
+
+    #[test]
+    fn text_units_cover_combining_emoji_and_line_breaks() {
+        let units = TextUnitMap::new("A\u{301} B\n🇺🇸👩‍🚀");
+
+        assert_eq!(units.grapheme_count, 6);
+        assert_eq!(units.word_count, 3);
+        assert_eq!(units.grapheme_range(0, 2), (0, 1));
+        assert_eq!(units.word_range(0, 2), (0, 1));
+        assert_eq!(units.grapheme_range(4, 5), (3, 4));
+        assert_eq!(units.word_range(4, 5), (0, 0));
+        assert_eq!(units.grapheme_range(5, 7), (4, 5));
+        assert_eq!(units.word_range(7, 10), (2, 3));
+
+        let multiline = TextUnitMap::new("A\nB");
+        assert_eq!(multiline.grapheme_range(2, 3), (2, 3));
+        assert_eq!(multiline.word_range(2, 3), (1, 2));
+    }
+
+    #[test]
+    fn word_selector_applies_range_and_per_word_stagger() {
+        let animator = TextAnimatorDef {
+            unit: TextSelectorUnit::Word,
+            range_start: 1,
+            range_end: Some(3),
+            start_tick: 0,
+            duration_ticks: 100,
+            delay_ticks: 20,
+            position_from_norm: [0.2, -0.1],
+            scale_from: 0.5,
+            opacity_from: 0.0,
+        };
+
+        let unselected = evaluate_text_animator(
+            Some(&animator),
+            (0, 1),
+            (0, 1),
+            Flicks(0),
+        );
+        assert_eq!(unselected.opacity, 1.0);
+
+        let selected_first = evaluate_text_animator(
+            Some(&animator),
+            (1, 2),
+            (1, 2),
+            Flicks(0),
+        );
+        assert_eq!(selected_first.opacity, 0.0);
+
+        let selected_second = evaluate_text_animator(
+            Some(&animator),
+            (2, 3),
+            (2, 3),
+            Flicks(70),
+        );
+        assert!((selected_second.opacity - 0.5).abs() < 1e-6);
+        assert!((selected_second.scale - 0.75).abs() < 1e-6);
+        assert!((selected_second.position_norm[0] - 0.1).abs() < 1e-6);
     }
 }

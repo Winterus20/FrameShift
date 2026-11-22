@@ -8,11 +8,10 @@ use crate::pool::{
 use crate::provider::{FrameProvider, SourceFrame, SourcePixelData};
 use crate::uniforms::{
     AnimeImpactFrameUniform, AnimeSharpenUniform, BackdropScrimUniform, BlendUniform,
-    BloomPassUniform,
-    ColorBasicUniform, ColorSpaceMode, CustomWgslUniform, DitherMode, DofBokehUniform,
-    DofCocUniform, FilmHalationUniform, FilmOpticsUniform, FxaaUniform, GpuMeshVertex3D,
-    GpuSlugBand, GpuSlugCurve, GpuSlugGlyph, GpuSlugVertex, HalftoneGlowUniform, Lut3DUniform,
-    MaskMatteUniform, MotionBlurUniform, MotionTileShakeUniform, OutputAlphaMode,
+    BloomPassUniform, ColorBasicUniform, ColorSpaceMode, CustomWgslUniform, DitherMode,
+    DofBokehUniform, DofCocUniform, FilmHalationUniform, FilmOpticsUniform, FxaaUniform,
+    GpuMeshVertex3D, GpuSlugBand, GpuSlugCurve, GpuSlugGlyph, GpuSlugVertex, HalftoneGlowUniform,
+    Lut3DUniform, MaskMatteUniform, MotionBlurUniform, MotionTileShakeUniform, OutputAlphaMode,
     ParticleField3DUniform, RadialShockwaveUniform, RibbonTrail3DUniform, SlugUniform,
     Text2DFxUniform, Text2DJfaUniform, Text3DUniform, TonemapMode, Transform3DUniform,
     TransformUniform, WhipTransitionUniform,
@@ -1194,6 +1193,8 @@ struct CachedSlugScene {
     curves_buffer: Option<wgpu::Buffer>,
     index_count: u32,
     block_bounds: [f32; 4],
+    grapheme_count: u32,
+    word_count: u32,
 }
 
 type Shape3DMeshKey = (u8, u32, u32, u32, u32, u32, u32, u32);
@@ -1777,7 +1778,12 @@ impl GpuCompositor {
 
             if release_inputs {
                 for upstream in &node.inputs {
-                    release_if_last_use(&mut self.pool, &mut remaining_uses, &mut textures, upstream);
+                    release_if_last_use(
+                        &mut self.pool,
+                        &mut remaining_uses,
+                        &mut textures,
+                        upstream,
+                    );
                 }
                 if release_scene_xform_inputs {
                     for child_id in &node.inputs {
@@ -2014,8 +2020,13 @@ impl GpuCompositor {
                     color_space_code(*color_space),
                 );
                 if !self.image_gpu_cache.contains_key(&key) {
-                    let frame =
-                        provider.provide_source_frame(asset_id, Flicks::ZERO, width, height, *fit)?;
+                    let frame = provider.provide_source_frame(
+                        asset_id,
+                        Flicks::ZERO,
+                        width,
+                        height,
+                        *fit,
+                    )?;
                     let cached_tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("frameshift-source-image-cache"),
                         size: wgpu::Extent3d {
@@ -2241,9 +2252,9 @@ impl GpuCompositor {
                     "ripple" | "transition_ripple" | "transition_ripple.wgsl" => {
                         &self.pipelines.transition_ripple
                     }
-                    "kaleidoscope"
-                    | "transition_kaleidoscope"
-                    | "transition_kaleidoscope.wgsl" => &self.pipelines.transition_kaleidoscope,
+                    "kaleidoscope" | "transition_kaleidoscope" | "transition_kaleidoscope.wgsl" => {
+                        &self.pipelines.transition_kaleidoscope
+                    }
                     other => {
                         return Err(RenderError::UnsupportedShaderTransition(other.to_owned()));
                     }
@@ -2275,6 +2286,7 @@ impl GpuCompositor {
                 font_family,
                 font_path,
                 gpu_slug,
+                text_animator,
                 ..
             } => {
                 let override_key = format!("vector_text://{}", node.id.0);
@@ -2285,13 +2297,15 @@ impl GpuCompositor {
                         source_tick,
                         message,
                     }) => {
-                        if let Some(rest) = message.strip_prefix("vector error: font file not found: ")
+                        if let Some(rest) =
+                            message.strip_prefix("vector error: font file not found: ")
                         {
                             return Err(RenderError::Vector(VectorError::FontNotFound(
                                 rest.to_owned(),
                             )));
                         }
-                        if let Some(rest) = message.strip_prefix("vector error: invalid font data: ")
+                        if let Some(rest) =
+                            message.strip_prefix("vector error: invalid font data: ")
                         {
                             return Err(RenderError::Vector(VectorError::InvalidFont(
                                 rest.to_owned(),
@@ -2319,8 +2333,12 @@ impl GpuCompositor {
                         &out.view,
                     )?;
                     Ok(out)
-                } else if *gpu_slug && (font_family.is_some() || font_path.is_some()) {
-                    self.render_vector_text_slug_gpu(encoder, &node.id.0, kind, width, height)
+                } else if (*gpu_slug || text_animator.is_some())
+                    && (font_family.is_some() || font_path.is_some())
+                {
+                    self.render_vector_text_slug_gpu(
+                        encoder, &node.id.0, kind, width, height, sub_tick,
+                    )
                 } else {
                     let rendered = frameshift_vector::render_vector_text_node_rgba16f(
                         kind, width, height, sub_tick,
@@ -2616,9 +2634,9 @@ impl GpuCompositor {
                 let mut up_idx = 0usize;
                 let up_total = levels.saturating_sub(1).max(1) as f32;
                 while let Some(base_mip) = down_mips.pop() {
-                    let up_target = self
-                        .pool
-                        .acquire(&self.ctx.device, base_mip.width, base_mip.height);
+                    let up_target =
+                        self.pool
+                            .acquire(&self.ctx.device, base_mip.width, base_mip.height);
                     let mip_norm = 1.0 - (up_idx as f32 / up_total);
                     let uniform = BloomPassUniform::with_optics(
                         [
@@ -2751,9 +2769,8 @@ impl GpuCompositor {
                 }
 
                 // Pass A: Lens distortion + 7-tap spectral CA (if active)
-                let needs_lens = lens_k1.abs() > 1e-6
-                    || lens_k2.abs() > 1e-6
-                    || chromatic_edge.abs() > 1e-5;
+                let needs_lens =
+                    lens_k1.abs() > 1e-6 || lens_k2.abs() > 1e-6 || chromatic_edge.abs() > 1e-5;
                 let lens_tex_opt = if needs_lens {
                     let lt = self.pool.acquire(&self.ctx.device, width, height);
                     self.record_two_tex_pass(
@@ -2799,11 +2816,8 @@ impl GpuCompositor {
                 );
 
                 // Downsample half -> quarter (threshold=0)
-                let down_u = FilmHalationUniform::extract(
-                    [1.0 / hw as f32, 1.0 / hh as f32],
-                    0.0,
-                    0.05,
-                );
+                let down_u =
+                    FilmHalationUniform::extract([1.0 / hw as f32, 1.0 / hh as f32], 0.0, 0.05);
                 self.record_two_tex_pass(
                     encoder,
                     &format!("{}-hal-down", node.id.0),
@@ -2905,34 +2919,20 @@ impl GpuCompositor {
                 match *expected_inputs {
                     0 => {
                         self.record_zero_tex_pass(
-                            encoder,
-                            &node.id.0,
-                            &program,
-                            &uniform,
-                            &out.view,
+                            encoder, &node.id.0, &program, &uniform, &out.view,
                         );
                     }
                     1 => {
                         let tex0 = require_input(node, textures, 0)?;
                         self.record_one_tex_pass(
-                            encoder,
-                            &node.id.0,
-                            &program,
-                            &tex0.view,
-                            &uniform,
-                            &out.view,
+                            encoder, &node.id.0, &program, &tex0.view, &uniform, &out.view,
                         );
                     }
                     _ => {
                         let tex0 = require_input(node, textures, 0)?;
                         let tex1 = require_input(node, textures, 1)?;
                         self.record_two_tex_pass(
-                            encoder,
-                            &node.id.0,
-                            &program,
-                            &tex0.view,
-                            &tex1.view,
-                            &uniform,
+                            encoder, &node.id.0, &program, &tex0.view, &tex1.view, &uniform,
                             &out.view,
                         );
                     }
@@ -3026,13 +3026,7 @@ impl GpuCompositor {
                 let echo_cnt = (*echo_count).min(16);
                 let depth_view = &self.depth_cache[&(width, height)].1;
                 self.record_mesh3d_pass(
-                    encoder,
-                    &node.id.0,
-                    cached,
-                    &uniform,
-                    echo_cnt,
-                    *opacity,
-                    &out.view,
+                    encoder, &node.id.0, cached, &uniform, echo_cnt, *opacity, &out.view,
                     depth_view,
                 );
                 Ok(out)
@@ -3081,13 +3075,7 @@ impl GpuCompositor {
                 let echo_cnt = (*echo_count).min(16);
                 let depth_view = &self.depth_cache[&(width, height)].1;
                 self.record_mesh3d_pass(
-                    encoder,
-                    &node.id.0,
-                    cached,
-                    &uniform,
-                    echo_cnt,
-                    *opacity,
-                    &out.view,
+                    encoder, &node.id.0, cached, &uniform, echo_cnt, *opacity, &out.view,
                     depth_view,
                 );
                 Ok(out)
@@ -3139,8 +3127,7 @@ impl GpuCompositor {
                     build_camera_matrices(*camera_pos, *camera_rot_deg, *fov_deg, width, height);
                 let t_sec = (sub_tick.0 as f64 / FLICKS_PER_SECOND as f64) as f32;
                 let segs = (*segments).max(1);
-                let uniform =
-                    build_ribbon_trail3d_uniform(kind, &cam, t_sec, None, width, height);
+                let uniform = build_ribbon_trail3d_uniform(kind, &cam, t_sec, None, width, height);
                 // Standalone ribbons have no depth attachment, so normal blending only
                 // changes how the trail composites over transparent black.
                 let program = if *normal_blend {
@@ -3169,8 +3156,7 @@ impl GpuCompositor {
             } => {
                 let src = require_input(node, textures, 0)?;
                 let out = self.pool.acquire(&self.ctx.device, width, height);
-                let uniform =
-                    CornerPinUniform::from_corners(*tl, *tr, *br, *bl, *filter, *opacity);
+                let uniform = CornerPinUniform::from_corners(*tl, *tr, *br, *bl, *filter, *opacity);
                 if *filter == frameshift_schema::SampleFilter::Bilinear
                     && let Some(mip_src) = self.build_mipmapped_copy(encoder, src)
                 {
@@ -3780,7 +3766,8 @@ impl GpuCompositor {
         let (atmos_tex_opt, depth_view_ref): (Option<PooledTexture>, &wgpu::TextureView) =
             if let Some(msaa_pipes) = &self.pipelines.scene3d_msaa4x {
                 let (msaa_color_view, msaa_depth_view) =
-                    self.msaa_cache.ensure_pair(&self.ctx.device, width, height, 4);
+                    self.msaa_cache
+                        .ensure_pair(&self.ctx.device, width, height, 4);
                 {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some(&node.id.0),
@@ -3961,24 +3948,27 @@ impl GpuCompositor {
                 .as_ref()
                 .map(|m| &m.fx_dof_coc_msaa_h)
                 .unwrap_or(&self.pipelines.fx_dof_coc);
-            let coc_h_bg = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("{}-dof-coc-h", node.id.0)),
-                layout: &coc_h_program.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&color_tex.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(depth_view_ref),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: coc_uniform_buf.as_entire_binding(),
-                    },
-                ],
-            });
+            let coc_h_bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("{}-dof-coc-h", node.id.0)),
+                    layout: &coc_h_program.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&color_tex.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(depth_view_ref),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: coc_uniform_buf.as_entire_binding(),
+                        },
+                    ],
+                });
             draw_fullscreen_pass(
                 encoder,
                 &format!("{}-dof-coc-h", node.id.0),
@@ -3987,20 +3977,23 @@ impl GpuCompositor {
                 &coc_h_tex.view,
             );
 
-            let coc_v_bg = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("{}-dof-coc-v", node.id.0)),
-                layout: &self.pipelines.fx_dof_coc_v.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&coc_h_tex.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: coc_uniform_buf.as_entire_binding(),
-                    },
-                ],
-            });
+            let coc_v_bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("{}-dof-coc-v", node.id.0)),
+                    layout: &self.pipelines.fx_dof_coc_v.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&coc_h_tex.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: coc_uniform_buf.as_entire_binding(),
+                        },
+                    ],
+                });
             draw_fullscreen_pass(
                 encoder,
                 &format!("{}-dof-coc-v", node.id.0),
@@ -4010,13 +4003,12 @@ impl GpuCompositor {
             );
 
             let out_tex = self.pool.acquire(&self.ctx.device, width, height);
-            let anam_ratio = if camera.dof_anamorphic_ratio.is_finite()
-                && camera.dof_anamorphic_ratio > 0.0
-            {
-                camera.dof_anamorphic_ratio.clamp(0.25, 4.0)
-            } else {
-                1.0
-            };
+            let anam_ratio =
+                if camera.dof_anamorphic_ratio.is_finite() && camera.dof_anamorphic_ratio > 0.0 {
+                    camera.dof_anamorphic_ratio.clamp(0.25, 4.0)
+                } else {
+                    1.0
+                };
             let bokeh_uniform = DofBokehUniform {
                 params0: [
                     texel_x,
@@ -4049,32 +4041,35 @@ impl GpuCompositor {
                 .as_ref()
                 .map(|t| &t.view)
                 .unwrap_or(&self.dummy_zero_view);
-            let bokeh_bg = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("{}-dof-bokeh", node.id.0)),
-                layout: &self.pipelines.fx_dof_bokeh.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&color_tex.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&coc_tex.view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(atmos_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&self.ctx.linear_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: bokeh_uniform_buf.as_entire_binding(),
-                    },
-                ],
-            });
+            let bokeh_bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("{}-dof-bokeh", node.id.0)),
+                    layout: &self.pipelines.fx_dof_bokeh.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&color_tex.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&coc_tex.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(atmos_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&self.ctx.linear_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: bokeh_uniform_buf.as_entire_binding(),
+                        },
+                    ],
+                });
             draw_fullscreen_pass(
                 encoder,
                 &format!("{}-dof-bokeh", node.id.0),
@@ -4185,6 +4180,7 @@ impl GpuCompositor {
         kind: &NodeKind,
         width: u32,
         height: u32,
+        sub_tick: Flicks,
     ) -> Result<PooledTexture, RenderError> {
         let NodeKind::VectorText {
             text,
@@ -4219,6 +4215,7 @@ impl GpuCompositor {
             glow_rgba,
             hdr_intensity,
             gpu_slug: _,
+            text_animator,
         } = kind
         else {
             unreachable!("expected VectorText");
@@ -4324,6 +4321,35 @@ impl GpuCompositor {
         let block_center_y_px = (*y_offset_norm) * h_f;
         let bottom_rgba = color_bottom_rgba.unwrap_or(*color_rgba);
 
+        let (selector, timing_seconds, from_style) = if let Some(animator) = text_animator {
+            let unit_tag = match animator.unit {
+                frameshift_schema::TextSelectorUnit::Grapheme => 0,
+                frameshift_schema::TextSelectorUnit::Word => 1,
+            };
+            let unit_count = match animator.unit {
+                frameshift_schema::TextSelectorUnit::Grapheme => cached.grapheme_count,
+                frameshift_schema::TextSelectorUnit::Word => cached.word_count,
+            };
+            let end = animator.range_end.unwrap_or(unit_count).min(unit_count);
+            (
+                [1, unit_tag, animator.range_start.min(unit_count), end],
+                [
+                    (sub_tick.0 as f64 / FLICKS_PER_SECOND as f64) as f32,
+                    (animator.start_tick as f64 / FLICKS_PER_SECOND as f64) as f32,
+                    (animator.duration_ticks as f64 / FLICKS_PER_SECOND as f64) as f32,
+                    (animator.delay_ticks as f64 / FLICKS_PER_SECOND as f64) as f32,
+                ],
+                [
+                    animator.position_from_norm[0],
+                    animator.position_from_norm[1],
+                    animator.scale_from,
+                    animator.opacity_from,
+                ],
+            )
+        } else {
+            ([0, 0, 0, 0], [0.0; 4], [0.0, 0.0, 1.0, 1.0])
+        };
+
         let slug_uniform = SlugUniform {
             canvas_anchor: [w_f, h_f, anchor_x_px, block_center_y_px],
             block_bounds: cached.block_bounds,
@@ -4335,6 +4361,9 @@ impl GpuCompositor {
                 if needs_fx { 1.0 } else { op },
                 1.0,
             ],
+            selector,
+            timing_seconds,
+            from_style,
         };
 
         let slug_bind_group = self.create_slug_bind_group(node_label, cached, &slug_uniform);
@@ -4455,6 +4484,8 @@ impl GpuCompositor {
                 curves_buffer: None,
                 index_count: 0,
                 block_bounds: scene.block_bounds,
+                grapheme_count: scene.grapheme_count,
+                word_count: scene.word_count,
             };
         }
         let gpu_verts: Vec<GpuSlugVertex> =
@@ -4489,16 +4520,30 @@ impl GpuCompositor {
                     usage: wgpu::BufferUsages::INDEX,
                 },
             )),
-            glyphs_buffer: Some(make_storage("frameshift-slug-glyphs", cast_slice(&gpu_glyphs))),
-            hbands_buffer: Some(make_storage("frameshift-slug-hbands", cast_slice(&gpu_hbands))),
-            vbands_buffer: Some(make_storage("frameshift-slug-vbands", cast_slice(&gpu_vbands))),
+            glyphs_buffer: Some(make_storage(
+                "frameshift-slug-glyphs",
+                cast_slice(&gpu_glyphs),
+            )),
+            hbands_buffer: Some(make_storage(
+                "frameshift-slug-hbands",
+                cast_slice(&gpu_hbands),
+            )),
+            vbands_buffer: Some(make_storage(
+                "frameshift-slug-vbands",
+                cast_slice(&gpu_vbands),
+            )),
             band_indices_buffer: Some(make_storage(
                 "frameshift-slug-band-indices",
                 cast_slice(&scene.band_indices),
             )),
-            curves_buffer: Some(make_storage("frameshift-slug-curves", cast_slice(&gpu_curves))),
+            curves_buffer: Some(make_storage(
+                "frameshift-slug-curves",
+                cast_slice(&gpu_curves),
+            )),
             index_count: scene.indices.len() as u32,
             block_bounds: scene.block_bounds,
+            grapheme_count: scene.grapheme_count,
+            word_count: scene.word_count,
         }
     }
 
@@ -5042,7 +5087,13 @@ impl GpuCompositor {
         let mip_tex = self
             .pool
             .acquire_mipmapped(&self.ctx.device, src.width, src.height);
-        copy_texture_2d(encoder, &src.texture, &mip_tex.texture, src.width, src.height);
+        copy_texture_2d(
+            encoder,
+            &src.texture,
+            &mip_tex.texture,
+            src.width,
+            src.height,
+        );
         self.generate_mipmaps(encoder, &mip_tex.texture, mip_tex.mip_level_count);
         Some(mip_tex)
     }
@@ -5817,8 +5868,7 @@ fn collect_scene3d_skip_standalone(
     let mut non_scene3d_consumers: HashSet<NodeId> = HashSet::new();
 
     for node in sub_order {
-        if node.disabled_passthrough().is_none() && matches!(node.kind, NodeKind::Scene3D { .. })
-        {
+        if node.disabled_passthrough().is_none() && matches!(node.kind, NodeKind::Scene3D { .. }) {
             for upstream in &node.inputs {
                 enabled_scene3d_children.insert(upstream.clone());
             }
@@ -6216,8 +6266,8 @@ mod tests {
     use super::*;
     use crate::provider::FnFrameProvider;
     use frameshift_schema::{
-        AnimationEasing, AnimationKeyframe, BlendMode, MatteMode, RenderProfileKind, Resolution,
-        WorkingPixelFormat,
+        AnimationEasing, AnimationKeyframe, BlendMode, MatteMode, ProjectCommand, ProjectSession,
+        RenderProfileKind, Resolution, WorkingPixelFormat,
     };
 
     #[test]
@@ -6232,6 +6282,65 @@ mod tests {
         assert!((env.sample_at(Flicks(100)) - 0.8).abs() < 1e-6);
         assert!((env.sample_at(Flicks(150)) - 1.0).abs() < 1e-6);
         assert_eq!(env.sample_at(Flicks(300)), 0.0);
+    }
+
+    #[test]
+    fn split_source_routes_preserve_compositor_source_ticks() {
+        let original = Project::golden_scene_preset();
+        let mut session = ProjectSession::new(original.clone()).expect("valid golden project");
+        let split_tick = Flicks(FLICKS_PER_SECOND);
+        session
+            .apply_command(
+                1,
+                ProjectCommand::SplitClip {
+                    clip_id: "clip_a".into(),
+                    split_tick,
+                    right_clip_id: "clip_a_tail".into(),
+                },
+            )
+            .expect("split retains graph source routes");
+        let split = session.project();
+        let before_animator = ProjectAnimator::new(&original).expect("compile original animator");
+        let after_animator = ProjectAnimator::new(split).expect("compile split animator");
+        let source_routes = split
+            .graph
+            .node(&NodeId::from("src_a"))
+            .expect("original source id remains the routing node");
+        let NodeKind::Blend { .. } = &source_routes.kind else {
+            panic!("split source node should route through a blend");
+        };
+
+        for output_tick in [
+            Flicks(FLICKS_PER_SECOND / 2),
+            split_tick,
+            Flicks(FLICKS_PER_SECOND + FLICKS_PER_SECOND / 2),
+        ] {
+            let expected = before_animator
+                .resolve_source_tick("asset_clip_a", Some("clip_a"), output_tick)
+                .expect("resolve original source")
+                .expect("original clip is active");
+            let branch_ticks: Vec<_> = source_routes
+                .inputs
+                .iter()
+                .map(|node_id| {
+                    let source = split
+                        .graph
+                        .node(node_id)
+                        .expect("split source branch exists");
+                    let NodeKind::SourceVideo {
+                        asset_id, clip_id, ..
+                    } = &source.kind
+                    else {
+                        panic!("source router branch must be a SourceVideo");
+                    };
+                    after_animator
+                        .resolve_source_tick(asset_id, clip_id.as_deref(), output_tick)
+                        .expect("resolve split source")
+                })
+                .collect();
+            let active: Vec<_> = branch_ticks.iter().filter_map(|tick| *tick).collect();
+            assert_eq!(active, vec![expected]);
+        }
     }
 
     #[test]

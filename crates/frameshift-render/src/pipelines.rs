@@ -1522,7 +1522,11 @@ fn build_text_slug_program(device: &wgpu::Device) -> Result<ShaderProgram, Rende
     let module = compile_wgsl_module(device, "text_slug", SHADER_TEXT_SLUG)?;
     let storage_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
+        visibility: if binding == 1 {
+            wgpu::ShaderStages::VERTEX_FRAGMENT
+        } else {
+            wgpu::ShaderStages::FRAGMENT
+        },
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only: true },
             has_dynamic_offset: false,

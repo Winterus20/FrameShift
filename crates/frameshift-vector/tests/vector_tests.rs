@@ -604,6 +604,7 @@ fn vector_text_missing_font_path_and_family_return_font_not_found_without_fallba
         glow_rgba: [0.0; 4],
         hdr_intensity: 1.0,
         gpu_slug: true,
+        text_animator: None,
     };
     let err_node = render_vector_text_node_rgba16f(&node_missing, 256, 128, Flicks::ZERO).unwrap_err();
     assert!(matches!(err_node, VectorError::FontNotFound(_)));
@@ -662,6 +663,7 @@ fn ttf_vector_text_multiline_alignment_tracking_outline_and_opacity() {
         glow_rgba: [0.0; 4],
         hdr_intensity: 1.0,
         gpu_slug: true,
+        text_animator: None,
     };
 
     let left_f =

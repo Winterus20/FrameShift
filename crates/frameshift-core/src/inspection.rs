@@ -683,6 +683,7 @@ pub(crate) fn export_fx_showcase_pack_impl(
                             glow_rgba: [0.0; 4],
                             hdr_intensity: 1.0,
                             gpu_slug: true,
+                            text_animator: None,
                         },
                         inputs: vec![],
                         enabled: true,
@@ -1145,14 +1146,7 @@ pub fn export_material_gallery_impl(
         AlphaMode::Straight,
     )?;
     fill_rect_u8(&mut sheet, 0, 0, sheet_w, GALLERY_HEADER_H, HEADER_BG);
-    fill_rect_u8(
-        &mut sheet,
-        0,
-        GALLERY_HEADER_H - 2,
-        sheet_w,
-        2,
-        HEADER_FG,
-    );
+    fill_rect_u8(&mut sheet, 0, GALLERY_HEADER_H - 2, sheet_w, 2, HEADER_FG);
     render_label_badge_scaled(
         &mut sheet,
         GALLERY_PAD,
@@ -1203,24 +1197,15 @@ pub fn export_material_gallery_impl(
                 &cell_opts,
             )?;
             let opaque = composite_over_solid(&rendered, GALLERY_CELL_BG)?;
-            let thumb =
-                downscale_frame_nearest_or_box(&opaque, GALLERY_CELL_W, GALLERY_CELL_H)?;
+            let thumb = downscale_frame_nearest_or_box(&opaque, GALLERY_CELL_W, GALLERY_CELL_H)?;
 
             let cell_rect = MaterialCellRect {
                 x: GALLERY_PAD + (col as u32) * (GALLERY_CELL_W + GALLERY_PAD),
-                y: GALLERY_HEADER_H
-                    + GALLERY_PAD
-                    + (row as u32) * (GALLERY_CELL_H + GALLERY_PAD),
+                y: GALLERY_HEADER_H + GALLERY_PAD + (row as u32) * (GALLERY_CELL_H + GALLERY_PAD),
                 width: GALLERY_CELL_W,
                 height: GALLERY_CELL_H,
             };
-            blit_frame_with_border(
-                &mut sheet,
-                &thumb,
-                cell_rect.x,
-                cell_rect.y,
-                CELL_BORDER,
-            );
+            blit_frame_with_border(&mut sheet, &thumb, cell_rect.x, cell_rect.y, CELL_BORDER);
             draw_gallery_color_chips(&mut sheet, cell_rect.x, cell_rect.y);
             let label = format!("{} / {}", shape.display_name, material.display_name);
             render_label_badge(
@@ -1289,7 +1274,10 @@ pub fn export_material_gallery_impl(
         tonemap: "aces_lite".to_string(),
         sample_tick: Flicks::ZERO,
         cells,
-        notes: GALLERY_NOTES.iter().map(|note| (*note).to_string()).collect(),
+        notes: GALLERY_NOTES
+            .iter()
+            .map(|note| (*note).to_string())
+            .collect(),
     };
     std::fs::write(
         out_dir.join(MATERIAL_GALLERY_MANIFEST_FILE),
@@ -1385,8 +1373,7 @@ fn composite_over_solid(frame: &Rgba8Frame, bg: [u8; 4]) -> Result<Rgba8Frame, C
     for idx in (0..frame.data.len()).step_by(4) {
         let alpha = frame.data[idx + 3] as u32;
         let inv = 255 - alpha;
-        out.data[idx] =
-            ((frame.data[idx] as u32 * alpha + bg[0] as u32 * inv + 127) / 255) as u8;
+        out.data[idx] = ((frame.data[idx] as u32 * alpha + bg[0] as u32 * inv + 127) / 255) as u8;
         out.data[idx + 1] =
             ((frame.data[idx + 1] as u32 * alpha + bg[1] as u32 * inv + 127) / 255) as u8;
         out.data[idx + 2] =
@@ -1438,7 +1425,14 @@ fn draw_gallery_color_chips(canvas: &mut Rgba8Frame, cell_x: u32, cell_y: u32) {
     for (index, linear) in colors.iter().enumerate() {
         let chip_x = x0 + (index as u32) * (CHIP + GAP);
         fill_rect_u8(canvas, chip_x - 1, y0 - 1, CHIP + 2, CHIP + 2, CHIP_BORDER);
-        fill_rect_u8(canvas, chip_x, y0, CHIP, CHIP, linear_rgba_to_srgb_u8(*linear));
+        fill_rect_u8(
+            canvas,
+            chip_x,
+            y0,
+            CHIP,
+            CHIP,
+            linear_rgba_to_srgb_u8(*linear),
+        );
     }
 }
 

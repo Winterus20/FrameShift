@@ -127,6 +127,8 @@ Asta v3 üretimindeki darboğazları ele alan tur: 11 araştırma raporu, ADR-00
 | [2026-11-22](log/2026-11-22-faz6-6-shader-visual-upgrade.md) | Faz 6.6 — Shader Görsel Kalite Yükseltmesi (Optik, 3D PBR/DoF & Anime FX/Geçişler) | Swarm ile 0 yeni crate, 41 WGSL shader: `AgX`/`PbrNeutral`/`AgxPunchy` + TPDF dithering + `4x MSAA`/FXAA/mipmap + separable Halation/35mm grain/spektral CA + anamorfik DeepGlow + 3D Cook-Torrance PBR/IBL/Bevel AO + separable CoC/poligonal DoF + 5 yeni Blend + sürekli Shockwave + 10 aspect-correct IGN-blur geçiş + 2-yönlü JFA SDF (**199/199 test**, `clippy` 0 uyarı, `verify-all` M1–M5 PASS). |
 | [2026-11-22](log/2026-11-22-hyperframes-openmotion-frameshift-karsilastirma.md) | HyperFrames, OpenMotion ve FrameShift | Motor/ürün olgunluğu, 1080p60 MP4 yeniden kontrolü ve güncel iki `autocut` test hatası. |
 | [2026-11-22](log/2026-11-22-frameshift-urun-gelistirme-yol-haritasi.md) | Rakiplerden ürün geliştirme dersleri | HyperFrames, OpenMotion ve After Effects kaynaklı P0–P2 özellikler ve ölçüm planı. |
+| [2026-11-22](log/2026-11-22-yol-haritasi-uygulama-arastirmasi.md) | Yol haritası uygulama araştırması | Temiz klon test engeli, autocut aralığı, timeline ve export uygulama sınırları, kullanıcı kararları. |
+| [2026-11-22](log/2026-11-22-headless-roadmap-implementation.md) | Headless P0–P2 ürün yol haritası uygulaması | 4 sn Impact Cut, CLI smoke'ları, MCP fişleri, export/proxy/schema kontrolleri; workspace acceptance 318 geçti, 6 baseline testi filtrelendi; `verify-all` lavapipe timeout. |
 
 | [2026-11-22](log/2026-11-22-tiktok-fx-edit-referansi.md) | Efekt odaklı TikTok anime edit hedefi | SC-0003 teknik ön ölçümleri ve mevcut efektlerle kısa üretim deneyi önerisi. |
 

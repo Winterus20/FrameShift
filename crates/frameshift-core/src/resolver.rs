@@ -11,7 +11,7 @@ use frameshift_time::{FLICKS_PER_SECOND, Flicks, SpeedCurve, ticks_to_audio_samp
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Built-in deterministic synthetic asset kinds resolved when on-disk media is absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,10 +146,14 @@ impl VectorTextCacheKey {
             glow_rgba,
             hdr_intensity,
             gpu_slug,
+            text_animator,
         } = kind
         else {
             return None;
         };
+        if text_animator.is_some() {
+            return None;
+        }
         let effective_align = align.unwrap_or(if *align_center {
             TextAlign2D::Center
         } else {
@@ -278,10 +282,36 @@ impl HudPathCacheKey {
 /// `SyntheticMediaGenerator`) and caches probed container `PtsIndex` metadata.
 #[derive(Debug, Default)]
 pub struct MediaResolver {
-    probe_cache: HashMap<String, MediaProbeInfo>,
+    probe_cache: HashMap<PathBuf, (DiskMediaStamp, MediaProbeInfo)>,
     vector_text_cache: HashMap<VectorTextCacheKey, Rgba16fFrame>,
     hud_path_cache: HashMap<HudPathCacheKey, Rgba16fFrame>,
     decoder_pool: DecoderPool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DiskMediaStamp {
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+fn disk_media_stamp(path: &Path) -> Result<DiskMediaStamp, CoreError> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(DiskMediaStamp {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        identity: {
+            use std::os::unix::fs::MetadataExt;
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        },
+    })
 }
 
 impl MediaResolver {
@@ -326,15 +356,19 @@ impl MediaResolver {
     /// Retrieves (or probes and caches) `MediaProbeInfo` for an on-disk video file.
     pub fn probe_disk_video(
         &mut self,
-        asset_id: &str,
+        _asset_id: &str,
         path: &Path,
     ) -> Result<MediaProbeInfo, CoreError> {
-        let key = format!("{asset_id}::{}", path.display());
-        if let Some(info) = self.probe_cache.get(&key) {
-            return Ok(info.clone());
+        let stamp = disk_media_stamp(path)?;
+        if let Some((previous, info)) = self.probe_cache.get(path) {
+            if *previous == stamp {
+                return Ok(info.clone());
+            }
+            self.decoder_pool.close_all();
         }
         let info = FfmpegBridge::probe_media_info(path)?;
-        self.probe_cache.insert(key, info.clone());
+        self.probe_cache
+            .insert(path.to_owned(), (stamp, info.clone()));
         Ok(info)
     }
 
@@ -363,8 +397,10 @@ impl MediaResolver {
         let clamped_tick = Flicks(source_tick.0.max(0));
         let source = self.resolve_asset_source(asset)?;
         let cache_asset_key = format!(
-            "{}@{}x{}:{}",
+            "{}:{:?}:{:?}@{}x{}:{}",
             asset.id,
+            asset.path,
+            asset.fps,
             width,
             height,
             source_fit_cache_name(fit)
@@ -374,6 +410,8 @@ impl MediaResolver {
         match source {
             ResolvedAssetSource::Disk(path) => {
                 let probe = self.probe_disk_video(&asset.id, &path)?;
+                let stamp = self.probe_cache.get(&path).map(|(stamp, _)| stamp);
+                let cache_asset_key = format!("{cache_asset_key}:{stamp:?}");
                 let matched = probe.pts_index.lookup_frame(clamped_tick).ok_or_else(|| {
                     CoreError::Media(frameshift_media::MediaError::EmptyMediaStream(format!(
                         "empty PtsIndex for '{}'",
@@ -822,7 +860,13 @@ impl FrameProvider for ProjectFrameProvider<'_> {
                         font_weight: *font_weight,
                     };
                     frameshift_vector::resolve_font_chain(&query, fallback_fonts, None).map_err(
-                        |err| map_core_vector_or_provider_err(crate::CoreError::Vector(err), asset_id, source_tick),
+                        |err| {
+                            map_core_vector_or_provider_err(
+                                crate::CoreError::Vector(err),
+                                asset_id,
+                                source_tick,
+                            )
+                        },
                     )?;
                 } else if let Some(cache_key) =
                     VectorTextCacheKey::from_node_kind(&node.kind, width, height)
@@ -1073,23 +1117,20 @@ mod tests {
         assert_eq!(rgba8_bytes(&cover), cover_direct.data.as_slice());
         assert_ne!(rgba8_bytes(&stretch), rgba8_bytes(&cover));
 
-        let stretch_key = format!("asset_clip_a@{dst_w}x{dst_h}:stretch");
-        let cover_key = format!("asset_clip_a@{dst_w}x{dst_h}:cover");
-        let frame_key = 0u64;
-        let cached_stretch = cache.peek(&stretch_key, frame_key).expect("stretch buffer");
-        let cached_cover = cache.peek(&cover_key, frame_key).expect("cover buffer");
-        assert_ne!(cached_stretch.data, cached_cover.data);
-        assert_eq!(cached_stretch.data, legacy.data);
-        assert_eq!(cached_cover.data, cover_direct.data);
-
+        assert_eq!(cache.telemetry().current_entries, 2);
         let hits_before = cache.telemetry().hits;
         {
             let provider = ProjectFrameProvider::new(&project, &mut resolver, &mut cache);
-            provider
+            let stretch = provider
                 .provide_source_frame("asset_clip_a", tick, dst_w, dst_h, stretch_fit)
                 .expect("stretch cache hit");
+            let cover = provider
+                .provide_source_frame("asset_clip_a", tick, dst_w, dst_h, cover_fit)
+                .expect("cover cache hit");
+            assert_eq!(rgba8_bytes(&stretch), legacy.data.as_slice());
+            assert_eq!(rgba8_bytes(&cover), cover_direct.data.as_slice());
         }
-        assert!(cache.telemetry().hits > hits_before);
+        assert_eq!(cache.telemetry().hits, hits_before + 2);
 
         resolver.close_video_streams();
         std::fs::remove_file(&mp4_path).expect("mp4 unlocked after close_video_streams");
@@ -1122,17 +1163,20 @@ mod tests {
         use frameshift_media::AlphaMode;
         use frameshift_render::SourcePixelData;
 
-        let dir = std::env::temp_dir().join(format!(
-            "frameshift_resolver_image_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("frameshift_resolver_image_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
 
         let png_path = dir.join("sprite.png");
-        let mut src_png =
-            Rgba8Frame::filled(32, 16, Flicks::ZERO, [240, 80, 40, 128], AlphaMode::Straight)
-                .unwrap();
+        let mut src_png = Rgba8Frame::filled(
+            32,
+            16,
+            Flicks::ZERO,
+            [240, 80, 40, 128],
+            AlphaMode::Straight,
+        )
+        .unwrap();
         src_png.set_pixel(0, 0, [0, 0, 0, 0]);
         src_png.save_png(&png_path).expect("save png");
 
@@ -1287,6 +1331,7 @@ mod tests {
                         glow_rgba: [0.0; 4],
                         hdr_intensity: 1.0,
                         gpu_slug: true,
+                        text_animator: None,
                     },
                     inputs: Vec::new(),
                     enabled: true,
@@ -1326,6 +1371,7 @@ mod tests {
                         glow_rgba: [0.0; 4],
                         hdr_intensity: 1.0,
                         gpu_slug: true,
+                        text_animator: None,
                     },
                     inputs: Vec::new(),
                     enabled: true,
@@ -1383,12 +1429,24 @@ mod tests {
         {
             let provider = ProjectFrameProvider::new(&project, &mut resolver, &mut cache);
             let hud_frame = provider
-                .provide_source_frame("vector_path_hud://sub_hud", Flicks::ZERO, 160, 90, SourceFit::Stretch)
+                .provide_source_frame(
+                    "vector_path_hud://sub_hud",
+                    Flicks::ZERO,
+                    160,
+                    90,
+                    SourceFit::Stretch,
+                )
                 .expect("nested static VectorPathHud should resolve");
             assert_eq!(hud_frame.width, 160);
 
             let text_frame = provider
-                .provide_source_frame("vector_text://sub_text", Flicks::ZERO, 160, 90, SourceFit::Stretch)
+                .provide_source_frame(
+                    "vector_text://sub_text",
+                    Flicks::ZERO,
+                    160,
+                    90,
+                    SourceFit::Stretch,
+                )
                 .expect("nested static VectorText should resolve");
             assert_eq!(text_frame.width, 160);
 
@@ -1402,12 +1460,21 @@ mod tests {
                 )
                 .expect_err("missing font must propagate as RenderError::Vector");
             assert!(
-                matches!(missing_err, RenderError::Vector(VectorError::FontNotFound(_))),
+                matches!(
+                    missing_err,
+                    RenderError::Vector(VectorError::FontNotFound(_))
+                ),
                 "expected RenderError::Vector(FontNotFound), got {missing_err:?}"
             );
 
             let dyn_err = provider
-                .provide_source_frame("vector_path_hud://dyn_hud", Flicks::ZERO, 160, 90, SourceFit::Stretch)
+                .provide_source_frame(
+                    "vector_path_hud://dyn_hud",
+                    Flicks::ZERO,
+                    160,
+                    90,
+                    SourceFit::Stretch,
+                )
                 .expect_err("dynamic HUD must request fallback");
             assert!(
                 matches!(

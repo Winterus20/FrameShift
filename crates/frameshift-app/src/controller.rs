@@ -2,9 +2,9 @@ use crate::error::AppError;
 use crate::snapshot::render_desktop_ui_snapshot;
 use frameshift_media::Rgba8Frame;
 use frameshift_schema::{
-    ClipDef, GraphNodeDef, NodeId, Project, ProjectCommand, ProjectSession, RenderProfileKind,
+    GraphNodeDef, NodeId, Project, ProjectCommand, ProjectSession, RenderProfileKind,
 };
-use frameshift_time::{Flicks, SpeedCurve, SpeedCurveSpec, SpeedKeyframe};
+use frameshift_time::{Flicks, ImpactCurveStyle, SourceFitMode};
 use serde::{Deserialize, Serialize};
 
 /// Optimistic-locking guard protecting human timeline edits from stale concurrent agent mutations.
@@ -199,90 +199,35 @@ impl WorkspaceUiController {
         clip_id: &str,
         action: ClipEditAction,
     ) -> Result<u64, AppError> {
-        let mut candidate = self.session.project().clone();
-        let idx = candidate
-            .timeline
-            .clips
-            .iter()
-            .position(|c| c.id == clip_id)
-            .ok_or_else(|| AppError::InvalidOperation(format!("missing clip '{clip_id}'")))?;
-
-        let summary = match action {
+        let (summary, command) = match action {
             ClipEditAction::Trim {
                 new_timeline_start,
                 new_timeline_end,
-            } => {
-                let clip = &mut candidate.timeline.clips[idx];
-                let old_start = clip.timeline_start;
-                let target_start = new_timeline_start.unwrap_or(clip.timeline_start);
-                let target_end = new_timeline_end.unwrap_or(clip.timeline_end);
-                if target_start < Flicks::ZERO || target_start >= target_end {
-                    return Err(AppError::InvalidOperation(format!(
-                        "invalid trim bounds [{target_start}, {target_end}) for clip '{clip_id}'"
-                    )));
-                }
-                if target_start > old_start {
-                    let delta = target_start - old_start;
-                    let src_advance = clip.speed_curve.source_offset_at(delta);
-                    clip.source_start = clip.source_start.saturating_add(src_advance);
-                    clip.speed_curve = shift_speed_curve(&clip.speed_curve, delta)?;
-                }
-                clip.timeline_start = target_start;
-                clip.timeline_end = target_end;
-                format!("Trimmed {clip_id} to [{}, {}]", target_start.0, target_end.0)
-            }
+            } => (
+                format!("Trimmed {clip_id}"),
+                ProjectCommand::TrimClip {
+                    clip_id: clip_id.to_owned(),
+                    new_timeline_start,
+                    new_timeline_end,
+                },
+            ),
             ClipEditAction::Split {
                 split_tick,
                 right_clip_id,
-            } => {
-                if candidate
-                    .timeline
-                    .clips
-                    .iter()
-                    .any(|c| c.id == right_clip_id)
-                {
-                    return Err(AppError::InvalidOperation(format!(
-                        "right_clip_id '{right_clip_id}' already exists"
-                    )));
-                }
-                let orig = candidate.timeline.clips[idx].clone();
-                if split_tick <= orig.timeline_start || split_tick >= orig.timeline_end {
-                    return Err(AppError::InvalidOperation(format!(
-                        "split_tick {split_tick} must lie strictly inside [{}, {})",
-                        orig.timeline_start, orig.timeline_end
-                    )));
-                }
-
-                let split_offset = split_tick - orig.timeline_start;
-                let right_source_start = orig
-                    .source_start
-                    .saturating_add(orig.speed_curve.source_offset_at(split_offset));
-                let right_curve = shift_speed_curve(&orig.speed_curve, split_offset)?;
-
-                candidate.timeline.clips[idx].timeline_end = split_tick;
-                let right_clip = ClipDef {
-                    id: right_clip_id.clone(),
-                    asset_id: orig.asset_id,
-                    timeline_start: split_tick,
-                    timeline_end: orig.timeline_end,
-                    source_start: right_source_start,
-                    speed_curve: right_curve,
-                    linked_event_id: orig.linked_event_id,
-                    event_animations: Vec::new(),
-                };
-                candidate.timeline.clips.insert(idx + 1, right_clip);
+            } => (
                 format!(
                     "Split {clip_id} at {} into {clip_id} + {right_clip_id}",
                     split_tick.0
-                )
-            }
+                ),
+                ProjectCommand::SplitClip {
+                    clip_id: clip_id.to_owned(),
+                    split_tick,
+                    right_clip_id,
+                },
+            ),
         };
 
-        self.human_apply_command(
-            "split_or_trim_clip",
-            summary,
-            ProjectCommand::ReplaceProject { project: candidate },
-        )
+        self.human_apply_command("split_or_trim_clip", summary, command)
     }
 
     /// Moves a semantic `event_id` anchor's `target_output_tick` via `ProjectSession::apply_command`.
@@ -297,6 +242,40 @@ impl WorkspaceUiController {
             ProjectCommand::MoveEventTarget {
                 event_id: event_id.to_owned(),
                 new_target_output_tick,
+            },
+        )
+    }
+
+    /// Retargets a semantic event, solving its linked source clip when bounds
+    /// and a source anchor are present. Source/speed bounds and fit policy are
+    /// explicit to keep the edit deterministic for headless and desktop users.
+    #[allow(clippy::too_many_arguments)]
+    pub fn human_retarget_event(
+        &mut self,
+        event_id: &str,
+        new_target_output_tick: Flicks,
+        source_bounds_start: Flicks,
+        source_bounds_end: Flicks,
+        min_speed: f64,
+        max_speed: f64,
+        curve_style: ImpactCurveStyle,
+        source_fit: SourceFitMode,
+    ) -> Result<u64, AppError> {
+        self.human_apply_command(
+            "retarget_event",
+            format!(
+                "Retargeted event '{event_id}' to {}",
+                new_target_output_tick.0
+            ),
+            ProjectCommand::RetargetEvent {
+                event_id: event_id.to_owned(),
+                new_target_output_tick,
+                source_bounds_start,
+                source_bounds_end,
+                min_speed,
+                max_speed,
+                curve_style,
+                source_fit,
             },
         )
     }
@@ -406,6 +385,12 @@ fn describe_command(cmd: &ProjectCommand) -> String {
         ProjectCommand::RemoveAsset { id } => format!("RemoveAsset({id})"),
         ProjectCommand::AddClip(c) => format!("AddClip({})", c.id),
         ProjectCommand::RemoveClip { id } => format!("RemoveClip({id})"),
+        ProjectCommand::TrimClip { clip_id, .. } => format!("TrimClip({clip_id})"),
+        ProjectCommand::SplitClip {
+            clip_id,
+            right_clip_id,
+            ..
+        } => format!("SplitClip({clip_id} -> {right_clip_id})"),
         ProjectCommand::AuthorHardCuts { cuts } => format!("AuthorHardCuts({})", cuts.len()),
         ProjectCommand::SetClipSpeedCurve { clip_id, .. } => {
             format!("SetClipSpeedCurve({clip_id})")
@@ -414,7 +399,21 @@ fn describe_command(cmd: &ProjectCommand) -> String {
         ProjectCommand::MoveEventTarget {
             event_id,
             new_target_output_tick,
-        } => format!("MoveEventTarget({event_id} -> {})", new_target_output_tick.0),
+        } => format!(
+            "MoveEventTarget({event_id} -> {})",
+            new_target_output_tick.0
+        ),
+        ProjectCommand::RetargetEvent {
+            event_id,
+            new_target_output_tick,
+            ..
+        } => format!("RetargetEvent({event_id} -> {})", new_target_output_tick.0),
+        ProjectCommand::Precompose {
+            precomp_node_id, ..
+        } => format!("Precompose({precomp_node_id})"),
+        ProjectCommand::Unprecompose { precomp_node_id } => {
+            format!("Unprecompose({precomp_node_id})")
+        }
         ProjectCommand::UpsertGraphNode(n) => format!("UpsertGraphNode({})", n.id),
         ProjectCommand::RemoveGraphNode { node_id } => format!("RemoveGraphNode({node_id})"),
         ProjectCommand::SetOutputNode { node_id } => format!("SetOutputNode({node_id})"),
@@ -424,43 +423,4 @@ fn describe_command(cmd: &ProjectCommand) -> String {
         ProjectCommand::SetPreference(p) => format!("SetPreference({})", p.key),
         ProjectCommand::ReplaceProject { .. } => "ReplaceProject".into(),
     }
-}
-
-fn shift_speed_curve(curve: &SpeedCurve, delta: Flicks) -> Result<SpeedCurve, AppError> {
-    match curve.spec() {
-        SpeedCurveSpec::Freeze => Ok(SpeedCurve::freeze()),
-        SpeedCurveSpec::Constant { speed } => Ok(SpeedCurve::constant(*speed)?),
-        SpeedCurveSpec::PiecewiseLinear { keyframes } => {
-            let shifted = shift_keyframes(curve, keyframes, delta);
-            Ok(SpeedCurve::piecewise_linear(shifted)?)
-        }
-        SpeedCurveSpec::CubicHermite { keyframes } => {
-            let shifted = shift_keyframes(curve, keyframes, delta);
-            Ok(SpeedCurve::cubic_hermite(shifted)?)
-        }
-    }
-}
-
-fn shift_keyframes(
-    curve: &SpeedCurve,
-    keyframes: &[SpeedKeyframe],
-    delta: Flicks,
-) -> Vec<SpeedKeyframe> {
-    let mut shifted: Vec<SpeedKeyframe> = Vec::new();
-    let speed_at_zero = curve.instant_speed_at(delta);
-    shifted.push(SpeedKeyframe {
-        output_offset: Flicks::ZERO,
-        speed: speed_at_zero,
-        tangent: None,
-    });
-    for kf in keyframes {
-        if kf.output_offset > delta {
-            shifted.push(SpeedKeyframe {
-                output_offset: kf.output_offset - delta,
-                speed: kf.speed,
-                tangent: kf.tangent,
-            });
-        }
-    }
-    shifted
 }

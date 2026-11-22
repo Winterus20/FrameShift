@@ -1,6 +1,9 @@
 # FrameShift — Aktif Durum (`state.md`)
 
 **Son Güncelleme:** 2026-11-22  
+**Headless P0–P2 ürün dilimi (2026-11-22):** CLI ve ortak uygulama/schema API'sinde güvenilir Impact Cut, timeline projection/snap/speed graph, retarget/split/trim, otomatik ajan değişiklik fişi, revision-pinned export, yerel şablon/precomp, proxy önizleme ve medya envanteri/relink akışları uygulandı. Bu, etkileşimli masaüstü timeline'ı değildir. Uygulama kanıtı ve sınırlar: [günlük](log/2026-11-22-headless-roadmap-implementation.md).
+
+**Bu dilimin doğrulama durumu:** `cargo clippy --workspace --all-targets -- -D warnings` geçti. 4.00 sn Impact Cut çıktısı `target/product-roadmap/impact-draft.mp4` için H.264/AAC, 96 kare, 24 fps doğrulandı; timeline/speed-graph/template/retarget, proxy kaynak baytı geçersizleştirme, proxy preview ve MCP autoapply/stale/persisted receipt smoke'ları geçti. Son kabul koşusu **318 geçti, 0 başarısız, clean-HEAD'de doğrulanmış 6 platform/görsel başarısızlık filtrelendi**; koşu split pixel/time ve font düzeltmesini ve yeni schema testlerini içerdi. Yeni schema matte/template regresyonları hedefli koşuda 2/2 geçti. Efekt metadata hedefli seti 4/4 geçti; son descriptor eklemesinden önce derlendi, final strict clippy değişiklikten sonra da geçti. `verify-all` yazılım Vulkan adaptöründe 300 sn'de M1 aşamasında zaman aşımına uğradı (`exit 124`, yalnız golden project üretildi). Bu nedenle acceptance seti yeşildir; tam `verify-all` kapısı lavapipe üzerinde tamamlanmış değildir.
 **Asta v3 Takım Çalışması (2026-11-22):** 11 araştırma raporu tamamlandı; ADR-0004 kabul edildi (`schema_version` `0.2.0`, yükleme kuralı `minor <= current`, `0.1.0` projeler yüklenir). Kullanıcı kararları: **fade-only** ses (gain automation yok), parçacık **B** (burst alt-yapısı + `emission`), **1 girişli scrim**, **statik reframe** (9:16), **ribbon varsayılan düzeltmesi**, **`autocut` v1**, ilerleme satırları **stderr**'e, ayrı **`sheet`/`materials`** komutları. P0 streaming encode ölçüldü: çalışma kümesi **6.5 GB → 0.27–0.80 GB** (O(N) tampon kaldırıldı; tepe LRU önbelleğiyle sınırlı). Fame v3 720p 1920 kare: **0.27 GB** / private **0.91 GB** / **100.2 sn**; asta_amv draft 720p: **0.80 GB**; asta_v3 draft 640×360: **0.40 GB**. Uygulama dalgaları devam ediyor; tamamlanmayan özellikler "tamamlandı" sayılmaz. Ayrıntı: [takım günlüğü](log/2026-11-22-asta-v3-team.md).  
 **SC-0002 Yeniden Üretimi (2026-11-22):** Referans [@asgardski kinetic-typography AMV](https://www.tiktok.com/@asgardski/video/7672463186175544609) (Mushoku Tensei, 1920×1080, 60 fps, 31.53 sn, 59 plan, 139.7 BPM) FrameShift ile yeniden üretildi: `local_media/mushoku/mushoku_project.json` (**260 düğüm, 126 binding, 59 klip, 30 kelime**), üretici `local_media/mushoku/build_project.py`, çıktı `local_media/mushoku/mushoku_final.mp4`. Harf harf yerleşim **harf başına ayrı `vector_text` düğümü** ile kuruldu; özne arkası örtme, kontrastı şişirilmiş luma maskesi + %58 blend ile **taklit edildi** (gerçek matte yok). Stil kartı: [SC-0002](style-cards/SC-0002-mushoku-tensei-kinetic-type-amv.md). Eksik/yol haritası: [gap analysis](research/2026-11-22-kinetic-typography-gap-analysis.md).  
 **Asta v3 Prodüksiyon (2026-11-22):** `local_media/asta_v3/asta_v3_final.mp4` — 20.000 sn, 1920×1080, 60 fps, 28 kesim, 76 node / 66 binding. Müzik drop'u ölçülen 33.35 sn'den 25.85 sn offset ile tam **7.50 sn**'ye oturtuldu (RMS −19.1 → −12.7 dB); giriş/çıkış fade'leri `bgm_v3.wav` içinde. `ffprobe`: 1200 kare / 20.000 sn, H.264 + AAC 48 kHz stereo. Ayrıntı: [log](log/2026-11-22-asta-v3-red-line.md).  
@@ -22,11 +25,11 @@
     - [open-source-shader-transitions.md](research/open-source-shader-transitions.md) (`gl-transitions` MIT/BSD birincil GLSL analizi ve WGSL geçiş şartnamesi).
     - [anime-amv-postfx-shaders.md](research/anime-amv-postfx-shaders.md) (Vidvox ISF, Libretro `slang-shaders`, GodotShaders MIT/CC0 analizi ve 4 anime post-FX WGSL şartnamesi).
     - [3d-kinetic-typography-architecture.md](research/3d-kinetic-typography-architecture.md) (3D kinetik tipografi / motion graphics için eksik 6 alan ve önerilen Rust/`wgpu`/WGSL + lyric alignment mimarisi).
-  - **9 Rust Crate'i + 15 WGSL Shader (`crates/frameshift-render/shaders/`):**
+  - **Faz 0–5 başlangıç envanteri: 9 Rust Crate'i + 15 WGSL Shader (`crates/frameshift-render/shaders/`):**
     - **Temel & Renk (7):** `common_fullscreen.wgsl`, `transform.wgsl`, `mask_matte.wgsl`, `blend.wgsl`, `color_basic.wgsl`, `lut3d.wgsl`, `motion_blur_accumulate.wgsl`.
     - **Geçişler (4):** `transition_whip_chromatic.wgsl`, `transition_cross_zoom.wgsl` (MIT), `transition_directional_warp.wgsl` (MIT), `transition_glitch_displace.wgsl` (MIT).
     - **Anime Post-FX (4):** `fx_motion_tile_shake.wgsl` (`MotionTileShake`), `fx_anime_impact_frame.wgsl` (`AnimeImpactFrame`), `fx_radial_shockwave.wgsl` (`RadialShockwave`), `fx_halftone_glow.wgsl` (`HalftoneGlow`).
-- **Son Güncelleme:** 2026-11-21
+- **Güncel envanter:** 9 Rust crate'i ve 41 WGSL shader (Faz 6.6); bu bölümdeki 15 shader listesi tarihsel başlangıç kapsamını gösterir.
 - **Edit-friction uygulaması:** Implementation of the edit-friction work landed. Araştırma: [research/2026-11-21-edit-friction.md](research/2026-11-21-edit-friction.md). Uygulama günlüğü: [log](log/2026-11-21-edit-friction-fixes.md). Uygulama oturumunda `verify-all` çalışmamıştı; `frameshift-media`, `frameshift-core` ve `frameshift-render` testleri ve aynı üç pakette clippy geçmişti.
 - **Edit-friction doğrulama (bu oturum, `CARGO_TARGET_DIR=target/friction-verify`):** Üç komut bitti. `cargo test --workspace` geçti (91 test, 0 başarısız). `cargo clippy --workspace --all-targets -- -D warnings` geçti (çıkış 0, uyarı yok). `verify-all` geçti (`all_gates_passed: true`). Blur kapısı: authored `sub_samples` 8, explicit `ShutterOverride` tavanı 1, hash `4416298738205128470` → `5729329321580515486`, `timing_anchors_identical: true`. Kaynak kod değişmedi. Ayrıntı: [log](log/2026-11-21-edit-friction-verify.md).
 - **Köle edits dogfood:** Referans TikTok kare kare ve bant enerjisiyle izlendi; ayrı klipler + trailer cue ile `target/dogfood/koleedits/koleedits_draft.mp4` (960×740, 24 fps, 202 kare, 8.42 sn, H.264+AAC, render 26.57 sn) üretildi. Contact sheet akıcılık veya ses senkronu kanıtı değildir. Ayrıntı: [log](log/2026-11-21-koleedits-dogfood.md).
@@ -47,21 +50,19 @@
 
 ## Sıradaki Öncelikli Adımlar
 
-1. **Faz 6.5 Tamamlandı (2026-11-22):** `harfrust 0.16.1` + `skrifa 0.50.0` shaping (`shaper.rs`), WGSL Slug GPU Bézier (`slug.rs`, `text_slug.wgsl`, `text2d_fx.wgsl`), `BevelProfile3D::{Flat, Round, Concave, Stepped}` + `material_mode = 3` Iridescent Chrome (`mesh3d.rs`, `text3d_mesh.wgsl`) ve 13 SIL OFL 1.1 küratörlü font (`assets/fonts/`) tamamlandı ve **187/187** test + `verify-all` ile doğrulandı.
-2. **SC-0002'den Çıkan Yeni Öncelikler (2026-11-22):**
-   - **P0** `VectorText`/`Text3D`'ye `per_glyph` dizisi (harf başına dx/dy/rot/scale/color/delay) — harf başına düğüm zorunluluğunu kaldırır.
-   - **P0** `DepthMap` düğümü veya matte varlık girdisi + metin için `text_behind` kompoziti — özne arkası tipografi ancak bununla gerçek olur.
-   - **P1** Projeye `tempo` (bpm/offset) alanı ve `peaks --author-cuts` — 59 kesmeyi elle yazma zorunluluğunu bitirir.
-   - **P1** `crop_rect` + panel düğümü; metne özel `chromatic_shift`.
-   - Ayrıntı: [gap analysis](research/2026-11-22-kinetic-typography-gap-analysis.md).
-3. **İsteğe Bağlı Kalan Uzantılar:**
-   - `frameshift-app` içine `winit` / `egui` canlı pencere kabuğu (timeline scrubbing + canlı önizleme).
-   - CLI/MCP `Demucs + stable-ts` söz zamanlama boru hattı (Faz 6C).
-   - `SafeExpr` ekstra operatörleri (`if`, `<, <=, >, >=, ==`, `&&, ||, !`, `%`, `mix`, `floor`, `ceil`, `sqrt`, `log`), `solo` modu, waveform PNG ve `SC-0002+` stil kartları.
+1. **Workspace kabul kapısı:** Nihai no-fail-fast test koşusu sürüyor. Son raporda clean HEAD'deki platforma bağlı font/görsel başarısızlıkları ile ürün diliminin sonuçları ayrı tutulmalı; `verify-all` yazılım Vulkan adaptöründe 300 saniyede M1'de zaman aşımına uğradı.
+2. **Canlı masaüstü kabuğu:** `frameshift-app` şimdilik headless timeline projeksiyonu, snap, kaynak/çıktı hız eğrisi örneklemesi ve ortak komut denetleyicisi sağlar. `winit`/`egui` pencere, etkileşimli scrub ve canlı önizleme sonraki bağımsız dilimdir.
+3. **Kinetik tipografi ve matte boşlukları:** `VectorText` için grafem/kelime aralığına position/scale/opacity animasyonu var. Per-unit rotation/color, tam Unicode grapheme sözleşmesi, sağdan sola kapsama kanıtı, dış alfa matte/depth girdisi ve gerçek `text_behind` örtmesi hâlâ açık. [SC-0002 gap analysis](research/2026-11-22-kinetic-typography-gap-analysis.md).
+4. **Üretim dayanıklılığı:** Export kuyruğu ve proxy kayıtları yerel süreç ve dosyalarla sınırlı; yeniden başlatma sonrası kuyruk kurtarma, taşınabilir paket kopyalama/lisans doğrulaması, gerçek zamanlı waveforms ve gerçek makinede scrub p50/p95 ölçümü yok.
+5. **İsteğe bağlı uzantılar:** CLI/MCP `Demucs + stable-ts` söz zamanlama boru hattı, `SafeExpr` ilave operatörleri (`if`, karşılaştırmalar, boolean işlemler, `%`, `mix`, `floor`, `ceil`, `sqrt`, `log`), solo modu, waveform PNG ve yeni referans stil kartları.
 
 ---
 
 ## Son Oturum Bağlantısı
+
+- [2026-11-22 — Headless P0–P2 ürün yol haritası uygulaması](log/2026-11-22-headless-roadmap-implementation.md): 4 sn MP4, timeline/speed graph/template/retarget smoke'ları, byte-pinned proxy, MCP fişleri, hedefli schema regresyonları ve kalan GUI/platform sınırları.
+
+- [2026-11-22 — Yol haritası uygulama araştırması](log/2026-11-22-yol-haritasi-uygulama-arastirmasi.md): Dört araştırma ajanı P0–P2'yi koda eşledi. Temiz klonda workspace testleri eksik `local_media` girdileri yüzünden derlenmiyor. Hedefli koşuda iki `autocut` hatası tekrarlandı. Uygulama için kapsam, canlı kabuk ve ajan onay tercihleri soruldu.
 
 - [2026-11-22 — GitHub publication checkpoint](log/2026-11-22-github-publication.md): `cargo test --workspace --locked` stopped on two existing `autocut` failures. No implementation changes were made in the publication session.
 

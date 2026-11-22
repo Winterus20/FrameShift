@@ -6,10 +6,10 @@ use frameshift_schema::{
     CreativeDecisionRecord, PreferenceEntry, PreferenceScope, Project, ProjectCommand,
 };
 use frameshift_time::{
-    Flicks, FLICKS_PER_SECOND, ImpactCurveStyle, ImpactSolveRequest, ImpactSolver, SourceFitMode,
+    FLICKS_PER_SECOND, Flicks, ImpactCurveStyle, ImpactSolveRequest, ImpactSolver, SourceFitMode,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// Summary produced by [`run_m3_agent_director_verification`].

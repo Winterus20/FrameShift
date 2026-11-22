@@ -76,7 +76,12 @@ fn find_windows_ttf() -> String {
             return candidate.to_string();
         }
     }
-    panic!("expected at least one standard Windows TTF font in C:\\Windows\\Fonts");
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets/fonts/Anton-Regular.ttf");
+    if bundled.is_file() {
+        return bundled.to_string_lossy().into_owned();
+    }
+    panic!("expected an installed or bundled test TTF font");
 }
 
 #[test]

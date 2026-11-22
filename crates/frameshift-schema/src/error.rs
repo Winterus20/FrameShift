@@ -62,6 +62,27 @@ pub enum SchemaError {
     #[error("invalid precomp node '{node_id}': {message}")]
     InvalidPrecomp { node_id: NodeId, message: String },
 
+    #[error("invalid precomp authoring operation: {message}")]
+    InvalidPrecompOperation { message: String },
+
+    #[error("invalid template '{template_id}': {message}")]
+    InvalidTemplate {
+        template_id: String,
+        message: String,
+    },
+
+    #[error("template slot '{0}' is required but has no value")]
+    MissingTemplateSlot(String),
+
+    #[error("template values contain unknown slot '{0}'")]
+    UnknownTemplateSlot(String),
+
+    #[error("template slot '{slot_id}' has an invalid value: {message}")]
+    InvalidTemplateSlot { slot_id: String, message: String },
+
+    #[error("template '{0}' has not been reviewed")]
+    UnreviewedTemplate(String),
+
     #[error("precomp node '{node_id}' depth ({depth}) exceeds maximum ({max_depth})")]
     PrecompDepthExceeded {
         node_id: NodeId,

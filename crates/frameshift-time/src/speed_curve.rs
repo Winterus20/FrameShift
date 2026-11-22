@@ -195,6 +195,55 @@ impl SpeedCurve {
         }
     }
 
+    /// Evaluates the right-hand derivative of playback speed at `output_offset`.
+    ///
+    /// The result is in speed units per second. This is useful when cropping a
+    /// curve: the derivative at the new head preserves the original Hermite
+    /// segment instead of recomputing its tangent from the shortened key list.
+    pub fn instant_speed_derivative_at(&self, output_offset: Flicks) -> f64 {
+        match &self.spec {
+            SpeedCurveSpec::Freeze | SpeedCurveSpec::Constant { .. } => 0.0,
+            SpeedCurveSpec::PiecewiseLinear { keyframes } => {
+                if output_offset < keyframes[0].output_offset
+                    || output_offset >= keyframes.last().unwrap().output_offset
+                {
+                    return 0.0;
+                }
+                let pos = keyframes.partition_point(|kf| kf.output_offset <= output_offset);
+                let index = pos.saturating_sub(1).min(keyframes.len() - 2);
+                let a = keyframes[index];
+                let b = keyframes[index + 1];
+                (b.speed - a.speed) * FLICKS_PER_SECOND as f64
+                    / (b.output_offset.0 - a.output_offset.0) as f64
+            }
+            SpeedCurveSpec::CubicHermite { keyframes } => {
+                let first = keyframes[0];
+                let last = keyframes.last().unwrap();
+                if output_offset < first.output_offset || output_offset > last.output_offset {
+                    return 0.0;
+                }
+                if output_offset == last.output_offset {
+                    return 0.0;
+                }
+                let pos = keyframes.partition_point(|kf| kf.output_offset <= output_offset);
+                let seg_idx = pos.saturating_sub(1).min(keyframes.len() - 2);
+                let a = keyframes[seg_idx];
+                let b = keyframes[seg_idx + 1];
+                let span_ticks = (b.output_offset.0 - a.output_offset.0) as f64;
+                let span_seconds = span_ticks / FLICKS_PER_SECOND as f64;
+                let u = (output_offset.0 - a.output_offset.0) as f64 / span_ticks;
+                eval_cubic_hermite_speed_derivative(
+                    a.speed,
+                    b.speed,
+                    self.hermite_tangents[seg_idx],
+                    self.hermite_tangents[seg_idx + 1],
+                    span_seconds,
+                    u,
+                )
+            }
+        }
+    }
+
     /// Returns `(min_source_offset, max_source_offset)` reached across `[start_output, end_output]`.
     /// Useful for bounds verification when curves contain reverse or freeze sections.
     pub fn source_extrema(&self, start_output: Flicks, end_output: Flicks) -> (Flicks, Flicks) {
@@ -566,4 +615,20 @@ fn eval_cubic_hermite_speed(
     let dt_sec = span / FLICKS_PER_SECOND as f64;
     let u = (output_offset.0 - a.output_offset.0) as f64 / span;
     eval_hermite_poly(a.speed, b.speed, tangents[seg_idx], tangents[seg_idx + 1], dt_sec, u)
+}
+
+fn eval_cubic_hermite_speed_derivative(
+    v0: f64,
+    v1: f64,
+    m0: f64,
+    m1: f64,
+    span_seconds: f64,
+    u: f64,
+) -> f64 {
+    let u2 = u * u;
+    let dv0 = 6.0 * u2 - 6.0 * u;
+    let dm0 = 3.0 * u2 - 4.0 * u + 1.0;
+    let dv1 = -6.0 * u2 + 6.0 * u;
+    let dm1 = 3.0 * u2 - 2.0 * u;
+    (dv0 * v0 + dv1 * v1) / span_seconds + dm0 * m0 + dm1 * m1
 }

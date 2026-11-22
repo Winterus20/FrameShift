@@ -21,6 +21,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 mod progress;
+mod workbench;
 
 /// Human time token. Resolved ticks stay `i64` Flicks; `f:<index>` needs the project fps.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +83,7 @@ enum CliCommand {
         project_path: PathBuf,
         asset_id: Option<String>,
         window: TimeSpec,
+        range: Option<RangeSpec>,
         at: Option<TimeSpec>,
         half_window: TimeSpec,
         min_segment: Option<TimeSpec>,
@@ -247,6 +249,9 @@ fn pass_str(ok: bool) -> &'static str {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(result) = workbench::dispatch(&args) {
+        return result;
+    }
     let cmd = parse_args(&args)?;
 
     match cmd {
@@ -474,13 +479,17 @@ fn main() -> Result<()> {
                 manifest.sheet.height,
                 manifest.cells.len()
             );
-            println!("  manifest: {}", out_dir.join(&manifest.sheet.file).display());
+            println!(
+                "  manifest: {}",
+                out_dir.join(&manifest.sheet.file).display()
+            );
             Ok(())
         }
         CliCommand::Autocut {
             project_path,
             asset_id,
             window,
+            range,
             at,
             half_window,
             min_segment,
@@ -488,14 +497,27 @@ fn main() -> Result<()> {
             no_end,
             write_events,
         } => {
-            let mut project = load_project(&project_path)?;
+            let project = load_project(&project_path)?;
             let fps = project.timeline.fps;
+            let resolved_range = match range {
+                Some(spec) => {
+                    let start = resolve_time_spec(spec.start, fps)?;
+                    let end = resolve_time_spec(spec.end, fps)?;
+                    Some(RenderRange::resolve(&project, start, end).with_context(|| {
+                        format!("invalid autocut --range for '{}'", project_path.display())
+                    })?)
+                }
+                None => None,
+            };
             let window_ticks = resolve_time_spec(window, fps)?;
             if window_ticks.0 <= 0 {
                 bail!("analysis window must be a positive tick count");
             }
             let audio = load_analysis_audio(&project, asset_id.as_deref())?;
             let report = audio.analyze_beats_and_energy(window_ticks)?;
+            let coordinate = asset_id
+                .as_deref()
+                .map_or_else(|| "project".to_owned(), |id| format!("source:{id}"));
             let cue = if let Some(at_spec) = at {
                 let center = resolve_time_spec(at_spec, fps)?;
                 let half = resolve_time_spec(half_window, fps)?;
@@ -514,15 +536,35 @@ fn main() -> Result<()> {
                 .transpose()?
                 .unwrap_or(Flicks::ZERO);
             let params = frameshift_core::AutocutParams {
+                start_tick: resolved_range
+                    .as_ref()
+                    .map_or(Flicks::ZERO, |range| range.start_tick),
+                duration_ticks: Flicks(
+                    resolved_range
+                        .as_ref()
+                        .map_or(project.timeline.duration_ticks.0, |range| {
+                            range.end_tick.0 - range.start_tick.0
+                        }),
+                ),
                 min_segment_ticks: min_seg,
                 include_start: !no_start,
                 include_end: !no_end,
             };
             let cuts = frameshift_core::plan_autocut(&report, params)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            print!("{}", format_autocut_report(&cuts, &report, &params));
+            print!(
+                "{}",
+                format_autocut_report(
+                    &cuts,
+                    &report,
+                    &params,
+                    fps,
+                    resolved_range.as_ref(),
+                    &coordinate,
+                )?
+            );
             if write_events {
-                let written = write_autocut_events(&mut project, &project_path, &cuts)?;
+                let written = write_autocut_events(&project, &project_path, &cuts)?;
                 println!(
                     "Wrote {} autocut event(s) -> {}",
                     written,
@@ -751,8 +793,21 @@ fn run_verify_all(out_dir: &Path) -> Result<()> {
 fn load_project(path: &Path) -> Result<Project> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read project JSON '{}'", path.display()))?;
-    Project::from_json_str(&raw)
-        .with_context(|| format!("failed to validate project JSON '{}'", path.display()))
+    let mut project = Project::from_json_str(&raw)
+        .with_context(|| format!("failed to validate project JSON '{}'", path.display()))?;
+    if let Some(project_dir) = path.parent() {
+        for asset in &mut project.assets {
+            let path = Path::new(&asset.path);
+            if path.is_relative()
+                && !asset.path.starts_with("synthetic://")
+                && let Ok(resolved) = project_dir.join(path).canonicalize()
+                && resolved.is_file()
+            {
+                asset.path = resolved.to_string_lossy().into_owned();
+            }
+        }
+    }
+    Ok(project)
 }
 
 fn profile_label(profile: RenderProfileKind) -> &'static str {
@@ -799,10 +854,7 @@ fn format_render_success(
     range: Option<&RenderRange>,
 ) -> String {
     let range = match range {
-        Some(range) => format!(
-            ", range f:{}..f:{}",
-            range.start_frame, range.end_frame
-        ),
+        Some(range) => format!(", range f:{}..f:{}", range.start_frame, range.end_frame),
         None => String::new(),
     };
     let blur = if blur_samples.is_empty() {
@@ -1139,22 +1191,34 @@ fn format_autocut_report(
     cuts: &[Flicks],
     report: &AudioAnalysisReport,
     params: &frameshift_core::AutocutParams,
-) -> String {
+    fps: Rational32,
+    range: Option<&RenderRange>,
+    coordinate: &str,
+) -> Result<String> {
     let mut text = format!(
-        "autocut cuts={} beats={} bpm={:.3} min_segment={} start={} end={}\n",
+        "autocut cuts={} beats={} bpm={:.3} fps={} coordinate={} min_segment={} start={} end={}\n",
         cuts.len(),
         report.detected_beats.len(),
         report.estimated_bpm,
+        fps,
+        coordinate,
         params.min_segment_ticks.0,
         params.include_start,
         params.include_end,
     );
+    if let Some(range) = range {
+        let _ = writeln!(
+            text,
+            "  range=[{}, {}) frames=[{}, {})",
+            range.start_tick.0, range.end_tick.0, range.start_frame, range.end_frame
+        );
+    }
     for (index, tick) in cuts.iter().enumerate() {
-        let ms = tick.0 as f64 / 705_600.0;
-        let frame = (tick.0 as f64 / (705_600_000.0 / 24.0)).floor() as i64;
+        let ms = tick.0 as f64 / FLICKS_PER_MILLISECOND as f64;
+        let frame = fps.ticks_to_frame_nearest(*tick)?;
         let _ = writeln!(text, "  [{index}] tick={} ms={ms:.3} ~f={frame}", tick.0);
     }
-    text
+    Ok(text)
 }
 
 fn write_autocut_events(project: &Project, path: &Path, cuts: &[Flicks]) -> Result<usize> {
@@ -1333,10 +1397,7 @@ fn parse_args(args: &[String]) -> Result<CliCommand> {
                     project_path = Some(PathBuf::from(&rest[i]));
                     i += 1;
                 } else {
-                    bail!(
-                        "unknown or unexpected argument '{}' for materials",
-                        rest[i]
-                    );
+                    bail!("unknown or unexpected argument '{}' for materials", rest[i]);
                 }
             }
             Ok(CliCommand::Materials {
@@ -1413,6 +1474,7 @@ fn parse_args(args: &[String]) -> Result<CliCommand> {
             let mut project_path: Option<PathBuf> = None;
             let mut asset_id: Option<String> = None;
             let mut window: Option<TimeSpec> = None;
+            let mut range: Option<RangeSpec> = None;
             let mut at: Option<TimeSpec> = None;
             let mut half_window: Option<TimeSpec> = None;
             let mut min_segment: Option<TimeSpec> = None;
@@ -1434,6 +1496,11 @@ fn parse_args(args: &[String]) -> Result<CliCommand> {
                     asset_id = Some(val);
                 } else if let Some(val) = take_flag_value(rest, &mut i, "--window")? {
                     assign_time(&mut window, parse_time_spec(&val)?)?;
+                } else if let Some(val) = take_flag_value(rest, &mut i, "--range")? {
+                    if range.is_some() {
+                        bail!("--range specified more than once");
+                    }
+                    range = Some(parse_range_spec(&val)?);
                 } else if let Some(val) = take_flag_value(rest, &mut i, "--at")? {
                     assign_time(&mut at, parse_time_spec(&val)?)?;
                 } else if let Some(val) = take_flag_value(rest, &mut i, "--half-window")? {
@@ -1451,6 +1518,7 @@ fn parse_args(args: &[String]) -> Result<CliCommand> {
                 project_path: project_path.context("autocut requires <project.json>")?,
                 asset_id,
                 window: window.unwrap_or_else(default_peak_window),
+                range,
                 at,
                 half_window: half_window.unwrap_or_else(default_cue_half_window),
                 min_segment,
@@ -1524,14 +1592,16 @@ fn print_usage() {
          \tframeshift-cli materials <project.json> --out-dir <dir>\n\
          \tframeshift-cli peaks <project.json> [--asset <id>] [--window <time>] [--at <time>] [--half-window <time>] [--write-events]\n\
          \tframeshift-cli mcp-stdio\n\
-         \tframeshift-cli autocut <project.json> [--asset <id>] [--window <time>] [--at <time>] [--half-window <time>] [--min-segment <time>] [--no-start] [--no-end] [--write-events]\n\
+         \tframeshift-cli autocut <project.json> [--asset <id>] [--window <time>] [--range <start>..<end>] [--at <time>] [--half-window <time>] [--min-segment <time>] [--no-start] [--no-end] [--write-events]\n\
          \tframeshift-cli verify-all --out-dir <dir>\n\
          \n\
          Time is integer Flicks, <seconds>s (1.905s = 1905 ms), <num>/<den>s, or f:<frame> at the project fps.\n\
          Render profile defaults to final. --range is end-exclusive and snaps outward to the frame grid.\n\
+         Autocut --range is end-exclusive; ticks stay in project coordinates by default and source coordinates with --asset.\n\
          Progress goes to stderr (auto on a TTY, --progress forces it, --quiet disables it).\n\
          --write-events stamps Detected anchors into the project JSON."
     );
+    workbench::print_usage();
 }
 
 #[cfg(test)]
@@ -1886,14 +1956,7 @@ mod tests {
 
         assert_eq!(
             parse_args(&args(&[
-                "render",
-                "p.json",
-                "--out",
-                "o.mp4",
-                "--start",
-                "f:450",
-                "--end",
-                "f:540",
+                "render", "p.json", "--out", "o.mp4", "--start", "f:450", "--end", "f:540",
                 "--quiet",
             ]))
             .unwrap(),
@@ -1921,7 +1984,10 @@ mod tests {
             "1s..nonsense",
         ] {
             assert!(
-                parse_args(&args(&["render", "p.json", "--out", "o.mp4", "--range", bad])).is_err(),
+                parse_args(&args(&[
+                    "render", "p.json", "--out", "o.mp4", "--range", bad
+                ]))
+                .is_err(),
                 "range '{bad}' must be rejected"
             );
         }
@@ -1932,12 +1998,25 @@ mod tests {
             .is_err()
         );
         assert!(
-            parse_args(&args(&["render", "p.json", "--out", "o.mp4", "--start", "1s"])).is_err()
+            parse_args(&args(&[
+                "render", "p.json", "--out", "o.mp4", "--start", "1s"
+            ]))
+            .is_err()
         );
-        assert!(parse_args(&args(&["render", "p.json", "--out", "o.mp4", "--end", "2s"])).is_err());
         assert!(
             parse_args(&args(&[
-                "render", "p.json", "--out", "o.mp4", "--progress", "--quiet",
+                "render", "p.json", "--out", "o.mp4", "--end", "2s"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_args(&args(&[
+                "render",
+                "p.json",
+                "--out",
+                "o.mp4",
+                "--progress",
+                "--quiet",
             ]))
             .is_err()
         );
@@ -1947,6 +2026,77 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn autocut_parses_an_absolute_range_and_rejects_duplicates() {
+        assert_eq!(
+            parse_args(&args(&[
+                "autocut",
+                "p.json",
+                "--range",
+                "f:120..f:240",
+                "--no-start",
+            ]))
+            .unwrap(),
+            CliCommand::Autocut {
+                project_path: PathBuf::from("p.json"),
+                asset_id: None,
+                window: default_peak_window(),
+                range: Some(RangeSpec {
+                    start: TimeSpec::FrameIndex(120),
+                    end: TimeSpec::FrameIndex(240),
+                }),
+                at: None,
+                half_window: default_cue_half_window(),
+                min_segment: None,
+                no_start: true,
+                no_end: false,
+                write_events: false,
+            }
+        );
+        assert!(
+            parse_args(&args(&[
+                "autocut", "p.json", "--range", "1s..2s", "--range", "3s..4s",
+            ]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn autocut_report_uses_project_fps_and_keeps_range_ticks_absolute() {
+        let report = AudioAnalysisReport {
+            window_ticks: Flicks(70),
+            rms_envelope: vec![],
+            detected_beats: vec![Flicks(705_600_000)],
+            estimated_bpm: 120.0,
+        };
+        let params = frameshift_core::AutocutParams {
+            start_tick: Flicks(705_600_000),
+            duration_ticks: Flicks(705_600_000),
+            min_segment_ticks: Flicks::ZERO,
+            include_start: true,
+            include_end: true,
+        };
+        let range = RenderRange {
+            start_tick: Flicks(705_600_000),
+            end_tick: Flicks(1_411_200_000),
+            start_frame: 60,
+            end_frame: 120,
+        };
+        let text = format_autocut_report(
+            &[Flicks(705_600_000), Flicks(1_411_200_000)],
+            &report,
+            &params,
+            frameshift_time::FPS_60,
+            Some(&range),
+            "project",
+        )
+        .unwrap();
+        assert!(text.contains("fps=60 fps coordinate=project"));
+        assert!(text.contains("range=[705600000, 1411200000) frames=[60, 120)"));
+        assert!(text.contains("tick=705600000 ms=1000.000 ~f=60"));
+        assert!(text.contains("tick=1411200000 ms=2000.000 ~f=120"));
     }
 
     #[test]

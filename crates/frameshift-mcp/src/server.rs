@@ -1,13 +1,17 @@
 use crate::error::McpError;
+use frameshift_app::{
+    AgentActor, AgentEditReceipt, AppError, NewReviewNote, PreviewArtifactState, ReviewNoteStore,
+    ReviewNoteView, TickRange, apply_agent_command,
+};
 use frameshift_core::{Engine, InspectionPackManifest, MediaResolver, VideoRenderSummary};
 use frameshift_media::AudioAnalysisReport;
 use frameshift_schema::{
-    NodeKind, PreferenceEntry, PreferenceScope, Project, ProjectCommand, ProjectSession,
-    RenderProfileKind, SchemaError, SchemaVersion, CURRENT_SCHEMA_VERSION,
+    CURRENT_SCHEMA_VERSION, NodeKind, PreferenceEntry, PreferenceScope, Project, ProjectCommand,
+    ProjectSession, RenderProfileKind, SchemaError, SchemaVersion,
 };
-use frameshift_time::{Flicks, FLICKS_PER_SECOND};
+use frameshift_time::{FLICKS_PER_SECOND, Flicks};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -45,6 +49,14 @@ pub struct MutateProjectResult {
     pub project_name: String,
     pub creative_decisions_count: usize,
     pub preferences_count: usize,
+    pub receipt: AgentEditReceipt,
+}
+
+/// Review notes pinned to the active project revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewNotesResult {
+    pub current_revision_id: u64,
+    pub notes: Vec<ReviewNoteView>,
 }
 
 /// Output of `query_preferences` preserving strict `Scene > Project > Global` precedence.
@@ -83,6 +95,8 @@ pub struct McpServer {
     session: ProjectSession,
     engine: Option<Engine>,
     resolver: MediaResolver,
+    agent_edit_receipts: Vec<AgentEditReceipt>,
+    review_notes: ReviewNoteStore,
 }
 
 impl McpServer {
@@ -93,6 +107,8 @@ impl McpServer {
             session,
             engine: None,
             resolver: MediaResolver::new(),
+            agent_edit_receipts: Vec::new(),
+            review_notes: ReviewNoteStore::default(),
         })
     }
 
@@ -103,6 +119,8 @@ impl McpServer {
             session,
             engine: Some(engine),
             resolver: MediaResolver::new(),
+            agent_edit_receipts: Vec::new(),
+            review_notes: ReviewNoteStore::default(),
         })
     }
 
@@ -164,15 +182,42 @@ impl McpServer {
             },
             McpToolDescriptor {
                 name: "mutate_project".into(),
-                description: "Applies an atomic ProjectCommand enforcing expected_revision_id optimistic locking. Hard cuts are command author_hard_cuts: an ordered, non-overlapping cut list in integer Flicks. The session writes one SourceVideo per cut and one Blend chain.".into(),
+                description: "Applies an atomic ProjectCommand enforcing expected_revision_id optimistic locking and returns an automatic agent edit receipt with affected IDs/ranges, moved events, preserved creative decisions, and truthful preview status. Hard cuts are command author_hard_cuts: an ordered, non-overlapping cut list in integer Flicks. The session writes one SourceVideo per cut and one Blend chain.".into(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["expected_revision_id", "command"],
                     "properties": {
                         "expected_revision_id": { "type": "integer" },
-                        "command": { "type": "object" }
+                        "command": { "type": "object" },
+                        "intent": { "type": "string" },
+                        "agent_id": { "type": "string" }
                     }
                 }),
+            },
+            McpToolDescriptor {
+                name: "list_edit_receipts".into(),
+                description: "Lists automatic agent edit receipts from this headless session, including before/after revision snapshots and preview artifact state.".into(),
+                input_schema: json!({ "type": "object", "properties": {} }),
+            },
+            McpToolDescriptor {
+                name: "add_review_note".into(),
+                description: "Adds a review note only when expected_revision_id matches the active project; optional tick ranges are half-open Flicks ranges.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["expected_revision_id", "body"],
+                    "properties": {
+                        "expected_revision_id": { "type": "integer" },
+                        "author": { "type": "string" },
+                        "body": { "type": "string" },
+                        "start_tick": { "type": "integer" },
+                        "end_tick": { "type": "integer" }
+                    }
+                }),
+            },
+            McpToolDescriptor {
+                name: "list_review_notes".into(),
+                description: "Lists review notes pinned to project revisions and reports each note as current or stale against the active revision.".into(),
+                input_schema: json!({ "type": "object", "properties": {} }),
             },
             McpToolDescriptor {
                 name: "query_preferences".into(),
@@ -222,10 +267,15 @@ impl McpServer {
                 "remove_asset".into(),
                 "add_clip".into(),
                 "remove_clip".into(),
+                "trim_clip".into(),
+                "split_clip".into(),
                 "author_hard_cuts".into(),
                 "set_clip_speed_curve".into(),
                 "upsert_event_anchor".into(),
                 "move_event_target".into(),
+                "retarget_event".into(),
+                "precompose".into(),
+                "unprecompose".into(),
                 "upsert_graph_node".into(),
                 "remove_graph_node".into(),
                 "set_output_node".into(),
@@ -295,21 +345,94 @@ impl McpServer {
         expected_revision_id: u64,
         command: ProjectCommand,
     ) -> Result<MutateProjectResult, McpError> {
-        let new_rev = match self.session.apply_command(expected_revision_id, command) {
-            Ok(rev) => rev,
-            Err(SchemaError::RevisionConflict { expected, actual }) => {
-                return Err(McpError::RevisionConflict { expected, actual });
-            }
-            Err(other) => return Err(McpError::Schema(other)),
-        };
+        self.mutate_project_as_agent(
+            expected_revision_id,
+            "mcp-agent".into(),
+            "Apply an MCP project command".into(),
+            command,
+        )
+    }
+
+    fn mutate_project_as_agent(
+        &mut self,
+        expected_revision_id: u64,
+        agent_id: String,
+        intent: String,
+        command: ProjectCommand,
+    ) -> Result<MutateProjectResult, McpError> {
+        let receipt = apply_agent_command(
+            &mut self.session,
+            expected_revision_id,
+            AgentActor { agent_id },
+            intent,
+            command,
+        )
+        .map_err(map_app_error)?;
 
         let p = self.session.project();
-        Ok(MutateProjectResult {
-            revision_id: new_rev,
+        let result = MutateProjectResult {
+            revision_id: receipt.after_revision_id,
             project_name: p.name.clone(),
             creative_decisions_count: p.creative_decisions.len(),
             preferences_count: p.preferences.len(),
-        })
+            receipt: receipt.clone(),
+        };
+        self.agent_edit_receipts.push(receipt);
+        Ok(result)
+    }
+
+    /// Returns receipts produced by successful agent edits in this MCP session.
+    pub fn list_edit_receipts(&self) -> &[AgentEditReceipt] {
+        &self.agent_edit_receipts
+    }
+
+    /// Updates truthful preview artifact status after an optional headless preview pass.
+    /// Returns `false` when `receipt_id` is not present in this session.
+    pub fn set_receipt_preview_artifacts(
+        &mut self,
+        receipt_id: &str,
+        visual: PreviewArtifactState,
+        audio: PreviewArtifactState,
+    ) -> bool {
+        let Some(receipt) = self
+            .agent_edit_receipts
+            .iter_mut()
+            .find(|receipt| receipt.receipt_id == receipt_id)
+        else {
+            return false;
+        };
+        receipt.preview.visual_artifact = visual;
+        receipt.preview.audio_artifact = audio;
+        true
+    }
+
+    /// Adds a review note pinned to the active revision.
+    pub fn add_review_note(
+        &mut self,
+        expected_revision_id: u64,
+        author: String,
+        body: String,
+        range: Option<TickRange>,
+    ) -> Result<ReviewNoteView, McpError> {
+        self.review_notes
+            .add(
+                &self.session,
+                NewReviewNote {
+                    expected_revision_id,
+                    author,
+                    body,
+                    range,
+                },
+            )
+            .map_err(map_app_error)
+    }
+
+    /// Lists review notes and marks notes from older revisions as stale.
+    pub fn list_review_notes(&self) -> ReviewNotesResult {
+        ReviewNotesResult {
+            current_revision_id: self.session.revision_id(),
+            notes: self.review_notes.list(self.session.revision_id()),
+        }
     }
 
     /// Queries preferences for `key` under strict `Scene > Project > Global` hierarchy.
@@ -495,6 +618,7 @@ impl McpServer {
                 }))
             }
             "describe_schema" | "analyze_audio" | "inspect_project" | "mutate_project"
+            | "list_edit_receipts" | "add_review_note" | "list_review_notes"
             | "query_preferences" | "render_project" => {
                 self.dispatch_tool(method, params.unwrap_or_else(|| json!({})))
             }
@@ -528,10 +652,43 @@ impl McpServer {
                 let p: MutateProjectParams = serde_json::from_value(args)
                     .map_err(|e| RpcDispatchError::InvalidParams(e.to_string()))?;
                 let res = self
-                    .mutate_project(p.expected_revision_id, p.command)
+                    .mutate_project_as_agent(
+                        p.expected_revision_id,
+                        p.agent_id.unwrap_or_else(|| "mcp-agent".into()),
+                        p.intent
+                            .unwrap_or_else(|| "Apply an MCP project command".into()),
+                        p.command,
+                    )
                     .map_err(RpcDispatchError::App)?;
                 to_json_value(res)
             }
+            "list_edit_receipts" => to_json_value(self.list_edit_receipts()),
+            "add_review_note" => {
+                let p: AddReviewNoteParams = serde_json::from_value(args)
+                    .map_err(|e| RpcDispatchError::InvalidParams(e.to_string()))?;
+                let range = match (p.start_tick, p.end_tick) {
+                    (Some(start), Some(end)) => Some(TickRange {
+                        start_tick: Flicks(start),
+                        end_tick: Flicks(end),
+                    }),
+                    (None, None) => None,
+                    _ => {
+                        return Err(RpcDispatchError::InvalidParams(
+                            "start_tick and end_tick must be supplied together".into(),
+                        ));
+                    }
+                };
+                let note = self
+                    .add_review_note(
+                        p.expected_revision_id,
+                        p.author.unwrap_or_else(|| "mcp-reviewer".into()),
+                        p.body,
+                        range,
+                    )
+                    .map_err(RpcDispatchError::App)?;
+                to_json_value(note)
+            }
+            "list_review_notes" => to_json_value(self.list_review_notes()),
             "query_preferences" => {
                 let p: QueryPreferencesParams = serde_json::from_value(args)
                     .map_err(|e| RpcDispatchError::InvalidParams(e.to_string()))?;
@@ -618,6 +775,22 @@ struct InspectProjectParams {
 struct MutateProjectParams {
     expected_revision_id: u64,
     command: ProjectCommand,
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddReviewNoteParams {
+    expected_revision_id: u64,
+    body: String,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    start_tick: Option<i64>,
+    #[serde(default)]
+    end_tick: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -635,9 +808,20 @@ struct RenderProjectParams {
     tick: Option<i64>,
 }
 
+fn map_app_error(error: AppError) -> McpError {
+    match error {
+        AppError::ConcurrencyConflict { expected, actual } => {
+            McpError::RevisionConflict { expected, actual }
+        }
+        AppError::Schema(schema_error) => McpError::Schema(schema_error),
+        other => McpError::InvalidParams(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frameshift_app::{ReviewNoteFreshness, TickRange};
 
     #[test]
     fn describe_schema_lists_all_node_kinds() {
@@ -650,5 +834,155 @@ mod tests {
             );
         }
         assert_eq!(desc.node_kinds.len(), NodeKind::ALL_SERDE_NAMES.len());
+    }
+
+    #[test]
+    fn mutate_project_returns_and_retains_one_revision_checked_receipt() {
+        let mut server = McpServer::new(Project::golden_scene_preset()).expect("valid server");
+        let initial_revision = server.revision_id();
+        let result = server
+            .mutate_project(
+                initial_revision,
+                ProjectCommand::SetProjectName {
+                    name: "Agent edit".into(),
+                },
+            )
+            .expect("mutation applied");
+
+        assert_eq!(result.revision_id, initial_revision + 1);
+        assert_eq!(result.receipt.before_revision_id, initial_revision);
+        assert_eq!(result.receipt.after_revision_id, initial_revision + 1);
+        assert_eq!(result.receipt.action, "set_project_name");
+        assert_eq!(result.receipt.actor.agent_id, "mcp-agent");
+        assert_eq!(server.list_edit_receipts(), &[result.receipt]);
+        assert_eq!(server.session().undo_len(), 1);
+
+        let stale = server.mutate_project(
+            initial_revision,
+            ProjectCommand::SetProjectName {
+                name: "must not apply".into(),
+            },
+        );
+        assert!(matches!(
+            stale,
+            Err(McpError::RevisionConflict {
+                expected,
+                actual
+            })
+            if expected == initial_revision && actual == initial_revision + 1
+        ));
+        assert_eq!(server.project().name, "Agent edit");
+        assert_eq!(server.list_edit_receipts().len(), 1);
+    }
+
+    #[test]
+    fn review_note_surface_marks_notes_stale_after_revision_changes() {
+        let mut server = McpServer::new(Project::golden_scene_preset()).expect("valid server");
+        let initial_revision = server.revision_id();
+        let note = server
+            .add_review_note(
+                initial_revision,
+                "reviewer".into(),
+                "Check this cut".into(),
+                Some(TickRange {
+                    start_tick: Flicks(0),
+                    end_tick: Flicks(1),
+                }),
+            )
+            .expect("note added");
+        assert_eq!(note.freshness, ReviewNoteFreshness::Current);
+
+        server
+            .mutate_project(
+                initial_revision,
+                ProjectCommand::SetProjectName {
+                    name: "New revision".into(),
+                },
+            )
+            .expect("revision advanced");
+        let listed = server.list_review_notes();
+        assert_eq!(listed.current_revision_id, initial_revision + 1);
+        assert_eq!(
+            listed.notes[0].freshness,
+            ReviewNoteFreshness::Stale {
+                current_revision_id: initial_revision + 1
+            }
+        );
+    }
+
+    #[test]
+    fn jsonrpc_tool_calls_expose_receipts_and_revision_bound_notes() {
+        let mut server = McpServer::new(Project::golden_scene_preset()).expect("valid server");
+        let revision = server.revision_id();
+        let mutate = server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "mutate_project",
+                    "arguments": {
+                        "expected_revision_id": revision,
+                        "intent": "rename the project for delivery",
+                        "agent_id": "director",
+                        "command": {
+                            "command": "set_project_name",
+                            "name": "RPC edited"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let mutate: Value = serde_json::from_str(&mutate).unwrap();
+        let receipt = &mutate["result"]["structuredContent"]["receipt"];
+        assert_eq!(receipt["intent"], "rename the project for delivery");
+        assert_eq!(receipt["actor"]["agent_id"], "director");
+        assert_eq!(receipt["action"], "set_project_name");
+        assert_eq!(receipt["before_revision_id"], revision);
+        assert_eq!(receipt["after_revision_id"], revision + 1);
+
+        let add_note = server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_review_note",
+                    "arguments": {
+                        "expected_revision_id": revision + 1,
+                        "author": "human-reviewer",
+                        "body": "Review the new title card",
+                        "start_tick": 100,
+                        "end_tick": 200
+                    }
+                }
+            })
+            .to_string(),
+        );
+        let add_note: Value = serde_json::from_str(&add_note).unwrap();
+        assert_eq!(
+            add_note["result"]["structuredContent"]["note"]["revision_id"],
+            revision + 1
+        );
+        assert_eq!(
+            add_note["result"]["structuredContent"]["freshness"]["status"],
+            "current"
+        );
+
+        let listed = server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": "list_review_notes", "arguments": {} }
+            })
+            .to_string(),
+        );
+        let listed: Value = serde_json::from_str(&listed).unwrap();
+        assert_eq!(
+            listed["result"]["structuredContent"]["notes"][0]["note"]["body"],
+            "Review the new title card"
+        );
     }
 }

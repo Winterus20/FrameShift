@@ -5,6 +5,7 @@ use frameshift_time::{PtsIndex, Rational32};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Rational scaling specification for proxy generation (`scale_num / scale_den`, e.g. `1/2` or `1/4`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -375,8 +376,8 @@ impl ProxyManager {
         })
     }
 
-    /// Resolves an existing proxy MP4 on disk for `(asset_id, spec)` if it exists and matches
-    /// `expected_pts.len()`, preserving `expected_pts`.
+    /// Resolves an existing proxy MP4 on disk for `(asset_id, spec)` only when its exact PTS
+    /// index matches `expected_pts`.
     pub fn resolve_proxy(
         &self,
         asset_id: &str,
@@ -391,14 +392,14 @@ impl ProxyManager {
             Ok(info) => info,
             Err(_) => return Ok(None),
         };
-        if probe.pts_index.len() != expected_pts.len() {
+        if probe.pts_index != *expected_pts {
             return Ok(None);
         }
         Ok(Some(ProxyArtifact {
             proxy_path: path,
             width: probe.width,
             height: probe.height,
-            pts_index: expected_pts.clone(),
+            pts_index: probe.pts_index,
         }))
     }
 
@@ -426,11 +427,49 @@ impl ProxyManager {
         source_path: &Path,
         spec: ProxySpec,
     ) -> Result<ProxyArtifact, MediaError> {
-        let probe = FfmpegBridge::probe_media_info(source_path)?;
-        if let Some(existing) = self.resolve_proxy(asset_id, spec, &probe.pts_index)? {
+        let identity = FfmpegBridge::hash_file(source_path)?;
+        let cache_id = format!("{asset_id}_{}", identity.sha256);
+        let pts_index = FfmpegBridge::probe_pts_index(source_path)?;
+        if let Some(existing) = self.resolve_proxy(&cache_id, spec, &pts_index)? {
             return Ok(existing);
         }
-        let path = self.proxy_path_for(asset_id, spec)?;
-        Self::generate_proxy_mp4(source_path, spec, &path)
+        let path = self.proxy_path_for(&cache_id, spec)?;
+        static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+        let temp = path.with_extension(format!(
+            "work-{}-{}.mp4",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        let result = (|| {
+            let mut artifact = Self::generate_proxy_mp4(source_path, spec, &temp)?;
+            if FfmpegBridge::hash_file(source_path)? != identity {
+                return Err(MediaError::IoError {
+                    message: format!(
+                        "Source changed while creating proxy: {}",
+                        source_path.display()
+                    ),
+                });
+            }
+            std::fs::rename(&temp, &path)?;
+            artifact.proxy_path = path;
+            Ok(artifact)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
+    }
+
+    /// Returns a proxy only when its cache key matches the original media bytes.
+    pub fn resolve_current_mp4_proxy(
+        &self,
+        asset_id: &str,
+        source_path: &Path,
+        spec: ProxySpec,
+    ) -> Result<Option<ProxyArtifact>, MediaError> {
+        let identity = FfmpegBridge::hash_file(source_path)?;
+        let cache_id = format!("{asset_id}_{}", identity.sha256);
+        let pts = FfmpegBridge::probe_pts_index(source_path)?;
+        self.resolve_proxy(&cache_id, spec, &pts)
     }
 }

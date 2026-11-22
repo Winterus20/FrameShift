@@ -274,6 +274,7 @@ dependencies = [
 name = "frameshift-mcp"
 version = "0.1.0"
 dependencies = [
+ "frameshift-app",
  "frameshift-core",
  "frameshift-media",
  "frameshift-schema",

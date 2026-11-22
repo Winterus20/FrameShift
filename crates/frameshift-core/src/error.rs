@@ -56,4 +56,7 @@ pub enum CoreError {
 
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    #[error("export cancelled")]
+    Cancelled,
 }

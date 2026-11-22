@@ -1022,7 +1022,7 @@ impl GpuSlugVertex {
     }
 }
 
-/// Pod wrapper for `SlugGlyphGpu` (48 bytes).
+/// Pod wrapper for `SlugGlyphGpu` (64 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct GpuSlugGlyph {
@@ -1032,6 +1032,7 @@ pub struct GpuSlugGlyph {
     pub vband_base: u32,
     pub hband_count: u32,
     pub vband_count: u32,
+    pub unit_ranges: [u32; 4],
 }
 
 impl From<&frameshift_vector::SlugGlyphGpu> for GpuSlugGlyph {
@@ -1043,6 +1044,7 @@ impl From<&frameshift_vector::SlugGlyphGpu> for GpuSlugGlyph {
             vband_base: g.vband_base,
             hband_count: g.hband_count,
             vband_count: g.vband_count,
+            unit_ranges: g.unit_ranges,
         }
     }
 }
@@ -1083,7 +1085,7 @@ impl From<&frameshift_vector::SlugCurveGpu> for GpuSlugCurve {
     }
 }
 
-/// Uniform buffer for `text_slug.wgsl` (80 bytes, 16-byte aligned).
+/// Uniform buffer for `text_slug.wgsl` (128 bytes, 16-byte aligned).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct SlugUniform {
@@ -1092,6 +1094,12 @@ pub struct SlugUniform {
     pub color_top: [f32; 4],
     pub color_bottom: [f32; 4],
     pub style_params: [f32; 4],
+    /// x = enabled, y = unit (0 grapheme, 1 word), z = range start, w = end-exclusive.
+    pub selector: [u32; 4],
+    /// x = current time, y = animation start, z = duration, w = per-unit stagger in seconds.
+    pub timing_seconds: [f32; 4],
+    /// x/y = initial position in canvas-height units, z = initial scale, w = initial opacity.
+    pub from_style: [f32; 4],
 }
 
 /// Uniform buffer for `text2d_fx.wgsl` (112 bytes, 16-byte aligned).
@@ -1142,10 +1150,10 @@ const _: () = {
     assert!(std::mem::size_of::<DofCocUniform>() == 32);
     assert!(std::mem::size_of::<DofBokehUniform>() == 48);
     assert!(std::mem::size_of::<GpuSlugVertex>() == 40);
-    assert!(std::mem::size_of::<GpuSlugGlyph>() == 48);
+    assert!(std::mem::size_of::<GpuSlugGlyph>() == 64);
     assert!(std::mem::size_of::<GpuSlugBand>() == 16);
     assert!(std::mem::size_of::<GpuSlugCurve>() == 32);
-    assert!(std::mem::size_of::<SlugUniform>() == 80);
+    assert!(std::mem::size_of::<SlugUniform>() == 128);
     assert!(std::mem::size_of::<Text2DFxUniform>() == 112);
     assert!(std::mem::size_of::<Text2DJfaUniform>() == 16);
 };

@@ -849,10 +849,127 @@ impl Project {
                         return Err(SchemaError::MissingAsset(asset_id.clone()));
                     }
                 }
+                NodeKind::MaskMatte {
+                    mode: MatteMode::Alpha,
+                    ..
+                } => {
+                    self.validate_shared_alpha_matte_source(graph, node)?;
+                }
                 NodeKind::Precomp { sub_graph, .. } => {
                     self.validate_graph_assets(sub_graph)?;
                 }
                 _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the narrow retimed-video matte contract when both direct inputs
+    /// are video sources over the same clip but refer to distinct assets.
+    /// Generic, static, and self-matte graphs keep their existing behavior.
+    fn validate_shared_alpha_matte_source(
+        &self,
+        graph: &RenderGraphDef,
+        matte_node: &GraphNodeDef,
+    ) -> Result<(), SchemaError> {
+        let [source_id, matte_id] = matte_node.inputs.as_slice() else {
+            // Graph arity validation reports this before asset validation.
+            return Ok(());
+        };
+        let (Some(source_node), Some(matte_source_node)) =
+            (graph.node(source_id), graph.node(matte_id))
+        else {
+            // Graph DAG validation reports missing nodes before asset validation.
+            return Ok(());
+        };
+        let (
+            NodeKind::SourceVideo {
+                asset_id: source_asset_id,
+                clip_id: Some(source_clip_id),
+                fit: source_fit,
+                ..
+            },
+            NodeKind::SourceVideo {
+                asset_id: matte_asset_id,
+                clip_id: Some(matte_clip_id),
+                fit: matte_fit,
+                ..
+            },
+        ) = (&source_node.kind, &matte_source_node.kind)
+        else {
+            return Ok(());
+        };
+        if source_clip_id != matte_clip_id || source_asset_id == matte_asset_id {
+            return Ok(());
+        }
+        if source_fit != matte_fit {
+            return Err(SchemaError::InvalidTimeline(format!(
+                "alpha matte node '{}' uses different source fit modes for shared clip '{}'; source and matte must use the same crop",
+                matte_node.id, source_clip_id
+            )));
+        }
+
+        let clip = self
+            .clip(source_clip_id)
+            .ok_or_else(|| SchemaError::MissingClip(source_clip_id.clone()))?;
+        let matte_asset = self
+            .asset(matte_asset_id)
+            .ok_or_else(|| SchemaError::MissingAsset(matte_asset_id.clone()))?;
+        if let Some(matte_duration) = matte_asset.duration_ticks {
+            let output_duration = clip
+                .timeline_end
+                .0
+                .checked_sub(clip.timeline_start.0)
+                .ok_or_else(|| {
+                    SchemaError::InvalidTimeline(format!(
+                        "alpha matte node '{}' has overflowing clip duration for '{}'",
+                        matte_node.id, source_clip_id
+                    ))
+                })?;
+            if output_duration <= 0 {
+                return Err(SchemaError::InvalidClipBounds {
+                    clip_id: source_clip_id.clone(),
+                    start: clip.timeline_start,
+                    end: clip.timeline_end,
+                });
+            }
+            // Timeline clips are half-open. Check the last representable output tick
+            // that can be sampled, rather than the exclusive end boundary.
+            let last_output_offset = Flicks(output_duration - 1);
+            let (source_min_offset, source_max_offset) = clip
+                .speed_curve
+                .source_extrema(Flicks::ZERO, last_output_offset);
+            let source_min = clip
+                .source_start
+                .checked_add(source_min_offset)
+                .map_err(|error| {
+                    SchemaError::InvalidTimeline(format!(
+                        "alpha matte node '{}' source-time range overflow: {error}",
+                        matte_node.id
+                    ))
+                })?;
+            let source_max = clip
+                .source_start
+                .checked_add(source_max_offset)
+                .map_err(|error| {
+                    SchemaError::InvalidTimeline(format!(
+                        "alpha matte node '{}' source-time range overflow: {error}",
+                        matte_node.id
+                    ))
+                })?;
+            if matte_duration <= Flicks::ZERO
+                || source_min < Flicks::ZERO
+                || source_max >= matte_duration
+            {
+                return Err(SchemaError::InvalidTimeline(format!(
+                    "alpha matte node '{}' maps clip '{}' to source ticks [{}, {}], outside matte asset '{}' declared coverage [0, {})",
+                    matte_node.id,
+                    source_clip_id,
+                    source_min.0,
+                    source_max.0,
+                    matte_asset_id,
+                    matte_duration.0
+                )));
             }
         }
         Ok(())
@@ -1144,6 +1261,7 @@ impl Project {
                             glow_rgba: [0.0; 4],
                             hdr_intensity: 1.0,
                             gpu_slug: true,
+                            text_animator: None,
                         },
                         inputs: vec![],
                         enabled: true,

@@ -19,7 +19,7 @@ pub struct SlugBandGpu {
     pub _pad: [u32; 2],
 }
 
-/// GPU glyph metadata and band mapping (48 bytes).
+/// GPU glyph metadata, source selector ranges, and band mapping (64 bytes).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SlugGlyphGpu {
@@ -31,6 +31,8 @@ pub struct SlugGlyphGpu {
     pub vband_base: u32,
     pub hband_count: u32,
     pub vband_count: u32,
+    /// `[grapheme_start, grapheme_end, word_start, word_end]`, end-exclusive.
+    pub unit_ranges: [u32; 4],
 }
 
 /// GPU vertex for a dilated glyph quad (40 bytes).
@@ -60,6 +62,8 @@ pub struct SlugSceneGpu {
     pub band_indices: Vec<u32>,
     pub curves: Vec<SlugCurveGpu>,
     pub block_bounds: [f32; 4],
+    pub grapheme_count: u32,
+    pub word_count: u32,
 }
 
 impl SlugSceneGpu {
@@ -78,6 +82,8 @@ pub fn build_slug_scene(block: &ShapedTextBlock) -> SlugSceneGpu {
             block.bounds_max[0],
             block.bounds_max[1],
         ],
+        grapheme_count: block.grapheme_count,
+        word_count: block.word_count,
         ..SlugSceneGpu::default()
     };
 
@@ -182,6 +188,12 @@ pub fn build_slug_scene(block: &ShapedTextBlock) -> SlugSceneGpu {
             vband_base,
             hband_count,
             vband_count,
+            unit_ranges: [
+                glyph.grapheme_start,
+                glyph.grapheme_end,
+                glyph.word_start,
+                glyph.word_end,
+            ],
         });
 
         let u0 = ((min_x - block.bounds_min[0]) / block_w).clamp(0.0, 1.0);

@@ -860,6 +860,7 @@ fn vector_text_renders_standalone_and_supports_provider_override() {
                 glow_rgba: [0.0; 4],
                 hdr_intensity: 1.0,
                 gpu_slug: true,
+                text_animator: None,
             },
             inputs: vec![],
             enabled: true,
@@ -1932,4 +1933,109 @@ fn bad_expression_stops_frame_evaluation() {
         }
         other => panic!("expected Expression, got {other}"),
     }
+}
+
+#[test]
+fn alpha_track_matte_uses_retimed_source_tick_and_shared_crop_fit() {
+    use std::cell::RefCell;
+
+    struct RetimedAnimator;
+    impl NodeAnimator for RetimedAnimator {
+        fn resolve_source_tick(
+            &self,
+            _asset_id: &str,
+            clip_id: Option<&str>,
+            sub_tick: Flicks,
+        ) -> Result<Option<Flicks>, RenderError> {
+            Ok(Some(if clip_id == Some("retimed_clip") {
+                Flicks(sub_tick.0 / 2)
+            } else {
+                sub_tick
+            }))
+        }
+    }
+
+    let graph = RenderGraphDef {
+        output_node: NodeId::from("masked"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("footage"),
+                kind: NodeKind::SourceVideo {
+                    asset_id: "footage_asset".into(),
+                    clip_id: Some("retimed_clip".into()),
+                    color_space: ColorSpace::LinearRec709,
+                    fit: SourceFit::Cover,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("alpha_matte"),
+                kind: NodeKind::SourceVideo {
+                    asset_id: "matte_asset".into(),
+                    clip_id: Some("retimed_clip".into()),
+                    color_space: ColorSpace::LinearRec709,
+                    fit: SourceFit::Cover,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("masked"),
+                kind: NodeKind::MaskMatte {
+                    mode: MatteMode::Alpha,
+                    invert: false,
+                    feather: 0.0,
+                    opaque_black_outside: false,
+                },
+                inputs: vec![NodeId::from("footage"), NodeId::from("alpha_matte")],
+                enabled: true,
+            },
+        ],
+    };
+
+    let seen = RefCell::new(Vec::new());
+    let mut compositor = GpuCompositor::new_headless().expect("headless init");
+    let frame = {
+        let provider = FnFrameProvider(
+            |asset_id: &str, source_tick: Flicks, width: u32, height: u32| {
+                seen.borrow_mut().push((asset_id.to_owned(), source_tick));
+                let mut pixels = vec![[0.0, 0.0, 0.0, 0.0]; (width * height) as usize];
+                if asset_id == "footage_asset" {
+                    pixels.fill([0.5, 0.25, 0.125, 1.0]);
+                } else {
+                    for y in 0..height {
+                        for x in width / 2..width {
+                            pixels[(y * width + x) as usize] = [0.0, 0.0, 0.0, 1.0];
+                        }
+                    }
+                }
+                Ok(SourceFrame::rgba_f32_straight(width, height, pixels))
+            },
+        );
+        compositor
+            .render_frame(
+                &graph,
+                Flicks(2 * FLICKS_PER_SECOND),
+                FPS_60.frame_duration().expect("frame duration"),
+                16,
+                16,
+                &provider,
+                &RetimedAnimator,
+                &RenderOptions {
+                    tonemap_mode: Some(TonemapMode::None),
+                    output_alpha_mode: OutputAlphaMode::Straight,
+                    ..Default::default()
+                },
+            )
+            .expect("alpha matte render")
+    };
+
+    let left = ((4 * 16 + 4) * 4) as usize;
+    let right = ((4 * 16 + 12) * 4) as usize;
+    assert_eq!(&frame.rgba8[left..left + 4], &[0, 0, 0, 0]);
+    assert_eq!(frame.rgba8[right + 3], 255);
+    let seen = seen.into_inner();
+    assert!(seen.contains(&("footage_asset".into(), Flicks(FLICKS_PER_SECOND))));
+    assert!(seen.contains(&("matte_asset".into(), Flicks(FLICKS_PER_SECOND))));
 }

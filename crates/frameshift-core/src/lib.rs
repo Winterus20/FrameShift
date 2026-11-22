@@ -1,17 +1,25 @@
 //! FrameShift core orchestration, project session management, media resolution,
 //! headless rendering, multi-surface inspection, and verification.
 
+pub mod autocut;
 pub mod engine;
 pub mod error;
+pub mod export;
 pub mod inspection;
 pub mod progress;
 pub mod range;
-pub mod autocut;
 pub mod report;
 pub mod resolver;
+pub mod workbench;
 
+pub use autocut::{AutocutParams, plan_autocut};
 pub use engine::Engine;
 pub use error::CoreError;
+pub use export::{
+    ExportDependencyRecord, ExportJobId, ExportJobSnapshot, ExportJobState, ExportOutputReport,
+    ExportOutputState, ExportProbeReport, ExportProgressSnapshot, ExportQueue, ExportTarget,
+    ExportTicket,
+};
 pub use frameshift_app::{
     ActorKind, AppError, BackgroundJobSupervisor, ClipEditAction, JobId, JobKind, JobState,
     OptimisticLockGuard, WindowClosePolicy, WorkspaceUiController,
@@ -35,7 +43,6 @@ pub use inspection::{
 };
 pub use progress::{RenderProgress, RenderStage};
 pub use range::RenderRange;
-pub use autocut::{plan_autocut, AutocutParams};
 pub use report::{
     AudioImpactSyncReport, DeterminismCheckReport, M1VerificationReport, MotionBlurCheckReport,
     Phase5VerificationReport, SeekIndependenceCheckReport, VideoRenderSummary,

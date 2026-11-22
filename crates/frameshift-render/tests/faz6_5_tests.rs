@@ -7,7 +7,7 @@ use frameshift_render::{
 use frameshift_schema::{
     BevelProfile3D, GraphNodeDef, NodeId, NodeKind, ParamBindingDef, Project, RenderGraphDef,
     RenderProfileDef, RenderProfileKind, RenderProfilesDef, Resolution, TextAlign2D, TimelineDef,
-    WorkingPixelFormat, WritingMode2D, CURRENT_SCHEMA_VERSION,
+    TextAnimatorDef, TextSelectorUnit, WorkingPixelFormat, WritingMode2D, CURRENT_SCHEMA_VERSION,
 };
 use frameshift_time::{Flicks, FLICKS_PER_SECOND, FPS_60};
 
@@ -107,6 +107,7 @@ fn wgsl_slug_renders_gradient_double_anime_outline_knockout_glow_and_shadow() {
                 },
                 hdr_intensity: 1.25,
                 gpu_slug,
+                text_animator: None,
             },
             inputs: vec![],
             enabled: true,
@@ -159,6 +160,143 @@ fn wgsl_slug_renders_gradient_double_anime_outline_knockout_glow_and_shadow() {
         "2D FX (double outline + glow + shadow) must expand visible coverage ({fx_px} vs {bare_px})"
     );
     assert_ne!(bare_a.fnv1a_hash, fx_frame.fnv1a_hash);
+}
+
+#[test]
+fn shaped_text_animator_selects_grapheme_range_and_staggers_in_ticks() {
+    let font_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/Anton-Regular.ttf");
+    if !Path::new(font_path).is_file() {
+        return;
+    }
+    let mut compositor = GpuCompositor::new_headless().expect("headless compositor");
+    let provider = no_override_provider();
+    let frame_ticks = FPS_60.frame_duration().expect("frame duration");
+    let graph = RenderGraphDef {
+        output_node: NodeId::from("title"),
+        nodes: vec![GraphNodeDef {
+            id: NodeId::from("title"),
+            kind: NodeKind::VectorText {
+                text: "AB".into(),
+                font_size_norm: 0.36,
+                color_rgba: [1.0, 1.0, 1.0, 1.0],
+                outline_rgba: [0.0; 4],
+                outline_width_norm: 0.0,
+                align_center: true,
+                y_offset_norm: 0.5,
+                font_family: None,
+                font_path: Some(font_path.into()),
+                font_weight: 400,
+                align: Some(TextAlign2D::Center),
+                x_offset_norm: None,
+                tracking_em: Some(0.0),
+                line_height_em: None,
+                opacity: 1.0,
+                fallback_fonts: Vec::new(),
+                writing_mode: WritingMode2D::HorizontalTb,
+                var_wght: None,
+                var_wdth: None,
+                var_slnt: None,
+                color_bottom_rgba: None,
+                gradient_angle_deg: 0.0,
+                outer_outline_rgba: [0.0; 4],
+                outer_outline_width_norm: 0.0,
+                outline_gap_norm: 0.0,
+                shadow_offset_norm: [0.0; 2],
+                shadow_blur_norm: 0.0,
+                shadow_rgba: [0.0; 4],
+                glow_radius_norm: 0.0,
+                glow_rgba: [0.0; 4],
+                hdr_intensity: 1.0,
+                gpu_slug: false,
+                text_animator: Some(TextAnimatorDef {
+                    unit: TextSelectorUnit::Grapheme,
+                    range_start: 0,
+                    range_end: Some(1),
+                    start_tick: 0,
+                    duration_ticks: FLICKS_PER_SECOND,
+                    delay_ticks: 0,
+                    position_from_norm: [0.0; 2],
+                    scale_from: 1.0,
+                    opacity_from: 0.0,
+                }),
+            },
+            inputs: vec![],
+            enabled: true,
+        }],
+    };
+    let (start_coverage, middle_coverage, end_coverage) = {
+        let mut render_at = |tick| {
+            compositor
+                .render_frame(
+                    &graph,
+                    tick,
+                    frame_ticks,
+                    160,
+                    90,
+                    &provider,
+                    &NoopAnimator,
+                    &test_opts(),
+                )
+                .expect("text animator render")
+        };
+
+        let start = render_at(Flicks::ZERO);
+        let middle = render_at(Flicks(FLICKS_PER_SECOND / 2));
+        let end = render_at(Flicks(FLICKS_PER_SECOND));
+        (
+            count_non_zero_alpha(&start.rgba8),
+            count_non_zero_alpha(&middle.rgba8),
+            count_non_zero_alpha(&end.rgba8),
+        )
+    };
+    assert!(start_coverage > 0, "the unselected B remains visible");
+    assert!(middle_coverage > start_coverage);
+    assert!(end_coverage > middle_coverage);
+
+    let mut word_graph = graph.clone();
+    let NodeKind::VectorText {
+        text,
+        text_animator,
+        ..
+    } = &mut word_graph.nodes[0].kind
+    else {
+        unreachable!("test graph contains vector text")
+    };
+    *text = "A B".into();
+    *text_animator = Some(TextAnimatorDef {
+        unit: TextSelectorUnit::Word,
+        range_start: 1,
+        range_end: Some(2),
+        start_tick: 0,
+        duration_ticks: FLICKS_PER_SECOND,
+        delay_ticks: 0,
+        position_from_norm: [0.0; 2],
+        scale_from: 1.0,
+        opacity_from: 0.0,
+    });
+    let mut render_word_at = |tick| {
+        compositor
+            .render_frame(
+                &word_graph,
+                tick,
+                frame_ticks,
+                160,
+                90,
+                &provider,
+                &NoopAnimator,
+                &test_opts(),
+            )
+            .expect("word selector render")
+    };
+    let start_word = render_word_at(Flicks::ZERO);
+    let middle_word = render_word_at(Flicks(FLICKS_PER_SECOND / 2));
+    let end_word = render_word_at(Flicks(FLICKS_PER_SECOND));
+    let start_word_coverage = count_non_zero_alpha(&start_word.rgba8);
+    let middle_word_coverage = count_non_zero_alpha(&middle_word.rgba8);
+    let end_word_coverage = count_non_zero_alpha(&end_word.rgba8);
+    assert!(start_word_coverage > 0, "the unselected A remains visible");
+    assert!(middle_word_coverage > start_word_coverage);
+    assert!(end_word_coverage > middle_word_coverage);
 }
 
 #[test]
@@ -217,6 +355,7 @@ fn wgsl_slug_supports_tategaki_japanese_and_animated_variable_font() {
                 glow_rgba: [0.0; 4],
                 hdr_intensity: 1.0,
                 gpu_slug: true,
+                text_animator: None,
             },
             inputs: vec![],
             enabled: true,
@@ -300,6 +439,7 @@ fn wgsl_slug_supports_tategaki_japanese_and_animated_variable_font() {
                     glow_rgba: [0.0; 4],
                     hdr_intensity: 1.0,
                     gpu_slug: true,
+                    text_animator: None,
                 },
                 inputs: vec![],
                 enabled: true,

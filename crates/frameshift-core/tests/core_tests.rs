@@ -69,6 +69,60 @@ fn engine_renders_single_frame_with_cache_telemetry_and_seek_determinism() {
 }
 
 #[test]
+fn split_clip_preserves_rendered_frames_across_the_new_boundary() {
+    let mut original = Project::golden_scene_preset();
+    original.render_profiles.draft.resolution = Resolution {
+        width: 64,
+        height: 36,
+    };
+    let mut session = ProjectSession::new(original.clone()).expect("valid golden project");
+    session
+        .apply_command(
+            1,
+            ProjectCommand::SplitClip {
+                clip_id: "clip_a".into(),
+                split_tick: Flicks(FLICKS_PER_SECOND),
+                right_clip_id: "clip_a_tail".into(),
+            },
+        )
+        .expect("source-routed split succeeds");
+    let split = session.project();
+    let sample_tick = Flicks(FLICKS_PER_SECOND + FLICKS_PER_SECOND / 2);
+
+    let mut original_engine = Engine::new_headless().expect("headless engine");
+    let before = original_engine
+        .render_frame_at(&original, RenderProfileKind::Draft, sample_tick)
+        .expect("render unsplit timeline");
+    let mut split_engine = Engine::new_headless().expect("second headless engine");
+    let after = split_engine
+        .render_frame_at(split, RenderProfileKind::Draft, sample_tick)
+        .expect("render split timeline");
+    let mut differing_channels = 0usize;
+    let mut differing_alpha = 0usize;
+    let mut max_color_delta = 0u8;
+    let mut first_difference = None;
+    for (index, (&actual, &expected)) in after.data.iter().zip(&before.data).enumerate() {
+        let delta = actual.abs_diff(expected);
+        differing_channels += usize::from(delta > 0);
+        if index % 4 == 3 {
+            differing_alpha += usize::from(delta > 0);
+        } else {
+            max_color_delta = max_color_delta.max(delta);
+        }
+        if delta > 0 && first_difference.is_none() {
+            first_difference = Some((index, actual, expected));
+        }
+    }
+    assert_eq!(differing_alpha, 0, "split render changed alpha coverage");
+    assert!(
+        max_color_delta <= 1,
+        "split render changed {differing_channels} channels (max color delta {max_color_delta}); first difference {first_difference:?}; hashes {} vs {}",
+        after.fnv1a_hash64(),
+        before.fnv1a_hash64()
+    );
+}
+
+#[test]
 fn engine_resolves_moving_mask_synthetic_asset_and_on_disk_mp4() {
     let temp = unique_temp_dir("disk_and_mask");
     let disk_clip_path = temp.0.join("disk_clip.mp4");
@@ -319,9 +373,14 @@ fn engine_source_image_png_alpha_and_jpeg_fallback() {
     let jpg_src_path = temp.0.join("photo_src.png");
     let jpg_path = temp.0.join("photo.jpg");
 
-    let mut overlay =
-        Rgba8Frame::filled(64, 32, Flicks::ZERO, [0, 240, 255, 255], AlphaMode::Straight)
-            .expect("overlay frame");
+    let mut overlay = Rgba8Frame::filled(
+        64,
+        32,
+        Flicks::ZERO,
+        [0, 240, 255, 255],
+        AlphaMode::Straight,
+    )
+    .expect("overlay frame");
     for y in 0..32 {
         for x in 0..32 {
             overlay.set_pixel(x, y, [0, 0, 0, 0]);
@@ -329,9 +388,14 @@ fn engine_source_image_png_alpha_and_jpeg_fallback() {
     }
     overlay.save_png(&png_path).expect("save png overlay");
 
-    let photo_src =
-        Rgba8Frame::filled(64, 32, Flicks::ZERO, [40, 220, 80, 255], AlphaMode::Straight)
-            .expect("photo src");
+    let photo_src = Rgba8Frame::filled(
+        64,
+        32,
+        Flicks::ZERO,
+        [40, 220, 80, 255],
+        AlphaMode::Straight,
+    )
+    .expect("photo src");
     photo_src.save_png(&jpg_src_path).expect("save jpg source");
     let status = std::process::Command::new("ffmpeg")
         .args(["-v", "error", "-y", "-i"])
@@ -531,6 +595,7 @@ fn engine_precomp_nested_inputs_time_remap_and_streaming_video_decoder() {
                     glow_rgba: [0.0; 4],
                     hdr_intensity: 1.0,
                     gpu_slug: true,
+                    text_animator: None,
                 },
                 inputs: Vec::new(),
                 enabled: true,
@@ -607,7 +672,10 @@ fn engine_precomp_nested_inputs_time_remap_and_streaming_video_decoder() {
         .expect("render frame 2");
 
     let tel = engine.decoder_telemetry();
-    assert_eq!(tel.spawns, 1, "sequential streaming should reuse 1 ffmpeg process");
+    assert_eq!(
+        tel.spawns, 1,
+        "sequential streaming should reuse 1 ffmpeg process"
+    );
     assert_eq!(tel.seek_reopens, 0);
     assert_ne!(seq0.fnv1a_hash64(), seq2.fnv1a_hash64());
 
@@ -673,6 +741,7 @@ fn engine_vector_text_real_ttf_and_font_not_found_error() {
                     glow_rgba: [0.0; 4],
                     hdr_intensity: 1.0,
                     gpu_slug: true,
+                    text_animator: None,
                 },
                 inputs: Vec::new(),
                 enabled: true,
@@ -726,6 +795,7 @@ fn engine_vector_text_real_ttf_and_font_not_found_error() {
         glow_rgba: [0.0; 4],
         hdr_intensity: 1.0,
         gpu_slug: true,
+        text_animator: None,
     };
     project.param_bindings.push(ParamBindingDef {
         node_id: NodeId::from("vtext"),
@@ -778,6 +848,7 @@ fn engine_vector_text_real_ttf_and_font_not_found_error() {
             glow_rgba: [0.0; 4],
             hdr_intensity: 1.0,
             gpu_slug: true,
+            text_animator: None,
         };
         let ttf_frame = engine
             .render_frame_at(&project, RenderProfileKind::Draft, Flicks::ZERO)
@@ -789,7 +860,10 @@ fn engine_vector_text_real_ttf_and_font_not_found_error() {
             .iter()
             .filter(|p| p[3] > 10)
             .count();
-        assert!(non_empty > 40, "expected rendered TTF glyphs, got {non_empty} pixels");
+        assert!(
+            non_empty > 40,
+            "expected rendered TTF glyphs, got {non_empty} pixels"
+        );
 
         // Re-render with dynamic opacity binding as well.
         project.param_bindings.push(ParamBindingDef {
@@ -955,7 +1029,9 @@ fn engine_lut3d_cube_and_ocio_configs() {
 
     // 1. Write a 2x2x2 .cube LUT that maps every color toward strong green [0.0, 1.0, 0.0]
     let cube_path = temp.0.join("force_green.cube");
-    let mut cube = String::from("TITLE \"ForceGreen\"\nLUT_3D_SIZE 2\nDOMAIN_MIN 0.0 0.0 0.0\nDOMAIN_MAX 1.0 1.0 1.0\n");
+    let mut cube = String::from(
+        "TITLE \"ForceGreen\"\nLUT_3D_SIZE 2\nDOMAIN_MIN 0.0 0.0 0.0\nDOMAIN_MAX 1.0 1.0 1.0\n",
+    );
     for _b in 0..2 {
         for _g in 0..2 {
             for _r in 0..2 {
@@ -1102,11 +1178,7 @@ fn range_render_matches_full_render_hashes_and_slices_audio() {
     let (temp, project) = small_draft_project("range_render", Flicks(FLICKS_PER_SECOND / 2));
     let mut engine = Engine::new_headless().expect("engine");
     let full = engine
-        .render_video_mp4(
-            &project,
-            RenderProfileKind::Draft,
-            &temp.0.join("full.mp4"),
-        )
+        .render_video_mp4(&project, RenderProfileKind::Draft, &temp.0.join("full.mp4"))
         .expect("full render");
     assert_eq!(full.frame_count, 30);
     assert_eq!(full.range, None);
@@ -1132,8 +1204,8 @@ fn range_render_matches_full_render_hashes_and_slices_audio() {
     assert_eq!(partial.duration_ticks, project.timeline.duration_ticks);
     assert!(partial.has_audio);
 
-    let probed = FfmpegBridge::probe_media_info(&temp.0.join("range.mp4"))
-        .expect("probe range mp4");
+    let probed =
+        FfmpegBridge::probe_media_info(&temp.0.join("range.mp4")).expect("probe range mp4");
     assert_eq!(probed.width, 64);
     assert_eq!(probed.height, 36);
     assert!(probed.has_audio);
@@ -1234,9 +1306,8 @@ fn audio_slice_length_matches_ticks_and_first_sample() {
     let expected_frames =
         ticks_to_audio_samples_nearest(duration, DEFAULT_AUDIO_SAMPLE_RATE).expect("sample count");
     assert_eq!(sliced.frame_count(), expected_frames as usize);
-    let start_sample =
-        ticks_to_audio_samples_nearest(start, DEFAULT_AUDIO_SAMPLE_RATE).expect("start sample")
-            as usize;
+    let start_sample = ticks_to_audio_samples_nearest(start, DEFAULT_AUDIO_SAMPLE_RATE)
+        .expect("start sample") as usize;
     let channels = full.channels as usize;
     assert_eq!(
         &sliced.samples[..channels],
@@ -1244,4 +1315,3 @@ fn audio_slice_length_matches_ticks_and_first_sample() {
     );
     assert_eq!(sliced.sample_rate, DEFAULT_AUDIO_SAMPLE_RATE);
 }
-

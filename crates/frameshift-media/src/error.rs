@@ -32,6 +32,9 @@ pub enum MediaError {
     #[error("empty media stream: {0}")]
     EmptyMediaStream(String),
 
+    #[error("invalid encoding settings: {0}")]
+    InvalidEncodingSettings(String),
+
     #[error("invalid PTS index: {0}")]
     InvalidPtsIndex(String),
 
@@ -58,9 +61,7 @@ pub enum MediaError {
     },
 
     #[error("{message}")]
-    IoError {
-        message: String,
-    },
+    IoError { message: String },
 
     #[error("failed to parse media metadata: {0}")]
     ParseError(String),

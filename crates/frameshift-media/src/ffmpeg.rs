@@ -1,15 +1,65 @@
 use crate::audio::AudioBuffer;
 use crate::error::MediaError;
+use crate::frame::Sha256;
 use crate::frame::{AlphaMode, Rgba8Frame, fit_rgba8_frame};
 use frameshift_time::{FLICKS_PER_SECOND, Flicks, PtsIndex, Rational32};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Content identity for a file, computed from its exact bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileContentIdentity {
+    pub byte_len: u64,
+    /// Lowercase SHA-256 digest.
+    pub sha256: String,
+}
+
+/// Reproducible software H.264 encoding settings for MP4 output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoEncodingSettings {
+    /// FFmpeg libx264 preset (validated against its standard preset names).
+    pub preset: String,
+    /// Constant rate factor in `0..=51`.
+    pub crf: u8,
+}
+
+impl Default for VideoEncodingSettings {
+    fn default() -> Self {
+        Self {
+            preset: "veryfast".into(),
+            crf: 16,
+        }
+    }
+}
+
+impl VideoEncodingSettings {
+    pub fn validate(&self) -> Result<(), MediaError> {
+        const PRESETS: &[&str] = &[
+            "ultrafast",
+            "superfast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow",
+        ];
+        if !PRESETS.contains(&self.preset.as_str()) || self.crf > 51 {
+            return Err(MediaError::InvalidEncodingSettings(format!(
+                "unsupported libx264 settings: preset='{}', crf={} (expected a standard preset and crf 0..=51)",
+                self.preset, self.crf
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// Detected FFmpeg hardware acceleration capabilities on the host.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -170,6 +220,9 @@ impl HwAccelDetector {
 /// Metadata summary extracted from a media container via `ffprobe`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaProbeInfo {
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub pixel_format: Option<String>,
     pub width: u32,
     pub height: u32,
     pub fps: Option<Rational32>,
@@ -188,6 +241,34 @@ pub struct MediaProbeInfo {
 pub struct FfmpegBridge;
 
 impl FfmpegBridge {
+    /// Computes a stable SHA-256 identity for an in-memory byte slice.
+    pub fn hash_bytes(bytes: &[u8]) -> FileContentIdentity {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        FileContentIdentity {
+            byte_len: bytes.len() as u64,
+            sha256: hex_sha256(hasher.finalize()),
+        }
+    }
+
+    /// Computes a stable SHA-256 identity for a file without loading it all into memory.
+    pub fn hash_file(path: &Path) -> Result<FileContentIdentity, MediaError> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut byte_len = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            byte_len = byte_len.saturating_add(read as u64);
+            hasher.update(&buffer[..read]);
+        }
+        let sha256 = hex_sha256(hasher.finalize());
+        Ok(FileContentIdentity { byte_len, sha256 })
+    }
+
     /// Probes a video file with `ffprobe` to build a deterministic `PtsIndex`
     /// using `i128` rational arithmetic over stream `time_base` and frame PTS values.
     pub fn probe_pts_index(path: &Path) -> Result<PtsIndex, MediaError> {
@@ -201,7 +282,7 @@ impl FfmpegBridge {
                 "-v",
                 "error",
                 "-show_entries",
-                "stream=codec_type,width,height,time_base,avg_frame_rate,r_frame_rate,start_pts,duration_ts,sample_rate,channels",
+                "stream=codec_type,codec_name,width,height,pix_fmt,time_base,avg_frame_rate,r_frame_rate,start_pts,duration_ts,sample_rate,channels",
                 "-show_entries",
                 "frame=media_type,pts,best_effort_timestamp,pts_time",
                 "-of",
@@ -317,6 +398,9 @@ impl FfmpegBridge {
         let audio_channels = audio_stream.and_then(|s| s.channels);
 
         Ok(MediaProbeInfo {
+            video_codec: video_stream.codec_name.clone(),
+            audio_codec: audio_stream.and_then(|s| s.codec_name.clone()),
+            pixel_format: video_stream.pix_fmt.clone(),
             width,
             height,
             fps,
@@ -799,13 +883,16 @@ impl FfmpegBridge {
             }
         }
 
-        let mut encoder =
-            Mp4FrameEncoder::new(width, height, audio, fps, out_path, video_encoder)?;
+        let mut encoder = Mp4FrameEncoder::new(width, height, audio, fps, out_path, video_encoder)?;
         for frame in frames {
             encoder.write_frame(frame)?;
         }
         encoder.finish()
     }
+}
+
+fn hex_sha256(bytes: [u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Streaming MP4 encoder that writes raw RGBA8 frames to one ffmpeg child process.
@@ -838,6 +925,28 @@ impl Mp4FrameEncoder {
         out_path: &Path,
         video_encoder: &str,
     ) -> Result<Self, MediaError> {
+        Self::new_with_settings(
+            width,
+            height,
+            audio,
+            fps,
+            out_path,
+            video_encoder,
+            &VideoEncodingSettings::default(),
+        )
+    }
+
+    /// Starts an encoder using explicit libx264 quality settings.
+    pub fn new_with_settings(
+        width: u32,
+        height: u32,
+        audio: Option<&AudioBuffer>,
+        fps: Rational32,
+        out_path: &Path,
+        video_encoder: &str,
+        encoding: &VideoEncodingSettings,
+    ) -> Result<Self, MediaError> {
+        encoding.validate()?;
         if fps.num == 0 || fps.den == 0 {
             return Err(frameshift_time::TimeError::InvalidRational {
                 num: fps.num,
@@ -877,7 +986,8 @@ impl Mp4FrameEncoder {
         }
         cmd.args(["-c:v", video_encoder, "-pix_fmt", "yuv420p"]);
         if video_encoder == "libx264" {
-            cmd.args(["-preset", "veryfast", "-crf", "16"]);
+            cmd.arg("-preset").arg(&encoding.preset);
+            cmd.arg("-crf").arg(encoding.crf.to_string());
         }
         if temp_wav_guard.is_some() {
             cmd.args(["-c:a", "aac", "-b:a", "192k"]);
@@ -974,7 +1084,11 @@ impl Mp4FrameEncoder {
             });
         };
         let status = wait_result.map_err(|io_err| MediaError::IoError {
-            message: io_failure_message("ffmpeg encode: failed to wait on child process", &io_err, &stderr),
+            message: io_failure_message(
+                "ffmpeg encode: failed to wait on child process",
+                &io_err,
+                &stderr,
+            ),
         })?;
 
         if let Some(flush_error) = flush_error {
@@ -995,7 +1109,7 @@ impl Mp4FrameEncoder {
 
     /// Finalizes the encoder by dropping the temporary WAV guard and reaping the
     /// ffmpeg child process.
-    pub fn finalize(mut self) -> Result<(), MediaError> {
+    pub fn finalize(self) -> Result<(), MediaError> {
         self.finish()
     }
 
@@ -1021,7 +1135,10 @@ impl Drop for Mp4FrameEncoder {
             let _ = child.wait();
         }
         // The drain thread sees EOF once the killed child releases its stderr pipe.
-        let _ = self.stderr_drain.take().and_then(|handle| handle.join().ok());
+        let _ = self
+            .stderr_drain
+            .take()
+            .and_then(|handle| handle.join().ok());
     }
 }
 
@@ -1083,6 +1200,8 @@ struct FfprobeOutput {
 #[derive(Debug, Deserialize)]
 struct FfprobeStream {
     codec_type: Option<String>,
+    codec_name: Option<String>,
+    pix_fmt: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     time_base: Option<String>,
@@ -1152,6 +1271,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    #[test]
+    fn file_content_identity_uses_sha256_and_byte_length() {
+        let path = std::env::temp_dir().join(format!(
+            "frameshift_file_identity_{}.bin",
+            std::process::id()
+        ));
+        let _guard = TempGuard(path.clone());
+        std::fs::write(&path, b"abc").expect("write identity fixture");
+        let expected = FfmpegBridge::hash_bytes(b"abc");
+        let actual = FfmpegBridge::hash_file(&path).expect("hash file");
+        assert_eq!(actual.byte_len, 3);
+        assert_eq!(
+            actual.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(actual, expected);
     }
 
     #[test]

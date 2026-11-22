@@ -6,7 +6,7 @@ use frameshift_schema::{
     ProxyConfigDef, RenderGraphDef, SampleFilter, SchemaError, SchemaVersion, Shape3DKind,
     SourceFit, TextAlign2D,
 };
-use frameshift_time::{FLICKS_PER_SECOND, Flicks, SpeedCurve};
+use frameshift_time::{FLICKS_PER_SECOND, Flicks, ImpactCurveStyle, SourceFitMode, SpeedCurve};
 
 #[test]
 fn golden_scene_preset_validates_toposorts_and_roundtrips_json() {
@@ -34,6 +34,279 @@ fn golden_scene_preset_validates_toposorts_and_roundtrips_json() {
     assert!(json.contains("\"schema_version\": \"0.2.0\""));
     let restored = Project::from_json_str(&json).expect("deserialize golden preset");
     assert_eq!(project, restored);
+}
+
+fn shared_alpha_matte_project(
+    matte_asset_id: &str,
+    matte_duration: Option<Flicks>,
+    matte_fit: SourceFit,
+) -> Project {
+    let mut project = Project::golden_scene_preset();
+    let clip = project
+        .timeline
+        .clips
+        .iter_mut()
+        .find(|clip| clip.id == "clip_a")
+        .expect("golden project clip_a");
+    clip.timeline_end = clip.timeline_start + Flicks(3 * FLICKS_PER_SECOND);
+    clip.source_start = Flicks(FLICKS_PER_SECOND);
+    clip.speed_curve = SpeedCurve::constant(1.0).expect("unit speed");
+
+    if matte_asset_id != "asset_clip_a" {
+        project.assets.push(AssetDef {
+            id: matte_asset_id.into(),
+            kind: AssetKind::Video,
+            path: "synthetic://matte_video".into(),
+            duration_ticks: matte_duration,
+            fps: Some(frameshift_time::FPS_24),
+            sample_rate_hz: None,
+            resolution: Some(frameshift_schema::Resolution {
+                width: 1920,
+                height: 1080,
+            }),
+        });
+    }
+
+    let source_id = NodeId::from("shared_alpha_source");
+    let matte_id = NodeId::from("shared_alpha_video");
+    let mask_id = NodeId::from("shared_alpha_mask");
+    project.graph.nodes.extend([
+        GraphNodeDef {
+            id: source_id.clone(),
+            kind: NodeKind::SourceVideo {
+                asset_id: "asset_clip_a".into(),
+                clip_id: Some("clip_a".into()),
+                color_space: ColorSpace::DisplaySrgb,
+                fit: SourceFit::Cover,
+            },
+            inputs: vec![],
+            enabled: true,
+        },
+        GraphNodeDef {
+            id: matte_id.clone(),
+            kind: NodeKind::SourceVideo {
+                asset_id: matte_asset_id.into(),
+                clip_id: Some("clip_a".into()),
+                color_space: ColorSpace::DisplaySrgb,
+                fit: matte_fit,
+            },
+            inputs: vec![],
+            enabled: true,
+        },
+        GraphNodeDef {
+            id: mask_id.clone(),
+            kind: NodeKind::MaskMatte {
+                mode: frameshift_schema::MatteMode::Alpha,
+                invert: false,
+                feather: 0.0,
+                opaque_black_outside: false,
+            },
+            inputs: vec![source_id, matte_id],
+            enabled: true,
+        },
+    ]);
+    project.graph.output_node = mask_id;
+    project
+}
+
+#[test]
+fn shared_clip_alpha_matte_checks_crop_and_declared_source_time_coverage() {
+    let enough = shared_alpha_matte_project(
+        "asset_alpha_matte",
+        Some(Flicks(4 * FLICKS_PER_SECOND)),
+        SourceFit::Cover,
+    );
+    enough.validate().expect("matte covers the full source map");
+
+    let too_short = shared_alpha_matte_project(
+        "asset_short_matte",
+        Some(Flicks(4 * FLICKS_PER_SECOND - 1)),
+        SourceFit::Cover,
+    );
+    assert!(matches!(
+        too_short.validate(),
+        Err(SchemaError::InvalidTimeline(message))
+            if message.contains("shared_alpha_mask") && message.contains("outside matte asset")
+    ));
+
+    let mismatched_crop = shared_alpha_matte_project(
+        "asset_different_crop",
+        Some(Flicks(5 * FLICKS_PER_SECOND)),
+        SourceFit::Contain,
+    );
+    assert!(matches!(
+        mismatched_crop.validate(),
+        Err(SchemaError::InvalidTimeline(message))
+            if message.contains("shared_alpha_mask") && message.contains("same crop")
+    ));
+
+    let unspecified_duration =
+        shared_alpha_matte_project("asset_unknown_duration", None, SourceFit::Cover);
+    unspecified_duration
+        .validate()
+        .expect("unknown duration leaves runtime source checks unchanged");
+
+    let same_asset = shared_alpha_matte_project("asset_clip_a", None, SourceFit::Contain);
+    same_asset
+        .validate()
+        .expect("self-matte behavior remains generic");
+}
+
+#[test]
+fn retarget_event_solves_linked_clip_and_rolls_back_constraint_failures() {
+    let mut session = ProjectSession::new(Project::golden_scene_preset()).unwrap();
+    let target = Flicks(FLICKS_PER_SECOND + FLICKS_PER_SECOND / 2);
+    let old_curve = session
+        .project()
+        .clip("clip_a")
+        .unwrap()
+        .speed_curve
+        .clone();
+    let revision = session
+        .apply_command(
+            1,
+            ProjectCommand::RetargetEvent {
+                event_id: "drop_impact".into(),
+                new_target_output_tick: target,
+                source_bounds_start: Flicks::ZERO,
+                source_bounds_end: Flicks(4 * FLICKS_PER_SECOND),
+                min_speed: 0.25,
+                max_speed: 4.0,
+                curve_style: ImpactCurveStyle::TwoSegmentConstant,
+                source_fit: SourceFitMode::ExactRange,
+            },
+        )
+        .expect("bounded retarget succeeds");
+    assert_eq!(revision, 2);
+    assert_eq!(
+        session
+            .project()
+            .event("drop_impact")
+            .unwrap()
+            .target_output_tick,
+        target
+    );
+    let solved_clip = session.project().clip("clip_a").unwrap();
+    assert_ne!(solved_clip.speed_curve, old_curve);
+    assert_eq!(
+        solved_clip.source_start + solved_clip.speed_curve.source_offset_at(target),
+        Flicks(2 * FLICKS_PER_SECOND)
+    );
+
+    let snapshot = session.project().clone();
+    let invalid = session.apply_command(
+        2,
+        ProjectCommand::RetargetEvent {
+            event_id: "drop_impact".into(),
+            new_target_output_tick: Flicks(FLICKS_PER_SECOND),
+            source_bounds_start: Flicks::ZERO,
+            source_bounds_end: Flicks(4 * FLICKS_PER_SECOND),
+            min_speed: 0.5,
+            max_speed: 0.75,
+            curve_style: ImpactCurveStyle::SmoothRamp,
+            source_fit: SourceFitMode::ExactRange,
+        },
+    );
+    assert!(matches!(invalid, Err(SchemaError::InvalidTimeline(_))));
+    assert_eq!(session.revision_id(), 2);
+    assert_eq!(session.project(), &snapshot);
+    assert_eq!(session.undo_len(), 1);
+}
+
+#[test]
+fn retarget_event_keeps_unlinked_anchor_moves_simple() {
+    let mut project = Project::golden_scene_preset();
+    let event = project
+        .events
+        .iter_mut()
+        .find(|event| event.event_id == "drop_impact")
+        .unwrap();
+    event.source_clip_id = None;
+    event.source_anchor_tick = None;
+    let mut session = ProjectSession::new(project).unwrap();
+    let target = Flicks(FLICKS_PER_SECOND / 3);
+    session
+        .apply_command(
+            1,
+            ProjectCommand::RetargetEvent {
+                event_id: "drop_impact".into(),
+                new_target_output_tick: target,
+                source_bounds_start: Flicks(10),
+                source_bounds_end: Flicks(5),
+                min_speed: f64::NAN,
+                max_speed: -1.0,
+                curve_style: ImpactCurveStyle::SmoothRamp,
+                source_fit: SourceFitMode::FitWithinBounds,
+            },
+        )
+        .expect("unlinked anchor is a simple move");
+    assert_eq!(
+        session
+            .project()
+            .event("drop_impact")
+            .unwrap()
+            .target_output_tick,
+        target
+    );
+}
+
+#[test]
+fn split_clip_routes_render_sources_and_moves_later_event_link() {
+    let mut session = ProjectSession::new(Project::golden_scene_preset()).unwrap();
+    let split_tick = Flicks(FLICKS_PER_SECOND);
+    session
+        .apply_command(
+            1,
+            ProjectCommand::SplitClip {
+                clip_id: "clip_a".into(),
+                split_tick,
+                right_clip_id: "clip_a_tail".into(),
+            },
+        )
+        .expect("split is valid");
+
+    let graph = &session.project().graph;
+    let routing_node = graph.node(&NodeId::from("src_a")).unwrap();
+    assert!(matches!(&routing_node.kind, NodeKind::Blend { .. }));
+    assert_eq!(routing_node.inputs.len(), 2);
+    let branches: Vec<_> = routing_node
+        .inputs
+        .iter()
+        .map(|id| graph.node(id).expect("split source exists"))
+        .collect();
+    assert!(branches.iter().any(|node| matches!(
+        &node.kind,
+        NodeKind::SourceVideo { clip_id: Some(id), .. } if id == "clip_a"
+    )));
+    assert!(branches.iter().any(|node| matches!(
+        &node.kind,
+        NodeKind::SourceVideo { clip_id: Some(id), .. } if id == "clip_a_tail"
+    )));
+    assert_eq!(
+        session
+            .project()
+            .event("drop_impact")
+            .unwrap()
+            .source_clip_id
+            .as_deref(),
+        Some("clip_a_tail")
+    );
+    assert_eq!(
+        session.project().clip("clip_a").unwrap().timeline_end,
+        split_tick
+    );
+    assert_eq!(
+        session
+            .project()
+            .clip("clip_a_tail")
+            .unwrap()
+            .timeline_start,
+        split_tick
+    );
+    session
+        .project()
+        .validate()
+        .expect("routed split remains valid");
 }
 
 #[test]
@@ -168,44 +441,42 @@ fn legacy_0_1_0_project_loads_with_serde_defaults() {
 
 #[test]
 fn legacy_local_media_0_1_0_projects_load() {
-    // Real-world fixtures authored before the 0.2.0 bump; every one must stay loadable.
+    // Real-world fixtures authored before the 0.2.0 bump are checked when local_media is
+    // available, but they are deliberately not compile-time includes so clean checkouts work.
     let fixtures = [
-        (
-            "asta_amv_project.json",
-            include_str!("../../../local_media/asta_amv_project.json"),
-        ),
-        (
-            "asta_devil_union_project.json",
-            include_str!("../../../local_media/asta_devil_union_project.json"),
-        ),
-        (
-            "asta_v3_project.json",
-            include_str!("../../../local_media/asta_v3/asta_v3_project.json"),
-        ),
-        (
-            "koleedits_project.json",
-            include_str!("../../../local_media/dogfood/koleedits/koleedits_project.json"),
-        ),
-        (
-            "fame_is_a_gun_project.json",
-            include_str!("../../../local_media/fame_is_a_gun/fame_is_a_gun_project.json"),
-        ),
-        (
-            "fame_is_a_gun_v3_project.json",
-            include_str!("../../../local_media/fame_is_a_gun/fame_is_a_gun_v3_project.json"),
-        ),
-        (
-            "mushoku_project.json",
-            include_str!("../../../local_media/mushoku/mushoku_project.json"),
-        ),
+        "../../local_media/asta_amv_project.json",
+        "../../local_media/asta_devil_union_project.json",
+        "../../local_media/asta_v3/asta_v3_project.json",
+        "../../local_media/dogfood/koleedits/koleedits_project.json",
+        "../../local_media/fame_is_a_gun/fame_is_a_gun_project.json",
+        "../../local_media/fame_is_a_gun/fame_is_a_gun_v3_project.json",
+        "../../local_media/mushoku/mushoku_project.json",
     ];
 
-    for (name, json) in fixtures {
-        let project = Project::from_json_str(json)
-            .unwrap_or_else(|e| panic!("0.1.0 local_media project '{name}' must load: {e}"));
-        assert_eq!(project.schema_version, SchemaVersion::new(0, 1, 0), "{name}");
-        assert!(!project.assets.is_empty(), "{name}");
+    let mut checked = 0;
+    for fixture in fixtures {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture);
+        if !path.is_file() {
+            continue;
+        }
+        let json = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read legacy fixture '{}': {e}", path.display()));
+        let project = Project::from_json_str(&json).unwrap_or_else(|e| {
+            panic!(
+                "0.1.0 local_media project '{}' must load: {e}",
+                path.display()
+            )
+        });
+        assert_eq!(
+            project.schema_version,
+            SchemaVersion::new(0, 1, 0),
+            "{}",
+            path.display()
+        );
+        assert!(!project.assets.is_empty(), "{}", path.display());
+        checked += 1;
     }
+    eprintln!("checked {checked} optional legacy local_media fixture(s)");
 }
 
 #[test]
@@ -471,6 +742,7 @@ fn phase_2_to_5_nodes_bindings_decisions_preferences_and_backward_compat() {
                     glow_rgba: [0.0; 4],
                     hdr_intensity: 1.0,
                     gpu_slug: true,
+                    text_animator: None,
                 },
                 inputs: vec![],
                 enabled: true,
@@ -1759,7 +2031,10 @@ fn node_kind_natural_2d_and_3d_serde_aliases_deserialize() {
 
     let particle_field_3d: NodeKind =
         serde_json::from_str(r#"{"type": "particle_field_3d"}"#).expect("particle_field_3d alias");
-    assert!(matches!(particle_field_3d, NodeKind::ParticleField3D { .. }));
+    assert!(matches!(
+        particle_field_3d,
+        NodeKind::ParticleField3D { .. }
+    ));
 
     let ribbon_trail_3d: NodeKind =
         serde_json::from_str(r#"{"type": "ribbon_trail_3d"}"#).expect("ribbon_trail_3d alias");
@@ -1771,10 +2046,9 @@ fn node_kind_natural_2d_and_3d_serde_aliases_deserialize() {
     .expect("transform_2d alias");
     assert!(matches!(transform_2d, NodeKind::Transform2D { .. }));
 
-    let lut_3d: NodeKind = serde_json::from_str(
-        r#"{"type": "lut_3d", "input": "src", "lut_preset": "identity"}"#,
-    )
-    .expect("lut_3d alias");
+    let lut_3d: NodeKind =
+        serde_json::from_str(r#"{"type": "lut_3d", "input": "src", "lut_preset": "identity"}"#)
+            .expect("lut_3d alias");
     assert!(matches!(lut_3d, NodeKind::Lut3D { .. }));
 }
 
@@ -1815,7 +2089,10 @@ fn phase_6_3_scene3d_and_shape3d_serde_validation_and_disabled_passthrough() {
         output_node: NodeId::from("s"),
         nodes: vec![GraphNodeDef {
             id: NodeId::from("s"),
-            kind: serde_json::from_str(r#"{"type": "shape_3d", "shape_kind": "neon_tile", "size": 0.0}"#).unwrap(),
+            kind: serde_json::from_str(
+                r#"{"type": "shape_3d", "shape_kind": "neon_tile", "size": 0.0}"#,
+            )
+            .unwrap(),
             inputs: vec![],
             enabled: true,
         }],
@@ -2078,10 +2355,8 @@ fn phase_6_3_legacy_faz6_2_backward_compat_and_safe_expr_bindings() {
             },
             GraphNodeDef {
                 id: NodeId::from("shp"),
-                kind: serde_json::from_str(
-                    r#"{"type": "shape_3d", "shape_kind": "diamond_3d"}"#,
-                )
-                .unwrap(),
+                kind: serde_json::from_str(r#"{"type": "shape_3d", "shape_kind": "diamond_3d"}"#)
+                    .unwrap(),
                 inputs: vec![],
                 enabled: true,
             },
@@ -2305,6 +2580,7 @@ fn wave1_all_serde_names_match_serialized_node_kind_tags() {
             glow_rgba: [0.0; 4],
             hdr_intensity: 1.0,
             gpu_slug: true,
+            text_animator: None,
         },
         NodeKind::VectorPathHud {
             points_norm: vec![[0.1, 0.1], [0.9, 0.9]],
@@ -2452,16 +2728,18 @@ fn wave1_legacy_vectortext_and_lut3d_backward_compat_and_validation() {
             }],
         };
         assert!(
-            matches!(g.validate_graph(), Err(SchemaError::InvalidVectorText { .. })),
+            matches!(
+                g.validate_graph(),
+                Err(SchemaError::InvalidVectorText { .. })
+            ),
             "expected InvalidVectorText for {bad_json}"
         );
     }
 
     // Legacy Lut3D without lut_source / spaces
-    let legacy_lut: NodeKind = serde_json::from_str(
-        r#"{"type": "lut3_d", "input": "src", "lut_preset": "warm_sunset"}"#,
-    )
-    .expect("legacy lut3_d must deserialize");
+    let legacy_lut: NodeKind =
+        serde_json::from_str(r#"{"type": "lut3_d", "input": "src", "lut_preset": "warm_sunset"}"#)
+            .expect("legacy lut3_d must deserialize");
     assert!(matches!(
         &legacy_lut,
         NodeKind::Lut3D {

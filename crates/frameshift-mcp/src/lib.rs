@@ -7,9 +7,9 @@ pub mod verification;
 pub use error::McpError;
 pub use server::{
     McpServer, McpToolDescriptor, MutateProjectResult, PreferenceQueryResult, RenderProjectResult,
-    SchemaDescription,
+    ReviewNotesResult, SchemaDescription,
 };
-pub use verification::{run_m3_agent_director_verification, M3VerificationSummary};
+pub use verification::{M3VerificationSummary, run_m3_agent_director_verification};
 
 /// Returns the crate identifier string.
 pub fn crate_name() -> &'static str {

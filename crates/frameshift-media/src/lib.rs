@@ -17,8 +17,8 @@ pub use audio::{
 pub use cache::{AssetId, CacheTelemetry, FrameCacheKey, LruFrameCache};
 pub use error::MediaError;
 pub use ffmpeg::{
-    EncodeBackend, FfmpegBridge, HwAccelCapability, HwAccelDetector, MediaProbeInfo,
-    Mp4FrameEncoder, SourceFit,
+    EncodeBackend, FfmpegBridge, FileContentIdentity, HwAccelCapability, HwAccelDetector,
+    MediaProbeInfo, Mp4FrameEncoder, SourceFit, VideoEncodingSettings,
 };
 pub use frame::{
     AlphaMode, Rgba8Frame, Rgba16fFrame, fit_rgba8_frame, linear_to_srgb, srgb_to_linear,

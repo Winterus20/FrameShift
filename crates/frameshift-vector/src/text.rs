@@ -192,6 +192,7 @@ impl VectorTextConfig {
                 glow_rgba,
                 hdr_intensity,
                 gpu_slug: _,
+                text_animator: _,
             } => Some(Self {
                 text: text.clone(),
                 font_size_norm: *font_size_norm,

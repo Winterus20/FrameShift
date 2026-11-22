@@ -27,7 +27,8 @@ pub use font_locator::{
     SystemFontIndex, TtfTextAlign, TtfTextConfig,
 };
 pub use shaper::{
-    shape_text_block, QuadraticCurve, ShapedGlyphOutline, ShapedTextBlock, TextLayoutOptions,
+    evaluate_text_animator, shape_text_block, GlyphAnimationState, QuadraticCurve,
+    ShapedGlyphOutline, ShapedTextBlock, TextLayoutOptions,
     VariationAxes,
 };
 pub use slug::{
