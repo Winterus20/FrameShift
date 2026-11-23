@@ -9,12 +9,12 @@ energy: high
 fps: 24
 aspect_ratio: "7:6"
 frameshift_readiness: partial
-tags: [tiktok-anime-edit, fx-stack, impact, reference-pending-visual-review]
+tags: [tiktok-anime-edit, fx-stack, impact, character-motifs]
 ---
 
 # SC-0003 — Curse / efekt odaklı TikTok anime edit referansı
 
-**Durum:** Ön kart. Kullanıcının hedefi ve teknik ölçümler kaydedildi; görsel/işitsel çözümleme tamamlanmadı. Bu belgeyi hazır efekt reçetesi gibi kullanma.
+**Durum:** 2026-11-23 tarihinde 24 fps referansın kesitleri ve ses atakları incelendi. Görsel sonuç gözlemlendi. Kaynak proje ve uygulama tekniği bilinmiyor.
 
 ## 1. Kimlik ve hedef
 
@@ -30,9 +30,17 @@ tags: [tiktok-anime-edit, fx-stack, impact, reference-pending-visual-review]
 
 Önerilen ilk inceleme penceresi **3.8–6.5 sn**: daha sakin bölüm ile daha yoğun kare değişiminin sınırını içeriyor. Vuruş ve efekt onset işaretleri ancak sesli izleme sonrası onaylanmalı.
 
-## 3. Kamera, katmanlar ve efektler — görsel inceleme bekliyor
+## 3. Görsel dil ve zamanlama
 
-Kamera hareketlerinin türü, özgün palet, tipografi, gerçek geçiş yöntemi ve kaynaktaki efekt zinciri doğrulanmadı. Çıkarılan kare şeritleri mevcut oturumda görsel olarak okunamadı. Aşağıdaki tasarım, **örnekte tespit edilmiş efektler değil**, istenen tür için yeniden kullanılabilir araç önerisidir.
+| Aralık | Referansta gözlenen |
+| --- | --- |
+| 0–4,08 sn | Koyu kehribar silüet, eğik yüz yakın planı, sonra göz, el ve kanat motifleri. Karaktere farklı açılardan tekrar tekrar dönülüyor. |
+| 4,08–4,88 sn | Tam siyah bekleme. Görüntü yaklaşık 4,875 sn'de, ilk güçlü bass atağından yaklaşık 2–3 kare önce geri dönüyor. Ses atağı 4,97–4,98 sn civarında. |
+| 4,88–7,9 sn | Yer değiştirme ve kısa bulanıklıkla içeri giren planlar birkaç karede netleşiyor. Yüz ve dans planları parlak/koyu darbelerle yineleniyor. |
+| 8–11,25 sn | Altın zemin önünde koyu kanat silüetleri, kısa mor/kırmızı vurgu ve peş peşe göz/yüz yakın planları. |
+| 11,25–16,83 sn | Dönüş ve hareket izi taşıyan sıcak yakın planlar, kısa mavi karşıtlık, üst üste binen pozlar ve karanlık karakter kapanışı. |
+
+Kurgu motivi karakterin yüzüne ve ellerine düzenli dönüş. Aralıklı tam siyah, öncesindeki düşük ses enerjisini ilk darbeye bağlıyor. Plan başına 2–4 karelik bulanık giriş ve ardından net plan yararlı bir üretim hedefi. Renk omurgası koyu kırmızı/kehribar, kısa soğuk renk karşıtlıklarıyla korunabilir. Klipte büyük başlık kartı gözlenmedi.
 
 ## 4. FrameShift’te yapılacak ilk üretim deneyi
 

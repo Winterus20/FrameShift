@@ -1,6 +1,13 @@
 # FrameShift — Aktif Durum (`state.md`)
 
-**Son Güncelleme:** 2026-11-22  
+**Son Güncelleme:** 2026-11-23
+
+**Chainsaw Man × Blow (2026-11-23):** Denji/Pochita açılışı, dönüşümde 4,375 sn müzik ankrajı ve beat odaklı efektler içeren 7:6 kurgu Python/FFmpeg üzerinden hazırlandı. [Günlük](log/2026-11-23-chainsaw-man-blow.md).
+
+**Afterlight V2 (2026-11-23):** Kullanıcının üç edit referansı kare düzeyinde incelendi. Yeniden kurulan 12,125 sn 7:6 sürüm Python/FFmpeg ile render edildi. [İnceleme ve kurgu günlüğü](log/2026-11-23-afterlight-referans-kurgusu.md).
+
+**Sol Levante / Afterlight (2026-11-23):** 23 planlık gerçek anime editi, 18,583 sn ve 4,25 sn impact. Ana 720p çıktı Python/FFmpeg, düzenlenebilir proje ve 18,583 sn 640×360 draft FrameShift CLI/yazılım Vulkan üzerinden üretildi. [Günlük](log/2026-11-23-sol-levante-afterlight.md).
+
 **Headless P0–P2 ürün dilimi (2026-11-22):** CLI ve ortak uygulama/schema API'sinde güvenilir Impact Cut, timeline projection/snap/speed graph, retarget/split/trim, otomatik ajan değişiklik fişi, revision-pinned export, yerel şablon/precomp, proxy önizleme ve medya envanteri/relink akışları uygulandı. Bu, etkileşimli masaüstü timeline'ı değildir. Uygulama kanıtı ve sınırlar: [günlük](log/2026-11-22-headless-roadmap-implementation.md).
 
 **Bu dilimin doğrulama durumu:** `cargo clippy --workspace --all-targets -- -D warnings` geçti. 4.00 sn Impact Cut çıktısı `target/product-roadmap/impact-draft.mp4` için H.264/AAC, 96 kare, 24 fps doğrulandı; timeline/speed-graph/template/retarget, proxy kaynak baytı geçersizleştirme, proxy preview ve MCP autoapply/stale/persisted receipt smoke'ları geçti. Son kabul koşusu **318 geçti, 0 başarısız, clean-HEAD'de doğrulanmış 6 platform/görsel başarısızlık filtrelendi**; koşu split pixel/time ve font düzeltmesini ve yeni schema testlerini içerdi. Yeni schema matte/template regresyonları hedefli koşuda 2/2 geçti. Efekt metadata hedefli seti 4/4 geçti; son descriptor eklemesinden önce derlendi, final strict clippy değişiklikten sonra da geçti. `verify-all` yazılım Vulkan adaptöründe 300 sn'de M1 aşamasında zaman aşımına uğradı (`exit 124`, yalnız golden project üretildi). Bu nedenle acceptance seti yeşildir; tam `verify-all` kapısı lavapipe üzerinde tamamlanmış değildir.

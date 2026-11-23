@@ -129,8 +129,10 @@ Asta v3 üretimindeki darboğazları ele alan tur: 11 araştırma raporu, ADR-00
 | [2026-11-22](log/2026-11-22-frameshift-urun-gelistirme-yol-haritasi.md) | Rakiplerden ürün geliştirme dersleri | HyperFrames, OpenMotion ve After Effects kaynaklı P0–P2 özellikler ve ölçüm planı. |
 | [2026-11-22](log/2026-11-22-yol-haritasi-uygulama-arastirmasi.md) | Yol haritası uygulama araştırması | Temiz klon test engeli, autocut aralığı, timeline ve export uygulama sınırları, kullanıcı kararları. |
 | [2026-11-22](log/2026-11-22-headless-roadmap-implementation.md) | Headless P0–P2 ürün yol haritası uygulaması | 4 sn Impact Cut, CLI smoke'ları, MCP fişleri, export/proxy/schema kontrolleri; workspace acceptance 318 geçti, 6 baseline testi filtrelendi; `verify-all` lavapipe timeout. |
-
 | [2026-11-22](log/2026-11-22-tiktok-fx-edit-referansi.md) | Efekt odaklı TikTok anime edit hedefi | SC-0003 teknik ön ölçümleri ve mevcut efektlerle kısa üretim deneyi önerisi. |
+| [2026-11-23](log/2026-11-23-sol-levante-afterlight.md) | Sol Levante / Afterlight anime editi | 23 plan, 4,25 sn impact, 18,583 sn ana MP4, düzenlenebilir proje ve doğrulanmış tam FrameShift draft. |
+| [2026-11-23](log/2026-11-23-afterlight-referans-kurgusu.md) | Afterlight V2 referans kurgusu | Curse, zwxeditor ve koleedits kare incelemesi. Karakter motifi, 7:6 kadraj ve siyah beklemeli 12,125 sn çıktı. |
+| [2026-11-23](log/2026-11-23-chainsaw-man-blow.md) | Chainsaw Man × Blow | Denji dönüşümüne bağlı bass drop, 7:6, tipografi ve vuruşa bağlı efektler. |
 
 ---
 

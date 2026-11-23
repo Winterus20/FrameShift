@@ -13,7 +13,7 @@ Bu klasör, kullanıcının beğendiği referans editlerden çıkarılan **yapı
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | [SC-0001](SC-0001-platsae-3d-kinetic-typography.md) | PlatsAE 3D Neon Kinetic Typography | `kinetic-typography` | `high` | `needs-features` (Faz 6A/6B) | Hızlı pop/EDM/phonk vokalli şarkılarda %100 söz-odaklı 3D kinetik tipografi veya yüksek enerjili intro/chorus sekansları |
 | [SC-0002](SC-0002-mushoku-tensei-kinetic-type-amv.md) | Mushoku Tensei Full-Frame Kinetic Typography AMV | `kinetic-typography` | `high` | `partial` | Orta/yavaş tempolu vokalli şarkılarda dev, harf harf yayılmış, özne arkasında kalan 2D tipografi; 1 vuruş = 1 plan kurgu |
-| [SC-0003](SC-0003-theamirhanio-curse-tiktok-edit.md) | Curse — efekt odaklı TikTok anime edit | `anime-amv` | `high` | `partial` / ön kart | Yoğun efekt yığını ve geçiş odaklı kısa sosyal editler; görsel/işitsel doğrulama bekliyor. |
+| [SC-0003](SC-0003-theamirhanio-curse-tiktok-edit.md) | Curse — efekt odaklı TikTok anime edit | `anime-amv` | `high` | `partial` | Karakter motifi, siyah bekleme, kısa bulanık giriş ve ışık vuruşları etrafında kurulan sosyal editler. |
 
 *(Eski serbest formatlı ilk 4 referans notu kök dizindeki [VISUAL_REFERENCES.md](../../VISUAL_REFERENCES.md) dosyasında korunmaktadır; istendiğinde onlar da `SC-0002+` kartlarına dönüştürülebilir.)*
 
