@@ -18,3 +18,13 @@ cargo test --workspace --no-fail-fast
 cargo clippy --workspace --all-targets -- -D warnings
 cargo run --release -p frameshift-cli -- verify-all --out-dir target/full_verify
 ```
+
+## Anime & Raw Clip Sources (Search Order)
+
+When sourcing raw anime clips, sakuga cuts, or Twixtor scene packs for edits, agents should search these repositories in order:
+
+1. **Sakugabooru** (`https://www.sakugabooru.com/post`) — Unsubtitled, watermark-free raw animation cuts (sakuga). Search by series/character tag with `order:score`, then download the uncompressed file via the `"Original"` link in the right sidebar.
+2. **Animédia / AnimeClipsRaw** (`https://animeclipsraw.fr`) — AMV and TikTok/Reels-focused raw clips categorized by character and series, including flowframe/Twixtor scenes and voice lines.
+3. **RingWitDaTwixtor** (`https://ringwitdatwixtor.com`) — Pre-made 4K/60fps Twixtor and raw scene packs for popular anime characters (typically via Google Drive/Mega links).
+4. **Hii Twixtor** (`https://hiitwixtor.com`) — Clip archive focused on time-remapped / slow-motion (Twixtor) anime cuts.
+5. **411 Scenepacks** (`https://411scenepacks.com`) — Large free HD/4K scene pack directory covering anime, series, films, and games.

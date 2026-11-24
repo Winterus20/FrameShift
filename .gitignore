@@ -5,6 +5,7 @@
 
 # Local test media (copyrighted anime clips / music)
 /local_media
+/scratch
 *.mp4
 *.mov
 *.mkv

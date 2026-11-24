@@ -92,3 +92,15 @@ cargo run --release -p frameshift-cli -- verify-all --out-dir target/full_verify
 - [VISUAL_REFERENCES.md](VISUAL_REFERENCES.md) — referans video ve kare gözlemleri.
 - [brain/style-cards/README.md](brain/style-cards/README.md) — referans editlerden çıkarılan görsel stil ve kurgu reçetesi kartları.
 - [brain/index.md](brain/index.md) — kalıcı hafıza dizini (`decisions/`, `specs/`, `research/`, `style-cards/`, `log/`, `_templates/`).
+
+---
+
+## Anime & Ham Klip Arama Sırası
+
+Editler için ham anime klibi, sakuga kesiti veya Twixtor scene pack ararken ajanlar aşağıdaki kaynakları **sırayla** tarar:
+
+1. **Sakugabooru** (`https://www.sakugabooru.com/post`) — Altyazısız/logosuz ham animasyon kesitleri; seri/karakter etiketi + `order:score` ile ara, sağ menüden `"Original"` ile indir.
+2. **Animédia / AnimeClipsRaw** (`https://animeclipsraw.fr`) — Karakter/seriye göre ham klipler, flowframe/Twixtor sahneleri ve ses replikleri.
+3. **RingWitDaTwixtor** (`https://ringwitdatwixtor.com`) — Popüler anime karakterleri için hazır 4K/60fps Twixtor ve raw scene pack arşivleri.
+4. **Hii Twixtor** (`https://hiitwixtor.com`) — Time-remapped / slow-motion (Twixtor) anime kesitleri arşivi.
+5. **411 Scenepacks** (`https://411scenepacks.com`) — Anime dahil dizi/film/oyun için ücretsiz HD/4K scene pack dizini.
