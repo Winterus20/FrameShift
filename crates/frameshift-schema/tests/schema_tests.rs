@@ -2167,6 +2167,7 @@ fn phase_6_3_scene3d_and_shape3d_serde_validation_and_disabled_passthrough() {
                 kind: NodeKind::Scene3D {
                     camera: Camera3DDef::default(),
                     background_rgba: [0.0; 4],
+        depth_plate: None,
                 },
                 inputs: vec![NodeId::from("bg_2d")],
                 enabled: true,
@@ -2213,6 +2214,7 @@ fn phase_6_3_scene3d_and_shape3d_serde_validation_and_disabled_passthrough() {
                 kind: NodeKind::Scene3D {
                     camera: bad_cam,
                     background_rgba: [0.0; 4],
+        depth_plate: None,
                 },
                 inputs: vec![],
                 enabled: true,
@@ -2258,6 +2260,7 @@ fn phase_6_3_scene3d_and_shape3d_serde_validation_and_disabled_passthrough() {
         kind: NodeKind::Scene3D {
             camera: Camera3DDef::default(),
             background_rgba: [0.0; 4],
+        depth_plate: None,
         },
         inputs: inputs_65,
         enabled: true,
@@ -2387,6 +2390,7 @@ fn phase_6_3_legacy_faz6_2_backward_compat_and_safe_expr_bindings() {
                         ..Default::default()
                     },
                     background_rgba: [0.0; 4],
+                    depth_plate: None,
                 },
                 inputs: vec![
                     NodeId::from("txt"),
@@ -2623,6 +2627,7 @@ fn wave1_all_serde_names_match_serialized_node_kind_tags() {
         serde_json::from_str(r#"{"type":"halftone_glow"}"#).unwrap(),
         serde_json::from_str(r#"{"type":"deep_glow"}"#).unwrap(),
         serde_json::from_str(r#"{"type":"anime_sharpen"}"#).unwrap(),
+        serde_json::from_str(r#"{"type":"anime4k"}"#).unwrap(),
         serde_json::from_str(r#"{"type":"film_optics"}"#).unwrap(),
         serde_json::from_str(r#"{"type":"custom_wgsl"}"#).unwrap(),
         serde_json::from_str(r#"{"type":"transform3_d"}"#).unwrap(),
@@ -2653,6 +2658,10 @@ fn wave1_all_serde_names_match_serialized_node_kind_tags() {
         serde_json::from_str(r#"{"type":"blur_mo_curves"}"#).unwrap(),
         serde_json::from_str(r#"{"type":"null3_d"}"#).unwrap(),
         serde_json::from_str(r#"{"type":"depth_matte"}"#).unwrap(),
+        serde_json::from_str(r#"{"type":"optical_flow_blur"}"#).unwrap(),
+        serde_json::from_str(r#"{"type":"displacement_map"}"#).unwrap(),
+        serde_json::from_str(r#"{"type":"frame_echo"}"#).unwrap(),
+        serde_json::from_str(r#"{"type":"shape_mask"}"#).unwrap(),
     ];
 
     let serialized_tags: Vec<String> = variants
@@ -3329,6 +3338,7 @@ fn anime_workflow_nodes_null3d_rig_matte_and_text_animator_v2_roundtrip_and_vali
                 kind: NodeKind::Scene3D {
                     camera: Camera3DDef::default(),
                     background_rgba: [0.0; 4],
+        depth_plate: None,
                 },
                 inputs: vec![NodeId::from("cam_null"), NodeId::from("layer_xform")],
                 enabled: true,
@@ -3689,4 +3699,251 @@ fn trim_and_split_shift_cubic_bezier_value_and_speed_curves() {
     let right_b = session.project().clip("clip_b_right").unwrap();
     assert_eq!(right_b.timeline_start, Flicks(3 * sec));
     assert_eq!(right_b.speed_curve.instant_speed_at(Flicks(sec)), 2.0);
+}
+
+#[test]
+fn optical_flow_blur_serde_defaults_validation_and_params() {
+    let parsed: NodeKind = serde_json::from_str(r#"{"type":"optical_flow_blur"}"#).unwrap();
+    assert_eq!(parsed.expected_input_count(), 1);
+    assert!(NodeKind::ALL_SERDE_NAMES.contains(&"optical_flow_blur"));
+    assert!(matches!(
+        parsed,
+        NodeKind::OpticalFlowBlur {
+            shutter_amount,
+            samples: 12,
+            max_blur_px,
+            sensitivity,
+            flow_smoothness,
+            visualize_flow: false,
+        } if (shutter_amount - 1.0).abs() < 1e-6
+            && (max_blur_px - 48.0).abs() < 1e-6
+            && (sensitivity - 0.35).abs() < 1e-6
+            && (flow_smoothness - 0.25).abs() < 1e-6
+    ));
+
+    let valid_graph = RenderGraphDef {
+        output_node: NodeId::from("ofb"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("src"),
+                kind: NodeKind::Solid {
+                    color_rgba: [1.0; 4],
+                    color_space: ColorSpace::LinearRec709,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("ofb"),
+                kind: parsed,
+                inputs: vec![NodeId::from("src")],
+                enabled: true,
+            },
+        ],
+    };
+    valid_graph.validate_graph().unwrap();
+
+    let bad_graph = RenderGraphDef {
+        output_node: NodeId::from("ofb"),
+        nodes: vec![
+            valid_graph.nodes[0].clone(),
+            GraphNodeDef {
+                id: NodeId::from("ofb"),
+                kind: NodeKind::OpticalFlowBlur {
+                    shutter_amount: 1.0,
+                    samples: 0,
+                    max_blur_px: 48.0,
+                    sensitivity: 0.35,
+                    flow_smoothness: 0.25,
+                    visualize_flow: false,
+                },
+                inputs: vec![NodeId::from("src")],
+                enabled: true,
+            },
+        ],
+    };
+    assert!(matches!(
+        bad_graph.validate_graph(),
+        Err(SchemaError::InvalidOpticalFlowBlur { .. })
+    ));
+}
+
+#[test]
+fn anime4k_serde_defaults_validation_and_depth_plate_cycle_precomp() {
+    use frameshift_schema::{Anime4KPreset, SceneDepthPlateDef, precompose};
+
+    let parsed: NodeKind = serde_json::from_str(r#"{"type":"anime4k"}"#).unwrap();
+    assert_eq!(parsed.expected_input_count(), 1);
+    assert!(NodeKind::ALL_SERDE_NAMES.contains(&"anime4k"));
+    assert!(matches!(
+        parsed,
+        NodeKind::Anime4K {
+            preset: Anime4KPreset::ModeA,
+            strength,
+            clamp_highlights: true,
+        } if (strength - 1.0).abs() < 1e-6
+    ));
+
+    let bad_a4k = RenderGraphDef {
+        output_node: NodeId::from("a4k"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("src"),
+                kind: NodeKind::Solid {
+                    color_rgba: [1.0; 4],
+                    color_space: ColorSpace::LinearRec709,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("a4k"),
+                kind: NodeKind::Anime4K {
+                    preset: Anime4KPreset::LineArt,
+                    strength: 2.5,
+                    clamp_highlights: true,
+                },
+                inputs: vec![NodeId::from("src")],
+                enabled: true,
+            },
+        ],
+    };
+    assert!(matches!(
+        bad_a4k.validate_graph(),
+        Err(SchemaError::InvalidAnime4K { .. })
+    ));
+
+    // Legacy SceneDepthPlateDef JSON without depth_gamma/disparity_mode/rg16_packed deserializes cleanly.
+    let legacy_dp: SceneDepthPlateDef =
+        serde_json::from_str(r#"{"node_id":"depth_src","near_z":0.8,"far_z":4.5}"#).unwrap();
+    assert!((legacy_dp.depth_gamma - 1.0).abs() < 1e-6);
+    assert!(legacy_dp.disparity_mode);
+    assert!(!legacy_dp.rg16_packed);
+
+    // Cycle through Scene3D.depth_plate.node_id must report non-empty cycle nodes.
+    let cycle_graph = RenderGraphDef {
+        output_node: NodeId::from("scene"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("depth_fx"),
+                kind: serde_json::from_str(r#"{"type":"color_basic"}"#).unwrap(),
+                inputs: vec![NodeId::from("scene")],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("scene"),
+                kind: NodeKind::Scene3D {
+                    camera: Default::default(),
+                    background_rgba: [0.0; 4],
+                    depth_plate: Some(SceneDepthPlateDef {
+                        node_id: NodeId::from("depth_fx"),
+                        ..Default::default()
+                    }),
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+        ],
+    };
+    let err = cycle_graph.validate_graph().unwrap_err();
+    match err {
+        SchemaError::CycleDetected { cycle } => {
+            assert!(cycle.contains(&NodeId::from("scene")));
+            assert!(cycle.contains(&NodeId::from("depth_fx")));
+        }
+        other => panic!("expected CycleDetected, got {other:?}"),
+    }
+
+    // precompose must reject splitting across outside Scene3D.depth_plate.node_id.
+    let mut precomp_graph = RenderGraphDef {
+        output_node: NodeId::from("scene"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("bg_src"),
+                kind: NodeKind::Solid {
+                    color_rgba: [0.5; 4],
+                    color_space: ColorSpace::LinearRec709,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("depth_fx"),
+                kind: serde_json::from_str(r#"{"type":"color_basic"}"#).unwrap(),
+                inputs: vec![NodeId::from("bg_src")],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("scene"),
+                kind: NodeKind::Scene3D {
+                    camera: Default::default(),
+                    background_rgba: [0.0; 4],
+                    depth_plate: Some(SceneDepthPlateDef {
+                        node_id: NodeId::from("depth_fx"),
+                        ..Default::default()
+                    }),
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+        ],
+    };
+    assert!(precompose(&mut precomp_graph, &[NodeId::from("depth_fx")], NodeId::from("sub")).is_err());
+
+    // Verify bindable_param_names includes depth_plate_near_z/far_z/gamma and Anime4K strength.
+    let mut proj = Project::golden_scene_preset();
+    for clip in &mut proj.timeline.clips {
+        clip.event_animations.clear();
+    }
+    proj.graph = RenderGraphDef {
+        output_node: NodeId::from("scene"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("src"),
+                kind: NodeKind::Solid {
+                    color_rgba: [0.5; 4],
+                    color_space: ColorSpace::LinearRec709,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("a4k"),
+                kind: NodeKind::Anime4K {
+                    preset: Anime4KPreset::ModeB,
+                    strength: 1.0,
+                    clamp_highlights: true,
+                },
+                inputs: vec![NodeId::from("src")],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("scene"),
+                kind: NodeKind::Scene3D {
+                    camera: Default::default(),
+                    background_rgba: [0.0; 4],
+                    depth_plate: Some(SceneDepthPlateDef {
+                        node_id: NodeId::from("a4k"),
+                        ..Default::default()
+                    }),
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+        ],
+    };
+    for param in ["depth_plate_near_z", "depth_plate_far_z", "depth_plate_gamma"] {
+        proj.param_bindings = vec![ParamBindingDef {
+            node_id: NodeId::from("scene"),
+            param_name: param.into(),
+            expression: "1.0".into(),
+        }];
+        proj.validate().unwrap();
+    }
+    proj.param_bindings = vec![ParamBindingDef {
+        node_id: NodeId::from("a4k"),
+        param_name: "strength".into(),
+        expression: "0.75".into(),
+    }];
+    proj.validate().unwrap();
 }

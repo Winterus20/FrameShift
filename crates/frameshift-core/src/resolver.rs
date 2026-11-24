@@ -1,11 +1,17 @@
 use crate::error::CoreError;
 use frameshift_media::{
-    AudioBuffer, AudioRetimeMode, DEFAULT_AUDIO_SAMPLE_RATE, DecoderPool, DecoderPoolTelemetry,
-    FfmpegBridge, LruFrameCache, MediaProbeInfo, Rgba8Frame, Rgba16fFrame, SourceFit as DecodeFit,
-    SyntheticMediaGenerator, apply_micro_silence, apply_sidechain_ducking, apply_soft_limiter,
-    apply_stereo_pan,
+    AudioBuffer, AudioRetimeMode, CachedVideoFrame, ChromaLocation as MediaChromaLocation,
+    DEFAULT_AUDIO_SAMPLE_RATE, DecoderPool, DecoderPoolTelemetry, FfmpegBridge, LruFrameCache,
+    MediaProbeInfo, Rgba8Frame, Rgba16fFrame, SourceFit as DecodeFit, SyntheticMediaGenerator,
+    YuvColorInfo as MediaYuvColorInfo, YuvColorMatrix as MediaYuvColorMatrix,
+    YuvColorRange as MediaYuvColorRange, YuvTransfer as MediaYuvTransfer, apply_micro_silence,
+    apply_sidechain_ducking, apply_soft_limiter, apply_stereo_pan,
 };
-use frameshift_render::{FrameProvider, RenderError, SourceFrame};
+use frameshift_render::{
+    ChromaLocation as RenderChromaLocation, FrameProvider, RenderError, SourceFrame,
+    YuvColorInfo as RenderYuvColorInfo, YuvColorMatrix as RenderYuvColorMatrix,
+    YuvColorRange as RenderYuvColorRange, YuvTransfer as RenderYuvTransfer,
+};
 use frameshift_schema::project::{AudioBus, AudioClipDef, MicroSilenceDef};
 use frameshift_schema::{
     AssetDef, AssetKind, NodeId, NodeKind, Project, SchemaError, SourceFit, TextAlign2D,
@@ -15,9 +21,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Built-in deterministic synthetic asset kinds resolved when on-disk media is absent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyntheticAssetKind {
     ClipA,
     ClipB,
@@ -292,7 +299,7 @@ pub struct MediaResolver {
     decoder_pool: DecoderPool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct DiskMediaStamp {
     length: u64,
     modified: Option<std::time::SystemTime>,
@@ -489,6 +496,115 @@ impl MediaResolver {
                 };
                 cache.insert(cache_asset_key, frame_key, frame.clone());
                 Ok(frame)
+            }
+        }
+    }
+
+    /// Loads or synthesizes a video frame preferring planar NV12 for even-sized opaque disk video
+    /// (`Rgba8` fallback for odd dimensions, alpha sources, and deterministic synthetic clips).
+    pub fn provide_video_frame_decoded(
+        &mut self,
+        cache: &mut LruFrameCache,
+        asset: &AssetDef,
+        source_tick: Flicks,
+        width: u32,
+        height: u32,
+        fit: SourceFit,
+    ) -> Result<CachedVideoFrame, CoreError> {
+        if asset.kind == AssetKind::Audio {
+            return Err(CoreError::InvalidArgument(format!(
+                "asset '{}' is Audio and cannot be sampled as video",
+                asset.id
+            )));
+        }
+
+        let clamped_tick = Flicks(source_tick.0.max(0));
+        let source = self.resolve_asset_source(asset)?;
+        let cache_asset_key = format!(
+            "{}:{:?}:{:?}@{}x{}:{}",
+            asset.id,
+            asset.path,
+            asset.fps,
+            width,
+            height,
+            source_fit_cache_name(fit)
+        );
+        let decode_fit = to_decode_fit(fit);
+
+        match source {
+            ResolvedAssetSource::Disk(path) => {
+                let probe = self.probe_disk_video(&asset.id, &path)?;
+                let stamp = self.probe_cache.get(&path).map(|(stamp, _)| stamp);
+                let cache_asset_key = format!("{cache_asset_key}:{stamp:?}");
+                let matched = probe.pts_index.lookup_frame(clamped_tick).ok_or_else(|| {
+                    CoreError::Media(frameshift_media::MediaError::EmptyMediaStream(format!(
+                        "empty PtsIndex for '{}'",
+                        path.display()
+                    )))
+                })?;
+                let frame_key = matched.frame_index as u64;
+                if let Some(cached) = cache.get_decoded(&cache_asset_key, frame_key)
+                    && cached.width() == width
+                    && cached.height() == height
+                {
+                    return Ok(cached);
+                }
+                let decoded = self.decoder_pool.decode_video_frame_decoded(
+                    &path,
+                    &probe,
+                    matched.frame_index,
+                    width,
+                    height,
+                    decode_fit,
+                )?;
+                let cached = CachedVideoFrame::from(decoded);
+                cache.insert_cached(cache_asset_key, frame_key, cached.clone());
+                Ok(cached)
+            }
+            ResolvedAssetSource::Synthetic(kind) => {
+                let (frame_key, quantized_tick) = if let Some(fps) = asset.fps {
+                    let frame_idx = fps.ticks_to_frame_floor(clamped_tick)?.max(0);
+                    let q_tick = fps.frame_to_ticks(frame_idx)?;
+                    (frame_idx as u64, q_tick)
+                } else {
+                    (clamped_tick.0 as u64, clamped_tick)
+                };
+
+                if let Some(cached) = cache.get_decoded(&cache_asset_key, frame_key)
+                    && cached.width() == width
+                    && cached.height() == height
+                {
+                    return Ok(cached);
+                }
+
+                let frame = match kind {
+                    SyntheticAssetKind::ClipA => SyntheticMediaGenerator::generate_clip_a_frame(
+                        width,
+                        height,
+                        quantized_tick,
+                    ),
+                    SyntheticAssetKind::ClipB => SyntheticMediaGenerator::generate_clip_b_frame(
+                        width,
+                        height,
+                        quantized_tick,
+                    ),
+                    SyntheticAssetKind::MovingMask => {
+                        SyntheticMediaGenerator::generate_moving_mask_frame(
+                            width,
+                            height,
+                            quantized_tick,
+                        )
+                    }
+                    SyntheticAssetKind::BeatAudio120Bpm => {
+                        return Err(CoreError::InvalidArgument(format!(
+                            "asset '{}' resolved to BeatAudio120Bpm and cannot provide video frames",
+                            asset.id
+                        )));
+                    }
+                };
+                let cached = CachedVideoFrame::Rgba8(Arc::new(frame));
+                cache.insert_cached(cache_asset_key, frame_key, cached.clone());
+                Ok(cached)
             }
         }
     }
@@ -961,6 +1077,58 @@ fn map_core_vector_or_provider_err(
     }
 }
 
+fn to_render_yuv_color_info(info: MediaYuvColorInfo) -> RenderYuvColorInfo {
+    RenderYuvColorInfo {
+        matrix: match info.matrix {
+            MediaYuvColorMatrix::Bt709 => RenderYuvColorMatrix::Bt709,
+            MediaYuvColorMatrix::Bt601 => RenderYuvColorMatrix::Bt601,
+            MediaYuvColorMatrix::Bt2020Ncl => RenderYuvColorMatrix::Bt2020Ncl,
+        },
+        range: match info.range {
+            MediaYuvColorRange::Limited => RenderYuvColorRange::Limited,
+            MediaYuvColorRange::Full => RenderYuvColorRange::Full,
+        },
+        chroma_location: match info.chroma_location {
+            MediaChromaLocation::Left => RenderChromaLocation::Left,
+            MediaChromaLocation::Center => RenderChromaLocation::Center,
+            MediaChromaLocation::TopLeft => RenderChromaLocation::TopLeft,
+        },
+        transfer: match info.transfer {
+            MediaYuvTransfer::Linear => RenderYuvTransfer::Linear,
+            MediaYuvTransfer::Srgb => RenderYuvTransfer::Srgb,
+        },
+    }
+}
+
+struct Fnv64Hasher(u64);
+
+impl Fnv64Hasher {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for Fnv64Hasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
+
+fn source_fit_tag(fit: SourceFit) -> u8 {
+    match fit {
+        SourceFit::Stretch => 0,
+        SourceFit::Cover => 1,
+        SourceFit::Contain => 2,
+    }
+}
+
 impl FrameProvider for ProjectFrameProvider<'_> {
     fn provide_frame(
         &self,
@@ -1079,25 +1247,113 @@ impl FrameProvider for ProjectFrameProvider<'_> {
 
         let mut resolver = self.resolver.borrow_mut();
         let mut cache = self.cache.borrow_mut();
-        let frame = if asset.kind == AssetKind::Image {
-            resolver.provide_image_frame(&mut cache, asset, width, height, fit)
-        } else {
-            resolver.provide_video_frame(&mut cache, asset, source_tick, width, height, fit)
+        if asset.kind == AssetKind::Image {
+            let frame = resolver
+                .provide_image_frame(&mut cache, asset, width, height, fit)
+                .map_err(|err| RenderError::FrameProvider {
+                    asset_id: asset_id.to_owned(),
+                    source_tick: source_tick.0,
+                    message: err.to_string(),
+                })?;
+            return Ok(match frame.alpha_mode {
+                frameshift_media::AlphaMode::Straight => {
+                    SourceFrame::rgba8_straight(frame.width, frame.height, frame.data)
+                }
+                frameshift_media::AlphaMode::Premultiplied => {
+                    SourceFrame::rgba8_premul(frame.width, frame.height, frame.data)
+                }
+            });
         }
-        .map_err(|err| RenderError::FrameProvider {
-            asset_id: asset_id.to_owned(),
-            source_tick: source_tick.0,
-            message: err.to_string(),
-        })?;
 
-        Ok(match frame.alpha_mode {
-            frameshift_media::AlphaMode::Straight => {
-                SourceFrame::rgba8_straight(frame.width, frame.height, frame.data)
-            }
-            frameshift_media::AlphaMode::Premultiplied => {
-                SourceFrame::rgba8_premul(frame.width, frame.height, frame.data)
-            }
+        let cached = resolver
+            .provide_video_frame_decoded(&mut cache, asset, source_tick, width, height, fit)
+            .map_err(|err| RenderError::FrameProvider {
+                asset_id: asset_id.to_owned(),
+                source_tick: source_tick.0,
+                message: err.to_string(),
+            })?;
+
+        Ok(match cached {
+            CachedVideoFrame::Rgba8(frame) => match frame.alpha_mode {
+                frameshift_media::AlphaMode::Straight => {
+                    SourceFrame::rgba8_straight(frame.width, frame.height, frame.data.clone())
+                }
+                frameshift_media::AlphaMode::Premultiplied => {
+                    SourceFrame::rgba8_premul(frame.width, frame.height, frame.data.clone())
+                }
+            },
+            CachedVideoFrame::Nv12(frame) => SourceFrame::nv12(
+                frame.width,
+                frame.height,
+                frame.y_plane.clone(),
+                frame.uv_plane.clone(),
+                to_render_yuv_color_info(frame.color_info),
+                frame.content_uv_rect,
+            ),
         })
+    }
+
+    fn source_frame_hash(
+        &self,
+        asset_id: &str,
+        source_tick: Flicks,
+        width: u32,
+        height: u32,
+        fit: SourceFit,
+    ) -> Option<u64> {
+        if asset_id.starts_with("vector_text://") || asset_id.starts_with("vector_path_hud://") {
+            return None;
+        }
+        let asset = self.project.asset(asset_id)?;
+        if asset.kind == AssetKind::Audio {
+            return None;
+        }
+        let mut resolver = self.resolver.borrow_mut();
+        let source = resolver.resolve_asset_source(asset).ok()?;
+        let mut hasher = Fnv64Hasher::new();
+        asset.id.hash(&mut hasher);
+        width.hash(&mut hasher);
+        height.hash(&mut hasher);
+        source_fit_tag(fit).hash(&mut hasher);
+
+        if asset.kind == AssetKind::Image {
+            "img".hash(&mut hasher);
+            match source {
+                ResolvedAssetSource::Disk(path) => {
+                    path.hash(&mut hasher);
+                    disk_media_stamp(&path).ok()?.hash(&mut hasher);
+                }
+                ResolvedAssetSource::Synthetic(kind) => kind.hash(&mut hasher),
+            }
+            return Some(hasher.finish());
+        }
+
+        let clamped_tick = Flicks(source_tick.0.max(0));
+        match source {
+            ResolvedAssetSource::Disk(path) => {
+                "vid_disk".hash(&mut hasher);
+                let probe = resolver.probe_disk_video(&asset.id, &path).ok()?;
+                let stamp = resolver.probe_cache.get(&path).map(|(s, _)| s)?;
+                let matched = probe.pts_index.lookup_frame(clamped_tick)?;
+                path.hash(&mut hasher);
+                stamp.hash(&mut hasher);
+                matched.frame_index.hash(&mut hasher);
+                probe.yuv_color_info().hash(&mut hasher);
+                Some(hasher.finish())
+            }
+            ResolvedAssetSource::Synthetic(kind) => {
+                "vid_syn".hash(&mut hasher);
+                let frame_key = if let Some(fps) = asset.fps {
+                    let frame_idx = fps.ticks_to_frame_floor(clamped_tick).ok()?.max(0);
+                    frame_idx as u64
+                } else {
+                    clamped_tick.0 as u64
+                };
+                kind.hash(&mut hasher);
+                frame_key.hash(&mut hasher);
+                Some(hasher.finish())
+            }
+        }
     }
 }
 
@@ -1210,12 +1466,18 @@ mod tests {
 
         let probe = FfmpegBridge::probe_media_info(&mp4_path).expect("probe");
         let tick = probe.pts_index.as_slice()[0];
-        let legacy =
-            FfmpegBridge::decode_video_frame(&mp4_path, &probe.pts_index, tick, dst_w, dst_h)
-                .expect("legacy stretch");
-        let cover_direct = FfmpegBridge::decode_video_frame_with_fit(
+        let legacy = FfmpegBridge::decode_video_frame_decoded_with_fit(
             &mp4_path,
-            &probe.pts_index,
+            &probe,
+            tick,
+            dst_w,
+            dst_h,
+            DecodeFit::Stretch,
+        )
+        .expect("legacy stretch");
+        let cover_direct = FfmpegBridge::decode_video_frame_decoded_with_fit(
+            &mp4_path,
+            &probe,
             tick,
             dst_w,
             dst_h,
@@ -1253,9 +1515,9 @@ mod tests {
             (stretch, cover)
         };
 
-        assert_eq!(rgba8_bytes(&stretch), legacy.data.as_slice());
-        assert_eq!(rgba8_bytes(&cover), cover_direct.data.as_slice());
-        assert_ne!(rgba8_bytes(&stretch), rgba8_bytes(&cover));
+        assert_eq!(source_bytes(&stretch), decoded_bytes(&legacy));
+        assert_eq!(source_bytes(&cover), decoded_bytes(&cover_direct));
+        assert_ne!(source_bytes(&stretch), source_bytes(&cover));
 
         assert_eq!(cache.telemetry().current_entries, 2);
         let hits_before = cache.telemetry().hits;
@@ -1267,18 +1529,36 @@ mod tests {
             let cover = provider
                 .provide_source_frame("asset_clip_a", tick, dst_w, dst_h, cover_fit)
                 .expect("cover cache hit");
-            assert_eq!(rgba8_bytes(&stretch), legacy.data.as_slice());
-            assert_eq!(rgba8_bytes(&cover), cover_direct.data.as_slice());
+            assert_eq!(source_bytes(&stretch), decoded_bytes(&legacy));
+            assert_eq!(source_bytes(&cover), decoded_bytes(&cover_direct));
         }
         assert_eq!(cache.telemetry().hits, hits_before + 2);
 
         resolver.close_video_streams();
         std::fs::remove_file(&mp4_path).expect("mp4 unlocked after close_video_streams");
 
-        fn rgba8_bytes(frame: &SourceFrame) -> &[u8] {
+        fn source_bytes(frame: &SourceFrame) -> Vec<u8> {
             match &frame.pixels {
-                SourcePixelData::Rgba8 { data, .. } => data,
-                SourcePixelData::RgbaF32 { .. } => panic!("disk decode returns rgba8"),
+                SourcePixelData::Rgba8 { data, .. } => data.clone(),
+                SourcePixelData::Nv12 {
+                    y_plane, uv_plane, ..
+                } => {
+                    let mut out = y_plane.clone();
+                    out.extend_from_slice(uv_plane);
+                    out
+                }
+                SourcePixelData::RgbaF32 { .. } => panic!("disk decode returns rgba8 or nv12"),
+            }
+        }
+
+        fn decoded_bytes(frame: &frameshift_media::DecodedVideoFrame) -> Vec<u8> {
+            match frame {
+                frameshift_media::DecodedVideoFrame::Rgba8(f) => f.data.clone(),
+                frameshift_media::DecodedVideoFrame::Nv12(f) => {
+                    let mut out = f.y_plane.clone();
+                    out.extend_from_slice(&f.uv_plane);
+                    out
+                }
             }
         }
 
@@ -1690,6 +1970,7 @@ mod tests {
             source_anchor_tick: None,
             target_output_tick: Flicks(FLICKS_PER_SECOND),
             origin: EventOrigin::UserMarked,
+            timing: frameshift_schema::EventTimingConstraint::Absolute,
         });
 
         // 1. Anchor placement + apex offset resolution

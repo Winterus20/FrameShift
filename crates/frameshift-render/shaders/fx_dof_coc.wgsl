@@ -60,9 +60,10 @@ fn eval_signed_coc(coord: vec2<i32>, max_coord: vec2<i32>) -> vec4<f32> {
     let max_rad = clamp(u.screen_params.x, 0.0, 48.0);
     let alpha = clamp(col.a, 0.0, 1.0);
 
-    // Unwritten depth buffer (raw_d >= 0.99999) is always void (0 CoC) so Z-echo / semi-transparent
-    // edges never falsely trigger z = far (200.0) blur.
-    if (raw_d >= 0.99999) {
+    // Unwritten depth buffer (raw_d >= 0.99999) or transparent empty pixels (alpha <= 1e-4, e.g.
+    // depth_plate-seeded background with no drawn 3D mesh) are always void (0 CoC) so empty
+    // foreground areas never bleed near-CoC onto sharp in-focus 3D text/shapes.
+    if (raw_d >= 0.99999 || alpha <= 1e-4) {
         return vec4<f32>(0.0, far, alpha, 1.0);
     }
 

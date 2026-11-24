@@ -1,6 +1,11 @@
 use crate::error::MediaError;
-use crate::ffmpeg::{FfmpegBridge, SourceFit, append_fitted_output, midpoint_seek_seconds};
-use crate::frame::{AlphaMode, Rgba8Frame};
+use crate::ffmpeg::{
+    FfmpegBridge, MediaProbeInfo, SourceFit, append_fitted_output, append_nv12_fitted_output,
+    midpoint_seek_seconds,
+};
+use crate::frame::{
+    AlphaMode, DecodedVideoFrame, Nv12Frame, Rgba8Frame, YuvColorInfo, validated_nv12_plane_lens,
+};
 use frameshift_time::PtsIndex;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufReader, Read};
@@ -45,6 +50,14 @@ impl StreamKey {
     }
 }
 
+/// Raw pipe pixel layout used by [`StreamingVideoDecoder`] and [`DecoderPool`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum StreamingPixelFormat {
+    #[default]
+    Rgba8,
+    Nv12,
+}
+
 /// Configuration for [`DecoderPool`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecoderPoolConfig {
@@ -73,10 +86,15 @@ pub struct DecoderPoolTelemetry {
     pub eof_reaches: u64,
 }
 
-/// A single long-lived `ffmpeg` rawvideo RGBA stdout pipe session.
+/// A single long-lived `ffmpeg` rawvideo (`rgba` or `nv12`) stdout pipe session.
 #[derive(Debug)]
 pub struct StreamingVideoDecoder {
     key: StreamKey,
+    pixel_format: StreamingPixelFormat,
+    decoded_width: u32,
+    decoded_height: u32,
+    color_info: YuvColorInfo,
+    content_uv_rect: [f32; 4],
     child: Child,
     reader: Option<BufReader<ChildStdout>>,
     stderr_drain: Option<JoinHandle<String>>,
@@ -99,6 +117,28 @@ impl StreamingVideoDecoder {
         pts_index: &PtsIndex,
         start_frame_index: usize,
     ) -> Result<Self, MediaError> {
+        Self::open_decoded(
+            key,
+            pts_index,
+            start_frame_index,
+            StreamingPixelFormat::Rgba8,
+            None,
+            YuvColorInfo::default(),
+        )
+    }
+
+    /// Spawns a continuous rawvideo pipe (`nv12` or `rgba`) starting at `start_frame_index`.
+    ///
+    /// Automatically falls back to `rgba` when dimensions are odd or when `SourceFit::Contain`
+    /// is requested without `src_dims`.
+    pub fn open_decoded(
+        key: StreamKey,
+        pts_index: &PtsIndex,
+        start_frame_index: usize,
+        pixel_format: StreamingPixelFormat,
+        src_dims: Option<(u32, u32)>,
+        color_info: YuvColorInfo,
+    ) -> Result<Self, MediaError> {
         if key.width == 0 || key.height == 0 {
             return Err(MediaError::InvalidDimensions {
                 width: key.width,
@@ -112,13 +152,16 @@ impl StreamingVideoDecoder {
                 key.path.display()
             )));
         }
-        let frame_byte_len = (key.width as usize)
-            .checked_mul(key.height as usize)
-            .and_then(|v| v.checked_mul(4))
-            .ok_or(MediaError::InvalidDimensions {
-                width: key.width,
-                height: key.height,
-            })?;
+
+        let effective_fmt = match pixel_format {
+            StreamingPixelFormat::Nv12
+                if !YuvColorInfo::should_fallback_to_rgba(key.width, key.height, None)
+                    && (key.fit != SourceFit::Contain || src_dims.is_some()) =>
+            {
+                StreamingPixelFormat::Nv12
+            }
+            _ => StreamingPixelFormat::Rgba8,
+        };
 
         let mut cmd = Command::new("ffmpeg");
         cmd.args(["-v", "error", "-nostdin"]);
@@ -128,9 +171,30 @@ impl StreamingVideoDecoder {
         cmd.arg("-i")
             .arg(&key.path)
             .args(["-fps_mode", "passthrough"]);
-        append_fitted_output(&mut cmd, key.width, key.height, key.fit);
-        cmd.args(["-pix_fmt", "rgba", "-f", "rawvideo", "pipe:1"])
-            .stdin(Stdio::null())
+
+        let (decoded_width, decoded_height, content_uv_rect, frame_byte_len) = match effective_fmt {
+            StreamingPixelFormat::Rgba8 => {
+                append_fitted_output(&mut cmd, key.width, key.height, key.fit);
+                cmd.args(["-pix_fmt", "rgba", "-f", "rawvideo", "pipe:1"]);
+                let bytes = (key.width as usize)
+                    .checked_mul(key.height as usize)
+                    .and_then(|v| v.checked_mul(4))
+                    .ok_or(MediaError::InvalidDimensions {
+                        width: key.width,
+                        height: key.height,
+                    })?;
+                (key.width, key.height, [0.0, 0.0, 1.0, 1.0], bytes)
+            }
+            StreamingPixelFormat::Nv12 => {
+                let (dw, dh, rect) =
+                    append_nv12_fitted_output(&mut cmd, src_dims, key.width, key.height, key.fit);
+                cmd.args(["-pix_fmt", "nv12", "-f", "rawvideo", "pipe:1"]);
+                let (y_len, uv_len) = validated_nv12_plane_lens(dw, dh)?;
+                (dw, dh, rect, y_len + uv_len)
+            }
+        };
+
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -152,6 +216,11 @@ impl StreamingVideoDecoder {
 
         Ok(Self {
             key,
+            pixel_format: effective_fmt,
+            decoded_width,
+            decoded_height,
+            color_info,
+            content_uv_rect,
             child,
             reader: Some(reader),
             stderr_drain,
@@ -163,6 +232,18 @@ impl StreamingVideoDecoder {
         })
     }
 
+    /// Returns the [`StreamKey`] associated with this streaming session.
+    #[inline]
+    pub fn key(&self) -> &StreamKey {
+        &self.key
+    }
+
+    /// Returns the pixel layout produced by this streaming session.
+    #[inline]
+    pub fn pixel_format(&self) -> StreamingPixelFormat {
+        self.pixel_format
+    }
+
     /// Reads the next frame (`self.next_cursor`) from the open pipe and advances the cursor by 1.
     ///
     /// Returns `Ok(None)` on clean EOF and marks the stream finished.
@@ -171,6 +252,18 @@ impl StreamingVideoDecoder {
         &mut self,
         pts_index: &PtsIndex,
     ) -> Result<Option<Rgba8Frame>, MediaError> {
+        match self.read_next_decoded_frame(pts_index)? {
+            Some(DecodedVideoFrame::Rgba8(f)) => Ok(Some(f)),
+            Some(DecodedVideoFrame::Nv12(f)) => f.to_rgba8_approx().map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Reads the next decoded frame (`Rgba8` or `Nv12`) from the open pipe.
+    pub fn read_next_decoded_frame(
+        &mut self,
+        pts_index: &PtsIndex,
+    ) -> Result<Option<DecodedVideoFrame>, MediaError> {
         if self.finished {
             return Ok(None);
         }
@@ -186,13 +279,25 @@ impl StreamingVideoDecoder {
         let mut buf = vec![0u8; self.frame_byte_len];
         match reader.read_exact(&mut buf) {
             Ok(()) => {
-                let frame = Rgba8Frame::new(
-                    self.key.width,
-                    self.key.height,
-                    pts,
-                    AlphaMode::Straight,
-                    buf,
-                )?;
+                let frame = match self.pixel_format {
+                    StreamingPixelFormat::Rgba8 => DecodedVideoFrame::Rgba8(Rgba8Frame::new(
+                        self.decoded_width,
+                        self.decoded_height,
+                        pts,
+                        AlphaMode::Straight,
+                        buf,
+                    )?),
+                    StreamingPixelFormat::Nv12 => {
+                        DecodedVideoFrame::Nv12(Nv12Frame::from_contiguous(
+                            self.decoded_width,
+                            self.decoded_height,
+                            pts,
+                            &buf,
+                            self.color_info,
+                            self.content_uv_rect,
+                        )?)
+                    }
+                };
                 self.next_cursor += 1;
                 Ok(Some(frame))
             }
@@ -313,13 +418,15 @@ struct PoolEntry {
     last_used_seq: u64,
 }
 
-/// Bounded LRU pool of open [`StreamingVideoDecoder`] subprocesses keyed by `(path, width, height, fit)`.
+type PoolMapKey = (StreamKey, StreamingPixelFormat);
+
+/// Bounded LRU pool of open [`StreamingVideoDecoder`] subprocesses keyed by `(path, width, height, fit, format)`.
 #[derive(Debug)]
 pub struct DecoderPool {
     config: DecoderPoolConfig,
     access_seq: u64,
-    streams: HashMap<StreamKey, PoolEntry>,
-    lru_order: BTreeMap<u64, StreamKey>,
+    streams: HashMap<PoolMapKey, PoolEntry>,
+    lru_order: BTreeMap<u64, PoolMapKey>,
     telemetry: DecoderPoolTelemetry,
 }
 
@@ -335,7 +442,7 @@ impl DecoderPool {
         }
     }
 
-    /// Decodes frame `target_frame_index` from `path` at `(width, height, fit)`.
+    /// Decodes frame `target_frame_index` from `path` at `(width, height, fit)` as `Rgba8Frame`.
     ///
     /// Reuses an open stream on sequential reads or small forward skips (`<= max_sequential_skip`),
     /// and reopens via `-ss` seek on rewinds, large jumps, or unexpected EOF.
@@ -348,6 +455,66 @@ impl DecoderPool {
         height: u32,
         fit: SourceFit,
     ) -> Result<Rgba8Frame, MediaError> {
+        let frame = self.decode_internal(
+            path,
+            pts_index,
+            target_frame_index,
+            width,
+            height,
+            fit,
+            StreamingPixelFormat::Rgba8,
+            None,
+            YuvColorInfo::default(),
+            None,
+        )?;
+        frame.into_rgba8()
+    }
+
+    /// Decodes frame `target_frame_index` using `probe` metadata, preferring planar NV12 when
+    /// `(width, height)` are even and `probe.pixel_format` has no alpha channel, falling back
+    /// automatically to `Rgba8` otherwise.
+    pub fn decode_video_frame_decoded(
+        &mut self,
+        path: &Path,
+        probe: &MediaProbeInfo,
+        target_frame_index: usize,
+        width: u32,
+        height: u32,
+        fit: SourceFit,
+    ) -> Result<DecodedVideoFrame, MediaError> {
+        let fmt = if probe.prefers_nv12_decode(width, height) {
+            StreamingPixelFormat::Nv12
+        } else {
+            StreamingPixelFormat::Rgba8
+        };
+        self.decode_internal(
+            path,
+            &probe.pts_index,
+            target_frame_index,
+            width,
+            height,
+            fit,
+            fmt,
+            Some((probe.width, probe.height)),
+            probe.yuv_color_info(),
+            Some(probe),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_internal(
+        &mut self,
+        path: &Path,
+        pts_index: &PtsIndex,
+        target_frame_index: usize,
+        width: u32,
+        height: u32,
+        fit: SourceFit,
+        pixel_format: StreamingPixelFormat,
+        src_dims: Option<(u32, u32)>,
+        color_info: YuvColorInfo,
+        probe_opt: Option<&MediaProbeInfo>,
+    ) -> Result<DecodedVideoFrame, MediaError> {
         if width == 0 || height == 0 {
             return Err(MediaError::InvalidDimensions { width, height });
         }
@@ -358,29 +525,47 @@ impl DecoderPool {
                 path.display()
             )));
         }
-        let expected_bytes = (width as usize)
+        let expected_rgba_bytes = (width as usize)
             .checked_mul(height as usize)
             .and_then(|v| v.checked_mul(4))
             .ok_or(MediaError::InvalidDimensions { width, height })?;
 
-        let key = StreamKey::new(path, width, height, fit);
+        let stream_key = StreamKey::new(path, width, height, fit);
+        let effective_fmt = match pixel_format {
+            StreamingPixelFormat::Nv12
+                if !YuvColorInfo::should_fallback_to_rgba(width, height, None)
+                    && (fit != SourceFit::Contain || src_dims.is_some()) =>
+            {
+                StreamingPixelFormat::Nv12
+            }
+            _ => StreamingPixelFormat::Rgba8,
+        };
+        let map_key = (stream_key.clone(), effective_fmt);
 
         if self.config.max_open_streams == 0 {
             self.telemetry.spawns += 1;
-            let mut decoder = StreamingVideoDecoder::open(key, pts_index, target_frame_index)?;
-            return match decoder.read_next_frame(pts_index)? {
+            let mut decoder = StreamingVideoDecoder::open_decoded(
+                stream_key,
+                pts_index,
+                target_frame_index,
+                effective_fmt,
+                src_dims,
+                color_info,
+            )?;
+            return match decoder.read_next_decoded_frame(pts_index)? {
                 Some(frame) => Ok(frame),
                 None => {
                     self.telemetry.eof_reaches += 1;
                     drop(decoder);
-                    decode_single_frame_fallback(
+                    decode_single_frame_decoded_fallback(
                         path,
                         pts_index,
+                        probe_opt,
                         target_frame_index,
                         width,
                         height,
                         fit,
-                        expected_bytes,
+                        expected_rgba_bytes,
                     )
                 }
             };
@@ -393,7 +578,7 @@ impl DecoderPool {
             SpawnNew,
         }
 
-        let action = if let Some(entry) = self.streams.get(&key) {
+        let action = if let Some(entry) = self.streams.get(&map_key) {
             let cursor = entry.decoder.next_cursor();
             if entry.decoder.finished {
                 Action::SeekReopen
@@ -412,41 +597,42 @@ impl DecoderPool {
 
         match action {
             Action::ReadSequential => {
-                self.touch_entry(&key);
+                self.touch_entry(&map_key);
                 self.telemetry.sequential_reads += 1;
                 let read_res = self
                     .streams
-                    .get_mut(&key)
+                    .get_mut(&map_key)
                     .expect("entry verified present")
                     .decoder
-                    .read_next_frame(pts_index);
+                    .read_next_decoded_frame(pts_index);
                 match read_res {
                     Ok(Some(frame)) => Ok(frame),
                     Ok(None) => {
                         self.telemetry.eof_reaches += 1;
-                        self.remove_entry(&key);
-                        decode_single_frame_fallback(
+                        self.remove_entry(&map_key);
+                        decode_single_frame_decoded_fallback(
                             path,
                             pts_index,
+                            probe_opt,
                             target_frame_index,
                             width,
                             height,
                             fit,
-                            expected_bytes,
+                            expected_rgba_bytes,
                         )
                     }
                     Err(err) => {
-                        self.remove_entry(&key);
+                        self.remove_entry(&map_key);
                         Err(err)
                     }
                 }
             }
             Action::SkipAndRead(delta) => {
-                self.touch_entry(&key);
+                self.touch_entry(&map_key);
                 let skip_and_read_res = {
                     let decoder = &mut self
                         .streams
-                        .get_mut(&key)
+                        .get_mut(&map_key)
                         .expect("entry verified present")
                         .decoder;
                     let before_cursor = decoder.next_cursor();
@@ -459,62 +645,67 @@ impl DecoderPool {
                     Ok(true) => {
                         let read_res = self
                             .streams
-                            .get_mut(&key)
+                            .get_mut(&map_key)
                             .expect("entry verified present")
                             .decoder
-                            .read_next_frame(pts_index);
+                            .read_next_decoded_frame(pts_index);
                         match read_res {
                             Ok(Some(frame)) => Ok(frame),
                             Ok(None) => {
                                 self.telemetry.eof_reaches += 1;
-                                self.remove_entry(&key);
-                                decode_single_frame_fallback(
+                                self.remove_entry(&map_key);
+                                decode_single_frame_decoded_fallback(
                                     path,
                                     pts_index,
+                                    probe_opt,
                                     target_frame_index,
                                     width,
                                     height,
                                     fit,
-                                    expected_bytes,
+                                    expected_rgba_bytes,
                                 )
                             }
                             Err(err) => {
-                                self.remove_entry(&key);
+                                self.remove_entry(&map_key);
                                 Err(err)
                             }
                         }
                     }
                     Ok(false) => {
                         self.telemetry.eof_reaches += 1;
-                        self.remove_entry(&key);
-                        decode_single_frame_fallback(
+                        self.remove_entry(&map_key);
+                        decode_single_frame_decoded_fallback(
                             path,
                             pts_index,
+                            probe_opt,
                             target_frame_index,
                             width,
                             height,
                             fit,
-                            expected_bytes,
+                            expected_rgba_bytes,
                         )
                     }
                     Err(err) => {
-                        self.remove_entry(&key);
+                        self.remove_entry(&map_key);
                         Err(err)
                     }
                 }
             }
             Action::SeekReopen => {
-                self.remove_entry(&key);
+                self.remove_entry(&map_key);
                 self.telemetry.seek_reopens += 1;
                 self.open_and_read_into_pool(
-                    key,
+                    map_key,
                     path,
                     pts_index,
+                    probe_opt,
                     target_frame_index,
                     width,
                     height,
                     fit,
-                    expected_bytes,
+                    src_dims,
+                    color_info,
+                    expected_rgba_bytes,
                 )
             }
             Action::SpawnNew => {
@@ -527,14 +718,17 @@ impl DecoderPool {
                 }
                 self.telemetry.spawns += 1;
                 self.open_and_read_into_pool(
-                    key,
+                    map_key,
                     path,
                     pts_index,
+                    probe_opt,
                     target_frame_index,
                     width,
                     height,
                     fit,
-                    expected_bytes,
+                    src_dims,
+                    color_info,
+                    expected_rgba_bytes,
                 )
             }
         }
@@ -542,10 +736,10 @@ impl DecoderPool {
 
     /// Closes and drops all open decoder subprocesses associated with `path`.
     pub fn invalidate_path(&mut self, path: &Path) {
-        let keys_to_remove: Vec<StreamKey> = self
+        let keys_to_remove: Vec<PoolMapKey> = self
             .streams
             .keys()
-            .filter(|k| k.path == path)
+            .filter(|(k, _)| k.path == path)
             .cloned()
             .collect();
         for key in keys_to_remove {
@@ -570,38 +764,49 @@ impl DecoderPool {
     #[allow(clippy::too_many_arguments)]
     fn open_and_read_into_pool(
         &mut self,
-        key: StreamKey,
+        map_key: PoolMapKey,
         path: &Path,
         pts_index: &PtsIndex,
+        probe_opt: Option<&MediaProbeInfo>,
         target_frame_index: usize,
         width: u32,
         height: u32,
         fit: SourceFit,
-        expected_bytes: usize,
-    ) -> Result<Rgba8Frame, MediaError> {
-        let mut decoder = StreamingVideoDecoder::open(key.clone(), pts_index, target_frame_index)?;
-        match decoder.read_next_frame(pts_index)? {
+        src_dims: Option<(u32, u32)>,
+        color_info: YuvColorInfo,
+        expected_rgba_bytes: usize,
+    ) -> Result<DecodedVideoFrame, MediaError> {
+        let mut decoder = StreamingVideoDecoder::open_decoded(
+            map_key.0.clone(),
+            pts_index,
+            target_frame_index,
+            map_key.1,
+            src_dims,
+            color_info,
+        )?;
+        match decoder.read_next_decoded_frame(pts_index)? {
             Some(frame) => {
-                self.insert_entry(key, decoder);
+                self.insert_entry(map_key, decoder);
                 Ok(frame)
             }
             None => {
                 self.telemetry.eof_reaches += 1;
                 drop(decoder);
-                decode_single_frame_fallback(
+                decode_single_frame_decoded_fallback(
                     path,
                     pts_index,
+                    probe_opt,
                     target_frame_index,
                     width,
                     height,
                     fit,
-                    expected_bytes,
+                    expected_rgba_bytes,
                 )
             }
         }
     }
 
-    fn touch_entry(&mut self, key: &StreamKey) {
+    fn touch_entry(&mut self, key: &PoolMapKey) {
         if let Some(entry) = self.streams.get_mut(key) {
             let old_seq = entry.last_used_seq;
             self.lru_order.remove(&old_seq);
@@ -612,7 +817,7 @@ impl DecoderPool {
         }
     }
 
-    fn insert_entry(&mut self, key: StreamKey, decoder: StreamingVideoDecoder) {
+    fn insert_entry(&mut self, key: PoolMapKey, decoder: StreamingVideoDecoder) {
         if let Some(old) = self.streams.remove(&key) {
             self.lru_order.remove(&old.last_used_seq);
         }
@@ -629,7 +834,7 @@ impl DecoderPool {
         self.telemetry.active_streams = self.streams.len();
     }
 
-    fn remove_entry(&mut self, key: &StreamKey) {
+    fn remove_entry(&mut self, key: &PoolMapKey) {
         if let Some(entry) = self.streams.remove(key) {
             self.lru_order.remove(&entry.last_used_seq);
         }
@@ -660,22 +865,34 @@ impl Drop for DecoderPool {
     }
 }
 
-fn decode_single_frame_fallback(
+#[allow(clippy::too_many_arguments)]
+fn decode_single_frame_decoded_fallback(
     path: &Path,
     pts_index: &PtsIndex,
+    probe_opt: Option<&MediaProbeInfo>,
     target_frame_index: usize,
     width: u32,
     height: u32,
     fit: SourceFit,
-    expected_bytes: usize,
-) -> Result<Rgba8Frame, MediaError> {
+    expected_rgba_bytes: usize,
+) -> Result<DecodedVideoFrame, MediaError> {
     let target_tick = pts_index.as_slice()[target_frame_index];
+    if let Some(probe) = probe_opt {
+        return FfmpegBridge::decode_video_frame_decoded_with_fit(
+            path,
+            probe,
+            target_tick,
+            width,
+            height,
+            fit,
+        );
+    }
     match FfmpegBridge::decode_video_frame_with_fit(path, pts_index, target_tick, width, height, fit)
     {
-        Ok(frame) => Ok(frame),
+        Ok(frame) => Ok(DecodedVideoFrame::Rgba8(frame)),
         Err(MediaError::BufferLengthMismatch { actual, .. }) => {
             Err(MediaError::BufferLengthMismatch {
-                expected: expected_bytes,
+                expected: expected_rgba_bytes,
                 actual,
             })
         }

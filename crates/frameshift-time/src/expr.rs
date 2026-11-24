@@ -55,6 +55,10 @@ pub struct ExprContext {
     pub output_tick: i64,
     pub beat_phase: f64,
     pub audio_rms: f64,
+    pub audio_sub: f64,
+    pub audio_mid: f64,
+    pub audio_high: f64,
+    pub downbeat_phase: f64,
     pub event_delta_sec: f64,
     pub progress: f64,
 }
@@ -65,6 +69,10 @@ enum ContextVar {
     OutputTick,
     BeatPhase,
     AudioRms,
+    AudioSub,
+    AudioMid,
+    AudioHigh,
+    DownbeatPhase,
     EventDeltaSec,
     Progress,
 }
@@ -76,6 +84,10 @@ impl ContextVar {
             "output_tick" => Some(Self::OutputTick),
             "beat_phase" => Some(Self::BeatPhase),
             "audio_rms" => Some(Self::AudioRms),
+            "audio_sub" => Some(Self::AudioSub),
+            "audio_mid" => Some(Self::AudioMid),
+            "audio_high" => Some(Self::AudioHigh),
+            "downbeat_phase" => Some(Self::DownbeatPhase),
             "event_delta_sec" => Some(Self::EventDeltaSec),
             "progress" => Some(Self::Progress),
             _ => None,
@@ -88,6 +100,10 @@ impl ContextVar {
             Self::OutputTick => ctx.output_tick as f64,
             Self::BeatPhase => ctx.beat_phase,
             Self::AudioRms => ctx.audio_rms,
+            Self::AudioSub => ctx.audio_sub,
+            Self::AudioMid => ctx.audio_mid,
+            Self::AudioHigh => ctx.audio_high,
+            Self::DownbeatPhase => ctx.downbeat_phase,
             Self::EventDeltaSec => ctx.event_delta_sec,
             Self::Progress => ctx.progress,
         };
@@ -99,6 +115,7 @@ impl ContextVar {
 enum UnaryOp {
     Neg,
     Pos,
+    Not,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +124,19 @@ enum BinaryOp {
     Sub,
     Mul,
     Div,
+    Mod,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogicalOp {
+    And,
+    Or,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +146,10 @@ enum BuiltinFunc {
     Abs,
     Exp,
     Floor,
+    Ceil,
     Fract,
+    Sqrt,
+    Log,
     EaseOutExpo,
     EaseInExpo,
     EaseInOutExpo,
@@ -127,8 +160,11 @@ enum BuiltinFunc {
     Clamp,
     Smoothstep,
     Lerp,
+    Mix,
     Step,
     Pow,
+    Spring,
+    Wiggle,
     CubicBezier,
 }
 
@@ -140,7 +176,10 @@ impl BuiltinFunc {
             "abs" => Some(Self::Abs),
             "exp" => Some(Self::Exp),
             "floor" => Some(Self::Floor),
+            "ceil" => Some(Self::Ceil),
             "fract" => Some(Self::Fract),
+            "sqrt" => Some(Self::Sqrt),
+            "log" => Some(Self::Log),
             "ease_out_expo" => Some(Self::EaseOutExpo),
             "ease_in_expo" => Some(Self::EaseInExpo),
             "ease_in_out_expo" => Some(Self::EaseInOutExpo),
@@ -151,8 +190,11 @@ impl BuiltinFunc {
             "clamp" => Some(Self::Clamp),
             "smoothstep" => Some(Self::Smoothstep),
             "lerp" => Some(Self::Lerp),
+            "mix" => Some(Self::Mix),
             "step" => Some(Self::Step),
             "pow" => Some(Self::Pow),
+            "spring" => Some(Self::Spring),
+            "wiggle" => Some(Self::Wiggle),
             "cubic_bezier" => Some(Self::CubicBezier),
             _ => None,
         }
@@ -165,13 +207,21 @@ impl BuiltinFunc {
             | Self::Abs
             | Self::Exp
             | Self::Floor
+            | Self::Ceil
             | Self::Fract
+            | Self::Sqrt
+            | Self::Log
             | Self::EaseOutExpo
             | Self::EaseInExpo
             | Self::EaseInOutExpo
             | Self::EaseOutBack => 1,
             Self::Min | Self::Max | Self::Mod | Self::Step | Self::Pow => 2,
-            Self::Clamp | Self::Smoothstep | Self::Lerp => 3,
+            Self::Clamp
+            | Self::Smoothstep
+            | Self::Lerp
+            | Self::Mix
+            | Self::Spring
+            | Self::Wiggle => 3,
             Self::CubicBezier => 5,
         }
     }
@@ -189,6 +239,16 @@ enum ExprNode {
         op: BinaryOp,
         lhs: Box<ExprNode>,
         rhs: Box<ExprNode>,
+    },
+    Logical {
+        op: LogicalOp,
+        lhs: Box<ExprNode>,
+        rhs: Box<ExprNode>,
+    },
+    Cond {
+        cond: Box<ExprNode>,
+        then_branch: Box<ExprNode>,
+        else_branch: Box<ExprNode>,
     },
     Call {
         func: BuiltinFunc,
@@ -277,6 +337,79 @@ fn ensure_finite(val: f64) -> Result<f64, ExprError> {
     }
 }
 
+/// Analytical step-response of a damped harmonic oscillator (seek-independent).
+///
+/// `x(0) = 0`, `x'(0) = 0`, `lim_{t -> inf} x(t) = 1.0`.
+#[inline]
+fn eval_spring(t: f64, stiffness: f64, damping: f64) -> f64 {
+    if t <= 0.0 {
+        return 0.0;
+    }
+    let omega0 = stiffness.clamp(0.01, 10_000.0).sqrt();
+    let zeta = damping.clamp(0.0, 10.0);
+    if zeta > 0.0 && t >= 30.0 && zeta * omega0 * t > 40.0 {
+        return 1.0;
+    }
+    let env = (-zeta * omega0 * t).exp();
+    if zeta < 1.0 - 1e-5 {
+        let denom = (1.0 - zeta * zeta).sqrt();
+        let wd = omega0 * denom;
+        let c = zeta / denom;
+        1.0 - env * ((wd * t).cos() + c * (wd * t).sin())
+    } else if zeta <= 1.0 + 1e-5 {
+        1.0 - env * (1.0 + omega0 * t)
+    } else {
+        let r = (zeta * zeta - 1.0).sqrt();
+        let r1 = -omega0 * (zeta - r);
+        let r2 = -omega0 * (zeta + r);
+        let denom = r2 - r1;
+        let c1 = r2 / denom;
+        let c2 = -r1 / denom;
+        1.0 - (c1 * (r1 * t).exp() + c2 * (r2 * t).exp())
+    }
+}
+
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+#[inline]
+fn grad_1d(cell: i64, seed: u64) -> f64 {
+    let h = splitmix64((cell as u64).wrapping_mul(0xd6e8_feb8_6659_fd93) ^ seed);
+    let unit = ((h >> 11) as f64) / ((1u64 << 53) as f64);
+    unit * 2.0 - 1.0
+}
+
+/// Deterministic, seek-independent 1D gradient (Perlin) noise scaled to `[-amp, +amp]`.
+#[inline]
+fn eval_wiggle(t_sec: f64, freq: f64, amp: f64, seed: f64) -> f64 {
+    if !freq.is_finite() || !amp.is_finite() || !seed.is_finite() || freq <= 0.0 || amp == 0.0 {
+        return 0.0;
+    }
+    let u = t_sec * freq;
+    let fl = u.floor();
+    let i0 = fl as i64;
+    let f = u - fl;
+    let s = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let seed_u64 = (seed.round() as i64) as u64;
+    let n0 = grad_1d(i0, seed_u64) * f;
+    let n1 = grad_1d(i0.wrapping_add(1), seed_u64) * (f - 1.0);
+    (n0 + (n1 - n0) * s) * 2.0 * amp
+}
+
+#[inline]
+fn consume_extra_fuel(fuel: &mut u32, extra: u32, max_fuel: u32) -> Result<(), ExprError> {
+    if *fuel < extra {
+        return Err(ExprError::FuelExhausted { max_fuel });
+    }
+    *fuel -= extra;
+    Ok(())
+}
+
 fn eval_node(
     node: &ExprNode,
     ctx: &ExprContext,
@@ -296,6 +429,13 @@ fn eval_node(
             let out = match op {
                 UnaryOp::Neg => -v,
                 UnaryOp::Pos => v,
+                UnaryOp::Not => {
+                    if v == 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
             };
             ensure_finite(out)
         }
@@ -312,8 +452,52 @@ fn eval_node(
                     }
                     a / b
                 }
+                BinaryOp::Mod => {
+                    if b == 0.0 {
+                        return Err(ExprError::DivisionByZero);
+                    }
+                    let q = ensure_finite(a / b)?;
+                    a - b * q.floor()
+                }
+                BinaryOp::Lt => if a < b { 1.0 } else { 0.0 },
+                BinaryOp::Le => if a <= b { 1.0 } else { 0.0 },
+                BinaryOp::Gt => if a > b { 1.0 } else { 0.0 },
+                BinaryOp::Ge => if a >= b { 1.0 } else { 0.0 },
+                BinaryOp::Eq => if a == b { 1.0 } else { 0.0 },
+                BinaryOp::Ne => if a != b { 1.0 } else { 0.0 },
             };
             ensure_finite(out)
+        }
+        ExprNode::Logical { op, lhs, rhs } => {
+            let a = eval_node(lhs, ctx, fuel, max_fuel)?;
+            match op {
+                LogicalOp::And => {
+                    if a == 0.0 {
+                        return Ok(0.0);
+                    }
+                    let b = eval_node(rhs, ctx, fuel, max_fuel)?;
+                    Ok(if b != 0.0 { 1.0 } else { 0.0 })
+                }
+                LogicalOp::Or => {
+                    if a != 0.0 {
+                        return Ok(1.0);
+                    }
+                    let b = eval_node(rhs, ctx, fuel, max_fuel)?;
+                    Ok(if b != 0.0 { 1.0 } else { 0.0 })
+                }
+            }
+        }
+        ExprNode::Cond {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            let c = eval_node(cond, ctx, fuel, max_fuel)?;
+            if c != 0.0 {
+                eval_node(then_branch, ctx, fuel, max_fuel)
+            } else {
+                eval_node(else_branch, ctx, fuel, max_fuel)
+            }
         }
         ExprNode::Call { func, args } => {
             let mut vals = [0.0_f64; 5];
@@ -326,7 +510,10 @@ fn eval_node(
                 BuiltinFunc::Abs => vals[0].abs(),
                 BuiltinFunc::Exp => vals[0].exp(),
                 BuiltinFunc::Floor => vals[0].floor(),
+                BuiltinFunc::Ceil => vals[0].ceil(),
                 BuiltinFunc::Fract => vals[0] - vals[0].floor(),
+                BuiltinFunc::Sqrt => vals[0].max(0.0).sqrt(),
+                BuiltinFunc::Log => vals[0].max(1e-12).ln(),
                 BuiltinFunc::EaseOutExpo => {
                     let t = vals[0].clamp(0.0, 1.0);
                     if t <= 0.0 {
@@ -408,7 +595,7 @@ fn eval_node(
                     let t = u.clamp(0.0, 1.0);
                     t * t * (3.0 - 2.0 * t)
                 }
-                BuiltinFunc::Lerp => {
+                BuiltinFunc::Lerp | BuiltinFunc::Mix => {
                     let (a, b, t) = (vals[0], vals[1], vals[2]);
                     a + (b - a) * t
                 }
@@ -416,7 +603,23 @@ fn eval_node(
                     let (edge, x) = (vals[0], vals[1]);
                     if x < edge { 0.0 } else { 1.0 }
                 }
-                BuiltinFunc::Pow => vals[0].powf(vals[1]),
+                BuiltinFunc::Pow => {
+                    let (base, exp) = (vals[0], vals[1]);
+                    if base < 0.0 && exp.fract() != 0.0 {
+                        0.0
+                    } else {
+                        base.powf(exp)
+                    }
+                }
+                BuiltinFunc::Spring => {
+                    consume_extra_fuel(fuel, 3, max_fuel)?;
+                    eval_spring(vals[0], vals[1], vals[2])
+                }
+                BuiltinFunc::Wiggle => {
+                    consume_extra_fuel(fuel, 3, max_fuel)?;
+                    let t_sec = ensure_finite(ctx.t_sec)?;
+                    eval_wiggle(t_sec, vals[0], vals[1], vals[2])
+                }
                 BuiltinFunc::CubicBezier => {
                     let (t_in, x1, y1, x2, y2) = (vals[0], vals[1], vals[2], vals[3], vals[4]);
                     if !(0.0..=1.0).contains(&x1) || !(0.0..=1.0).contains(&x2) {
@@ -440,6 +643,16 @@ enum Token {
     Minus,
     Star,
     Slash,
+    Percent,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    EqEq,
+    NotEq,
+    AndAnd,
+    OrOr,
+    Bang,
     LParen,
     RParen,
     Comma,
@@ -472,6 +685,67 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ExprError> {
             b'/' => {
                 tokens.push(Token::Slash);
                 i += 1;
+            }
+            b'%' => {
+                tokens.push(Token::Percent);
+                i += 1;
+            }
+            b'<' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token::Le);
+                    i += 2;
+                } else {
+                    tokens.push(Token::Lt);
+                    i += 1;
+                }
+            }
+            b'>' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token::Ge);
+                    i += 2;
+                } else {
+                    tokens.push(Token::Gt);
+                    i += 1;
+                }
+            }
+            b'=' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token::EqEq);
+                    i += 2;
+                } else {
+                    return Err(ExprError::SyntaxError(
+                        "unexpected '='; use '==' for equality".into(),
+                    ));
+                }
+            }
+            b'!' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token::NotEq);
+                    i += 2;
+                } else {
+                    tokens.push(Token::Bang);
+                    i += 1;
+                }
+            }
+            b'&' => {
+                if bytes.get(i + 1) == Some(&b'&') {
+                    tokens.push(Token::AndAnd);
+                    i += 2;
+                } else {
+                    return Err(ExprError::SyntaxError(
+                        "unexpected '&'; use '&&' for logical AND".into(),
+                    ));
+                }
+            }
+            b'|' => {
+                if bytes.get(i + 1) == Some(&b'|') {
+                    tokens.push(Token::OrOr);
+                    i += 2;
+                } else {
+                    return Err(ExprError::SyntaxError(
+                        "unexpected '|'; use '||' for logical OR".into(),
+                    ));
+                }
             }
             b'(' => {
                 tokens.push(Token::LParen);
@@ -596,6 +870,82 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self, depth: usize) -> Result<ExprNode, ExprError> {
+        self.parse_or(depth)
+    }
+
+    fn parse_or(&mut self, depth: usize) -> Result<ExprNode, ExprError> {
+        Self::check_depth(depth)?;
+        let mut lhs = self.parse_and(depth + 1)?;
+        while matches!(self.peek(), Some(Token::OrOr)) {
+            self.pos += 1;
+            let rhs = self.parse_and(depth + 1)?;
+            lhs = self.alloc_node(ExprNode::Logical {
+                op: LogicalOp::Or,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            })?;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_and(&mut self, depth: usize) -> Result<ExprNode, ExprError> {
+        Self::check_depth(depth)?;
+        let mut lhs = self.parse_eq(depth + 1)?;
+        while matches!(self.peek(), Some(Token::AndAnd)) {
+            self.pos += 1;
+            let rhs = self.parse_eq(depth + 1)?;
+            lhs = self.alloc_node(ExprNode::Logical {
+                op: LogicalOp::And,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            })?;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_eq(&mut self, depth: usize) -> Result<ExprNode, ExprError> {
+        Self::check_depth(depth)?;
+        let mut lhs = self.parse_cmp(depth + 1)?;
+        while let Some(tok) = self.peek() {
+            let op = match tok {
+                Token::EqEq => BinaryOp::Eq,
+                Token::NotEq => BinaryOp::Ne,
+                _ => break,
+            };
+            self.pos += 1;
+            let rhs = self.parse_cmp(depth + 1)?;
+            lhs = self.alloc_node(ExprNode::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            })?;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_cmp(&mut self, depth: usize) -> Result<ExprNode, ExprError> {
+        Self::check_depth(depth)?;
+        let mut lhs = self.parse_add(depth + 1)?;
+        while let Some(tok) = self.peek() {
+            let op = match tok {
+                Token::Lt => BinaryOp::Lt,
+                Token::Le => BinaryOp::Le,
+                Token::Gt => BinaryOp::Gt,
+                Token::Ge => BinaryOp::Ge,
+                _ => break,
+            };
+            self.pos += 1;
+            let rhs = self.parse_add(depth + 1)?;
+            lhs = self.alloc_node(ExprNode::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            })?;
+        }
+        Ok(lhs)
+    }
+
+    fn parse_add(&mut self, depth: usize) -> Result<ExprNode, ExprError> {
         Self::check_depth(depth)?;
         let mut lhs = self.parse_term(depth + 1)?;
         while let Some(tok) = self.peek() {
@@ -622,6 +972,7 @@ impl<'a> Parser<'a> {
             let op = match tok {
                 Token::Star => BinaryOp::Mul,
                 Token::Slash => BinaryOp::Div,
+                Token::Percent => BinaryOp::Mod,
                 _ => break,
             };
             self.pos += 1;
@@ -651,6 +1002,14 @@ impl<'a> Parser<'a> {
                 let inner = self.parse_unary(depth + 1)?;
                 self.alloc_node(ExprNode::Unary {
                     op: UnaryOp::Pos,
+                    expr: Box::new(inner),
+                })
+            }
+            Some(Token::Bang) => {
+                self.pos += 1;
+                let inner = self.parse_unary(depth + 1)?;
+                self.alloc_node(ExprNode::Unary {
+                    op: UnaryOp::Not,
                     expr: Box::new(inner),
                 })
             }
@@ -692,6 +1051,25 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.pos += 1; // consume ')'
+
+                    if name == "if" || name == "select" {
+                        if args.len() != 3 {
+                            return Err(ExprError::InvalidArity {
+                                func: name,
+                                expected: 3,
+                                actual: args.len(),
+                            });
+                        }
+                        let mut iter = args.into_iter();
+                        let cond = iter.next().unwrap();
+                        let then_branch = iter.next().unwrap();
+                        let else_branch = iter.next().unwrap();
+                        return self.alloc_node(ExprNode::Cond {
+                            cond: Box::new(cond),
+                            then_branch: Box::new(then_branch),
+                            else_branch: Box::new(else_branch),
+                        });
+                    }
 
                     let func = BuiltinFunc::from_name(&name)
                         .ok_or_else(|| ExprError::UnknownFunction(name.clone()))?;

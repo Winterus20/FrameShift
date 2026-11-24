@@ -1,10 +1,11 @@
 use crate::controller::WorkspaceUiController;
-use frameshift_media::{AlphaMode, Rgba8Frame};
+use frameshift_media::{AlphaMode, AudioBuffer, Rgba8Frame};
 use frameshift_schema::{
-    AssetKind, GraphNodeDef, HwAccelPolicy, NodeKind, PreferenceScope, RenderProfileKind,
-    TemplateSlotKind,
+    AssetKind, AudioClipDef, GraphNodeDef, HwAccelPolicy, NodeKind, PreferenceScope, Project,
+    RenderProfileKind, TemplateSlotKind,
 };
-use frameshift_time::{FLICKS_PER_SECOND, Flicks};
+use frameshift_time::{FLICKS_PER_SECOND, Flicks, ticks_to_audio_samples_nearest};
+use std::collections::HashMap;
 
 const BG_CANVAS: [u8; 4] = [12, 14, 20, 255];
 const BG_PANEL: [u8; 4] = [20, 24, 34, 255];
@@ -271,6 +272,86 @@ impl Canvas {
     }
 }
 
+/// Visual coloring style for real PCM audio waveforms drawn in desktop snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnapshotWaveformStyle {
+    #[default]
+    DualEnvelope,
+    SpectralRgb,
+}
+
+/// Pre-summarized per-column waveform bucket for [`SnapshotAudioClipWaveform`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SnapshotWaveformColumn {
+    pub min: f32,
+    pub max: f32,
+    pub rms: f32,
+    pub band_energy: [f32; 3],
+}
+
+/// Real PCM audio waveform payload associated with a single timeline [`AudioClipDef`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotAudioClipWaveform {
+    pub clip_id: String,
+    pub effective_start: Flicks,
+    pub effective_end: Flicks,
+    /// Optional pre-sampled columns across the clip width (e.g. from `WaveformPyramid`).
+    pub columns: Vec<SnapshotWaveformColumn>,
+    /// Optional decoded or synthetic PCM buffer sampled on-demand when `columns` is empty.
+    pub buffer: Option<AudioBuffer>,
+    /// Optional per-column linear gain envelope (`fade_in`, `fade_out`, `gain_db`).
+    pub gain_envelope: Vec<f32>,
+    pub style: SnapshotWaveformStyle,
+}
+
+impl SnapshotAudioClipWaveform {
+    /// Creates a clip waveform payload from pre-sampled columns.
+    pub fn from_columns(
+        clip_id: impl Into<String>,
+        effective_start: Flicks,
+        effective_end: Flicks,
+        columns: Vec<SnapshotWaveformColumn>,
+    ) -> Self {
+        Self {
+            clip_id: clip_id.into(),
+            effective_start,
+            effective_end,
+            columns,
+            buffer: None,
+            gain_envelope: Vec::new(),
+            style: SnapshotWaveformStyle::DualEnvelope,
+        }
+    }
+
+    /// Creates a clip waveform payload backed directly by an [`AudioBuffer`].
+    pub fn from_audio_buffer(
+        clip_id: impl Into<String>,
+        effective_start: Flicks,
+        effective_end: Flicks,
+        buffer: AudioBuffer,
+    ) -> Self {
+        Self {
+            clip_id: clip_id.into(),
+            effective_start,
+            effective_end,
+            columns: Vec::new(),
+            buffer: Some(buffer),
+            gain_envelope: Vec::new(),
+            style: SnapshotWaveformStyle::DualEnvelope,
+        }
+    }
+}
+
+/// Optional decoded audio context passed to [`render_desktop_ui_snapshot_with_audio`] so the
+/// A1 audio lane renders real PCM waveforms and beat/downbeat markers without running FFmpeg
+/// inside `frameshift-app`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SnapshotAudioContext {
+    pub clip_waveforms: HashMap<String, SnapshotAudioClipWaveform>,
+    pub detected_beats: Vec<Flicks>,
+    pub downbeat_ticks: Vec<Flicks>,
+}
+
 /// Renders a deterministic, dark-mode desktop editor UI snapshot (`1920x1080` default)
 /// displaying the project's media pool, creative decisions & preferences, scaled live
 /// `wgpu` viewport embed, render DAG inspector with `SafeExpr` bindings, multi-track
@@ -281,6 +362,18 @@ pub fn render_desktop_ui_snapshot(
     viewport_frame: &Rgba8Frame,
     width: u32,
     height: u32,
+) -> Rgba8Frame {
+    render_desktop_ui_snapshot_with_audio(controller, viewport_frame, width, height, None)
+}
+
+/// Renders the deterministic desktop editor UI snapshot with an optional [`SnapshotAudioContext`]
+/// for real PCM waveform & beat-grid visualization in the `A1 AUDIO` lane.
+pub fn render_desktop_ui_snapshot_with_audio(
+    controller: &WorkspaceUiController,
+    viewport_frame: &Rgba8Frame,
+    width: u32,
+    height: u32,
+    audio: Option<&SnapshotAudioContext>,
 ) -> Rgba8Frame {
     let w = width.max(640) as i32;
     let h = height.max(360) as i32;
@@ -566,7 +659,9 @@ pub fn render_desktop_ui_snapshot(
     let total_rows = shown_nodes.div_ceil(cols);
     let visible_rows = total_rows.min(max_rows_fit);
 
-    for (local_idx, node) in project.graph.nodes[node_start..node_end].iter().enumerate() {
+    let mut node_boxes: HashMap<&str, (Rect, usize)> = HashMap::with_capacity(shown_nodes);
+    let visible_slice = &project.graph.nodes[node_start..node_end];
+    for (local_idx, node) in visible_slice.iter().enumerate() {
         let row = local_idx / cols;
         if row >= visible_rows {
             break;
@@ -577,6 +672,7 @@ pub fn render_desktop_ui_snapshot(
         let is_selected = controller.selected_node.as_ref() == Some(&node.id);
         let is_output = project.graph.output_node == node.id;
         let row_r = Rect::new(cell_x, cell_y, col_w, box_h);
+        node_boxes.insert(node.id.0.as_str(), (row_r, col));
         canvas.fill_rect(
             row_r,
             if is_selected {
@@ -593,25 +689,43 @@ pub fn render_desktop_ui_snapshot(
             canvas.stroke_rect(row_r, 1, ACCENT_CYAN);
         }
         let out_tag = if is_output { " [OUT]" } else { "" };
+        let has_dp = matches!(
+            &node.kind,
+            NodeKind::Scene3D {
+                depth_plate: Some(_),
+                ..
+            }
+        );
+        let in_count = node.inputs.len() + usize::from(has_dp);
         let line = if two_col {
             truncate_str(
                 &format!("{}:{}{}", node.id.0, node_kind_label(&node.kind), out_tag),
                 max_node_chars,
             )
         } else {
+            let dp_tag = if has_dp { "+dp" } else { "" };
             truncate_str(
                 &format!(
-                    "{} : {}{} (in:{})",
+                    "{} : {}{} (in:{}{})",
                     node.id.0,
                     node_kind_label(&node.kind),
                     out_tag,
-                    node.inputs.len()
+                    in_count,
+                    dp_tag
                 ),
                 max_node_chars,
             )
         };
         canvas.draw_text(row_r.x + 5, row_r.y + 4, &line, small_scale, TEXT_PRIMARY);
     }
+    draw_node_dag_edges(
+        &mut canvas,
+        right_rect,
+        col_w,
+        two_col,
+        visible_slice,
+        &node_boxes,
+    );
     ry += (visible_rows as i32) * row_stride;
 
     ry += 6;
@@ -822,40 +936,63 @@ pub fn render_desktop_ui_snapshot(
         );
     }
 
-    // Draw audio clips + procedural beat waveform bars
+    // Draw audio clips: real PCM waveform when `SnapshotAudioContext` is supplied,
+    // falling back to deterministic procedural bars when media context is absent.
     for ac in &project.timeline.audio_clips {
-        let ax0 = tick_to_x(ac.timeline_start);
-        let ax1 = tick_to_x(ac.timeline_end).max(ax0 + 4);
+        let clip_wf = audio.and_then(|ctx| ctx.clip_waveforms.get(&ac.id));
+        let (eff_start, eff_end) = if let Some(wf) = clip_wf {
+            (wf.effective_start, wf.effective_end)
+        } else {
+            resolve_snapshot_audio_clip_bounds(project, ac)
+        };
+        let ax0 = tick_to_x(eff_start);
+        let ax1 = tick_to_x(eff_end).max(ax0 + 4);
         let ar = Rect::new(ax0, a1_rect.y + 2, ax1 - ax0, a1_rect.h - 4);
         canvas.fill_rect(ar, [14, 58, 48, 255]);
         canvas.stroke_rect(ar, 1, ACCENT_GREEN);
 
-        let mid_y = ar.y + ar.h / 2;
-        let max_half = (ar.h / 2 - 3).max(2);
-        let mut bx = ar.x + 3;
-        let mut step = 0_u32;
-        while bx < ar.right() - 2 {
-            let phase = (step as f64 * 0.45).sin().abs();
-            let beat_boost = if step.is_multiple_of(8) {
-                1.0
+        if let Some(wf) = clip_wf {
+            let wf_rect = Rect::new(ar.x + 1, ar.y + 1, (ar.w - 2).max(1), (ar.h - 2).max(1));
+            let cols = resolve_snapshot_clip_columns(ac, wf, wf_rect.w as usize);
+            if !cols.is_empty() {
+                paint_snapshot_waveform_columns(&mut canvas, wf_rect, &cols, wf.style);
+                let label_w = ((ac.id.chars().count() as i32) * 6 + 8).min((ar.w - 4).max(0));
+                if label_w > 6 {
+                    canvas.fill_rect(Rect::new(ar.x + 3, ar.y + 2, label_w, 11), [12, 16, 24, 195]);
+                }
             } else {
-                0.45 + 0.45 * phase
-            };
-            let bar_h = ((max_half as f64) * beat_boost).round() as i32;
-            canvas.fill_rect(Rect::new(bx, mid_y - bar_h, 2, bar_h * 2 + 1), ACCENT_GREEN);
-            bx += 4;
-            step += 1;
+                draw_procedural_waveform_bars(&mut canvas, ar);
+            }
+        } else {
+            draw_procedural_waveform_bars(&mut canvas, ar);
         }
         canvas.draw_text(ar.x + 6, ar.y + 4, &ac.id, 1, TEXT_PRIMARY);
     }
 
-    // Beat grid markers every 0.5s across A1
-    let half_sec = FLICKS_PER_SECOND / 2;
-    let mut bt = half_sec;
-    while bt < project.timeline.duration_ticks.0 {
-        let bx = tick_to_x(Flicks(bt));
-        canvas.draw_line(bx, a1_rect.y, bx, a1_rect.bottom(), 1, [110, 231, 183, 140]);
-        bt += half_sec;
+    // Beat & downbeat grid markers across A1 (real detected beats when present, 0.5s fallback otherwise)
+    if let Some(ctx) = audio
+        && (!ctx.detected_beats.is_empty() || !ctx.downbeat_ticks.is_empty())
+    {
+        for &bt in &ctx.detected_beats {
+            if bt >= Flicks::ZERO && bt <= project.timeline.duration_ticks {
+                let bx = tick_to_x(bt);
+                canvas.draw_line(bx, a1_rect.y, bx, a1_rect.bottom(), 1, [110, 231, 183, 150]);
+            }
+        }
+        for &dbt in &ctx.downbeat_ticks {
+            if dbt >= Flicks::ZERO && dbt <= project.timeline.duration_ticks {
+                let bx = tick_to_x(dbt);
+                canvas.draw_line(bx, a1_rect.y, bx, a1_rect.bottom(), 2, [56, 189, 248, 210]);
+            }
+        }
+    } else {
+        let half_sec = FLICKS_PER_SECOND / 2;
+        let mut bt = half_sec;
+        while bt < project.timeline.duration_ticks.0 {
+            let bx = tick_to_x(Flicks(bt));
+            canvas.draw_line(bx, a1_rect.y, bx, a1_rect.bottom(), 1, [110, 231, 183, 140]);
+            bt += half_sec;
+        }
     }
 
     // Draw inlaid SpeedCurve plot for selected clip (or first clip)
@@ -1033,6 +1170,11 @@ pub fn node_kind_label(kind: &NodeKind) -> &'static str {
         NodeKind::BlurMoCurves { .. } => "BlurMoCurves",
         NodeKind::Null3D { .. } => "Null3D",
         NodeKind::DepthMatte { .. } => "DepthMatte",
+        NodeKind::OpticalFlowBlur { .. } => "OpticalFlowBlur",
+        NodeKind::Anime4K { .. } => "Anime4K",
+        NodeKind::DisplacementMap { .. } => "DisplacementMap",
+        NodeKind::FrameEcho { .. } => "FrameEcho",
+        NodeKind::ShapeMask { .. } => "ShapeMask",
     }
 }
 
@@ -1044,6 +1186,7 @@ pub fn node_kind_accent(kind: &NodeKind) -> [u8; 4] {
         | NodeKind::Solid { .. }
         | NodeKind::VectorText { .. }
         | NodeKind::VectorPathHud { .. }
+        | NodeKind::ShapeMask { .. }
         | NodeKind::PrecompInput { .. } => ACCENT_GREEN,
         NodeKind::Transform2D { .. }
         | NodeKind::CornerPin { .. }
@@ -1072,7 +1215,11 @@ pub fn node_kind_accent(kind: &NodeKind) -> [u8; 4] {
         | NodeKind::DeepGlow { .. }
         | NodeKind::AnimeSharpen { .. }
         | NodeKind::FilmOptics { .. }
-        | NodeKind::BlurMoCurves { .. } => ACCENT_CYAN,
+        | NodeKind::BlurMoCurves { .. }
+        | NodeKind::OpticalFlowBlur { .. }
+        | NodeKind::Anime4K { .. }
+        | NodeKind::DisplacementMap { .. }
+        | NodeKind::FrameEcho { .. } => ACCENT_CYAN,
         NodeKind::CustomWgsl { .. } => ACCENT_RED,
     }
 }
@@ -1302,9 +1449,17 @@ fn describe_node_params(node: &GraphNodeDef) -> String {
         } => {
             format!("{shape_kind:?} size={size:.2} depth={extrude_depth:.2}")
         }
-        NodeKind::Scene3D { camera, .. } => {
+        NodeKind::Scene3D {
+            camera,
+            depth_plate,
+            ..
+        } => {
+            let dp_str = match depth_plate {
+                Some(dp) => format!(" dp={}({:.2}..{:.2})", dp.node_id.0, dp.near_z, dp.far_z),
+                None => String::new(),
+            };
             format!(
-                "mode={:?} pos=[{:.2},{:.2},{:.2}] fov={:.0} dof={:.2}",
+                "mode={:?} pos=[{:.2},{:.2},{:.2}] fov={:.0} dof={:.2}{dp_str}",
                 camera.mode,
                 camera.pos[0],
                 camera.pos[1],
@@ -1435,6 +1590,52 @@ fn describe_node_params(node: &GraphNodeDef) -> String {
             invert,
         } => {
             format!("near={near_depth:.2} far={far_depth:.2} feather={feather:.2} inv={invert}")
+        }
+        NodeKind::OpticalFlowBlur {
+            shutter_amount,
+            samples,
+            max_blur_px,
+            sensitivity,
+            visualize_flow,
+            ..
+        } => {
+            format!(
+                "shutter={shutter_amount:.2} n={samples} max={max_blur_px:.0}px sens={sensitivity:.2} vis={visualize_flow}"
+            )
+        }
+        NodeKind::Anime4K {
+            preset,
+            strength,
+            clamp_highlights,
+        } => {
+            format!("preset={preset:?} str={strength:.2} clamp={clamp_highlights}")
+        }
+        NodeKind::DisplacementMap {
+            channel_mode,
+            scale_x,
+            scale_y,
+            opacity,
+            ..
+        } => {
+            format!("mode={channel_mode:?} s=[{scale_x:.2},{scale_y:.2}] op={opacity:.2}")
+        }
+        NodeKind::FrameEcho {
+            echo_count,
+            starting_intensity,
+            decay,
+            operator,
+            ..
+        } => {
+            format!("n={echo_count} int={starting_intensity:.2} decay={decay:.2} op={operator:?}")
+        }
+        NodeKind::ShapeMask {
+            vertices,
+            feather_px,
+            invert,
+            opacity,
+            ..
+        } => {
+            format!("pts={} feather={feather_px:.1} inv={invert} op={opacity:.2}", vertices.len())
         }
     }
 }
@@ -1613,6 +1814,391 @@ fn glyph_5x7(ch: char) -> [u8; 7] {
     }
 }
 
+fn node_upstream_edges(node: &GraphNodeDef) -> Vec<(&str, bool)> {
+    let mut edges: Vec<(&str, bool)> = node
+        .inputs
+        .iter()
+        .map(|id| (id.0.as_str(), false))
+        .collect();
+    if let NodeKind::Scene3D {
+        depth_plate: Some(dp),
+        ..
+    } = &node.kind
+    {
+        edges.push((dp.node_id.0.as_str(), true));
+    }
+    edges
+}
+
+fn draw_node_dag_edges(
+    canvas: &mut Canvas,
+    right_rect: Rect,
+    col_w: i32,
+    two_col: bool,
+    visible_nodes: &[GraphNodeDef],
+    node_boxes: &HashMap<&str, (Rect, usize)>,
+) {
+    let mut std_lane = 0_i32;
+    let mut dp_lane = 0_i32;
+    for node in visible_nodes {
+        let Some(&(dst_rect, dst_col)) = node_boxes.get(node.id.0.as_str()) else {
+            continue;
+        };
+        let dst_y = dst_rect.y + dst_rect.h / 2;
+
+        for (up_id, is_dp) in node_upstream_edges(node) {
+            let Some(&(src_rect, src_col)) = node_boxes.get(up_id) else {
+                continue;
+            };
+            let src_y = src_rect.y + src_rect.h / 2;
+            let color = if is_dp {
+                ACCENT_YELLOW
+            } else {
+                [56, 189, 248, 125]
+            };
+
+            if !two_col {
+                if is_dp {
+                    let gutter_x = right_rect.right() - 4 - (dp_lane % 2) * 2;
+                    dp_lane += 1;
+                    canvas.draw_line(src_rect.right(), src_y, gutter_x, src_y, 1, color);
+                    canvas.draw_dashed_vline(gutter_x, src_y, dst_y, color);
+                    canvas.draw_line(gutter_x, dst_y, dst_rect.right(), dst_y, 1, color);
+                    canvas.fill_rect(Rect::new(dst_rect.right() - 1, dst_y - 1, 3, 3), color);
+                } else {
+                    let gutter_x = right_rect.x + 3 + (std_lane % 3) * 2;
+                    std_lane += 1;
+                    canvas.draw_line(src_rect.x, src_y, gutter_x, src_y, 1, color);
+                    canvas.draw_line(gutter_x, src_y, gutter_x, dst_y, 1, color);
+                    canvas.draw_line(gutter_x, dst_y, dst_rect.x, dst_y, 1, color);
+                }
+            } else if src_col == dst_col {
+                let (gutter_x, sx, dx) = if src_col == 0 {
+                    let gx = right_rect.x + 3 + (std_lane % 3) * 2;
+                    std_lane += 1;
+                    (gx, src_rect.x, dst_rect.x)
+                } else {
+                    let gx = right_rect.right() - 4 - (dp_lane % 3) * 2;
+                    dp_lane += 1;
+                    (gx, src_rect.right(), dst_rect.right())
+                };
+                canvas.draw_line(sx, src_y, gutter_x, src_y, 1, color);
+                if is_dp {
+                    canvas.draw_dashed_vline(gutter_x, src_y, dst_y, color);
+                    canvas.fill_rect(Rect::new(dx - 1, dst_y - 1, 3, 3), color);
+                } else {
+                    canvas.draw_line(gutter_x, src_y, gutter_x, dst_y, 1, color);
+                }
+                canvas.draw_line(gutter_x, dst_y, dx, dst_y, 1, color);
+            } else {
+                // Cross-column edge routed strictly inside the 6px inter-column gap.
+                let gap_x = right_rect.x + 10 + col_w + 1 + ((std_lane + dp_lane) % 4);
+                if is_dp {
+                    dp_lane += 1;
+                } else {
+                    std_lane += 1;
+                }
+                let sx = if src_col == 0 {
+                    src_rect.right()
+                } else {
+                    src_rect.x
+                };
+                let dx = if dst_col == 0 {
+                    dst_rect.right()
+                } else {
+                    dst_rect.x
+                };
+                canvas.draw_line(sx, src_y, gap_x, src_y, 1, color);
+                if is_dp {
+                    canvas.draw_dashed_vline(gap_x, src_y, dst_y, color);
+                    canvas.fill_rect(Rect::new(dx - 1, dst_y - 1, 3, 3), color);
+                } else {
+                    canvas.draw_line(gap_x, src_y, gap_x, dst_y, 1, color);
+                }
+                canvas.draw_line(gap_x, dst_y, dx, dst_y, 1, color);
+            }
+        }
+    }
+}
+
+fn resolve_snapshot_audio_clip_bounds(project: &Project, ac: &AudioClipDef) -> (Flicks, Flicks) {
+    let duration = ac.timeline_end - ac.timeline_start;
+    if let Some(ref event_id) = ac.anchor_event_id
+        && let Some(ev) = project.event(event_id)
+    {
+        let apex = ac.apex_offset_ticks.unwrap_or(Flicks::ZERO);
+        let start = Flicks(ev.target_output_tick.0.saturating_sub(apex.0));
+        return (start, Flicks(start.0.saturating_add(duration.0)));
+    }
+    (ac.timeline_start, ac.timeline_end)
+}
+
+fn draw_procedural_waveform_bars(canvas: &mut Canvas, ar: Rect) {
+    let mid_y = ar.y + ar.h / 2;
+    let max_half = (ar.h / 2 - 3).max(2);
+    let mut bx = ar.x + 3;
+    let mut step = 0_u32;
+    while bx < ar.right() - 2 {
+        let phase = (step as f64 * 0.45).sin().abs();
+        let beat_boost = if step.is_multiple_of(8) {
+            1.0
+        } else {
+            0.45 + 0.45 * phase
+        };
+        let bar_h = ((max_half as f64) * beat_boost).round() as i32;
+        canvas.fill_rect(Rect::new(bx, mid_y - bar_h, 2, bar_h * 2 + 1), ACCENT_GREEN);
+        bx += 4;
+        step += 1;
+    }
+}
+
+fn resolve_snapshot_clip_columns(
+    ac: &AudioClipDef,
+    wf: &SnapshotAudioClipWaveform,
+    target_cols: usize,
+) -> Vec<SnapshotWaveformColumn> {
+    if target_cols == 0 {
+        return Vec::new();
+    }
+    let mut cols = if !wf.columns.is_empty() {
+        resample_snapshot_columns(&wf.columns, target_cols)
+    } else if let Some(ref buf) = wf.buffer {
+        sample_audio_buffer_columns(buf, ac, wf, target_cols)
+    } else {
+        return Vec::new();
+    };
+
+    // Apply explicit gain envelope or clip gain/fade envelope when sampling raw buffer.
+    if !wf.gain_envelope.is_empty() {
+        for (i, col) in cols.iter_mut().enumerate() {
+            let g_idx = (i * wf.gain_envelope.len()) / target_cols;
+            let g = wf.gain_envelope[g_idx.min(wf.gain_envelope.len() - 1)].max(0.0);
+            col.min = (col.min * g).clamp(-1.0, 1.0);
+            col.max = (col.max * g).clamp(-1.0, 1.0);
+            col.rms = (col.rms * g).clamp(0.0, 1.0);
+        }
+    } else if wf.columns.is_empty() {
+        let base_gain = if ac.gain_db.is_finite() {
+            10.0_f32.powf(ac.gain_db / 20.0).clamp(0.0, 4.0)
+        } else {
+            1.0
+        };
+        let dur_ticks = (wf.effective_end - wf.effective_start).0.max(1) as f64;
+        for (i, col) in cols.iter_mut().enumerate() {
+            let elapsed = ((i as f64 + 0.5) / target_cols as f64) * dur_ticks;
+            let remaining = dur_ticks - elapsed;
+            let mut g = base_gain;
+            if let Some(fi) = ac.fade_in {
+                g *= fi.gain_at_elapsed(elapsed) as f32;
+            }
+            if let Some(fo) = ac.fade_out {
+                g *= fo.gain_at_elapsed(remaining) as f32;
+            }
+            col.min = (col.min * g).clamp(-1.0, 1.0);
+            col.max = (col.max * g).clamp(-1.0, 1.0);
+            col.rms = (col.rms * g).clamp(0.0, 1.0);
+        }
+    }
+    cols
+}
+
+fn merge_snapshot_columns(slice: &[SnapshotWaveformColumn]) -> SnapshotWaveformColumn {
+    if slice.is_empty() {
+        return SnapshotWaveformColumn::default();
+    }
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    let mut rms_sq = 0.0f64;
+    let mut b_sq = [0.0f64; 3];
+    for c in slice {
+        min_v = min_v.min(c.min);
+        max_v = max_v.max(c.max);
+        rms_sq += (c.rms as f64).powi(2);
+        for (k, acc) in b_sq.iter_mut().enumerate() {
+            *acc += (c.band_energy[k] as f64).powi(2);
+        }
+    }
+    let n = slice.len() as f64;
+    SnapshotWaveformColumn {
+        min: if min_v.is_finite() { min_v } else { 0.0 },
+        max: if max_v.is_finite() { max_v } else { 0.0 },
+        rms: (rms_sq / n).sqrt() as f32,
+        band_energy: [
+            (b_sq[0] / n).sqrt() as f32,
+            (b_sq[1] / n).sqrt() as f32,
+            (b_sq[2] / n).sqrt() as f32,
+        ],
+    }
+}
+
+fn resample_snapshot_columns(
+    src: &[SnapshotWaveformColumn],
+    target_cols: usize,
+) -> Vec<SnapshotWaveformColumn> {
+    if src.len() == target_cols {
+        return src.to_vec();
+    }
+    let mut out = Vec::with_capacity(target_cols);
+    for i in 0..target_cols {
+        let c0 = (i * src.len()) / target_cols;
+        let c1 = (((i + 1) * src.len()) / target_cols)
+            .max(c0 + 1)
+            .min(src.len());
+        out.push(merge_snapshot_columns(&src[c0..c1]));
+    }
+    out
+}
+
+fn sample_audio_buffer_columns(
+    buf: &AudioBuffer,
+    ac: &AudioClipDef,
+    wf: &SnapshotAudioClipWaveform,
+    target_cols: usize,
+) -> Vec<SnapshotWaveformColumn> {
+    let total_frames = buf.frame_count();
+    if total_frames == 0 || target_cols == 0 {
+        return Vec::new();
+    }
+    let ch_count = buf.channels as usize;
+    let clip_dur = Flicks((wf.effective_end - wf.effective_start).0.max(1));
+    let start_tick = Flicks(ac.source_start.0.max(0));
+    let end_tick = Flicks(start_tick.0.saturating_add(clip_dur.0));
+    let sf = ticks_to_audio_samples_nearest(start_tick, buf.sample_rate)
+        .unwrap_or(0)
+        .max(0) as usize;
+    let ef = ticks_to_audio_samples_nearest(end_tick, buf.sample_rate)
+        .unwrap_or(total_frames as i64)
+        .max(0) as usize;
+    let sf = sf.min(total_frames.saturating_sub(1));
+    let ef = ef.clamp(sf + 1, total_frames);
+    let span = ef - sf;
+
+    let mut out = Vec::with_capacity(target_cols);
+    for i in 0..target_cols {
+        let f0 = sf + (i * span) / target_cols;
+        let f1 = (sf + ((i + 1) * span) / target_cols).max(f0 + 1).min(ef);
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut sum_sq = 0.0f64;
+        for f in f0..f1 {
+            let base = f * ch_count;
+            let mut mono = 0.0f32;
+            for ch in 0..ch_count {
+                let s = buf.samples[base + ch];
+                if s.is_finite() {
+                    mono += s;
+                }
+            }
+            mono /= ch_count as f32;
+            min_v = min_v.min(mono);
+            max_v = max_v.max(mono);
+            sum_sq += (mono as f64) * (mono as f64);
+        }
+        let n = (f1 - f0).max(1) as f64;
+        out.push(SnapshotWaveformColumn {
+            min: if min_v.is_finite() { min_v } else { 0.0 },
+            max: if max_v.is_finite() { max_v } else { 0.0 },
+            rms: (sum_sq / n).sqrt() as f32,
+            band_energy: [0.0; 3],
+        });
+    }
+    out
+}
+
+fn paint_snapshot_waveform_columns(
+    canvas: &mut Canvas,
+    rect: Rect,
+    columns: &[SnapshotWaveformColumn],
+    style: SnapshotWaveformStyle,
+) {
+    let mid_y = rect.y as f32 + (rect.h as f32) * 0.5;
+    let half_h = ((rect.h as f32) * 0.5 - 2.0).max(1.0);
+    let mut prev_range: Option<(f32, f32)> = None;
+
+    for (idx, col) in columns.iter().enumerate() {
+        let px = rect.x + idx as i32;
+        if px >= rect.right() {
+            break;
+        }
+        let s_min = col.min.clamp(-1.0, 1.0);
+        let s_max = col.max.clamp(-1.0, 1.0);
+        let s_rms = col.rms.abs().clamp(0.0, 1.0);
+
+        let (peak_rgba, rms_rgba) = match style {
+            SnapshotWaveformStyle::DualEnvelope => ([16, 185, 129, 130], [110, 231, 183, 235]),
+            SnapshotWaveformStyle::SpectralRgb => spectral_snapshot_colors(col.band_energy),
+        };
+
+        let mut y_top = mid_y - s_max * half_h;
+        let mut y_bot = mid_y - s_min * half_h;
+        if y_top > y_bot {
+            std::mem::swap(&mut y_top, &mut y_bot);
+        }
+        if y_bot - y_top < 1.0 {
+            let c = 0.5 * (y_top + y_bot);
+            y_top = c - 0.5;
+            y_bot = c + 0.5;
+        }
+        if let Some((pt, pb)) = prev_range {
+            if y_top > pb {
+                y_top = pb;
+            } else if y_bot < pt {
+                y_bot = pt;
+            }
+        }
+        prev_range = Some((y_top, y_bot));
+
+        y_top = y_top.clamp(rect.y as f32, rect.bottom() as f32);
+        y_bot = y_bot.clamp(rect.y as f32, rect.bottom() as f32);
+        paint_aa_span(canvas, px, rect, y_top, y_bot, peak_rgba);
+
+        if s_rms > 1e-5 {
+            let y_rt = (mid_y - s_rms * half_h).max(y_top).clamp(rect.y as f32, rect.bottom() as f32);
+            let y_rb = (mid_y + s_rms * half_h).min(y_bot).clamp(rect.y as f32, rect.bottom() as f32);
+            if y_rb > y_rt {
+                paint_aa_span(canvas, px, rect, y_rt, y_rb, rms_rgba);
+            }
+        }
+    }
+}
+
+fn paint_aa_span(canvas: &mut Canvas, px: i32, rect: Rect, y_top: f32, y_bot: f32, rgba: [u8; 4]) {
+    let py0 = (y_top.floor() as i32).max(rect.y);
+    let py1 = (y_bot.ceil() as i32).min(rect.bottom() - 1);
+    for py in py0..=py1 {
+        let cov = (y_bot.min(py as f32 + 1.0) - y_top.max(py as f32)).clamp(0.0, 1.0);
+        if cov > 0.001 {
+            let a = ((rgba[3] as f32) * cov).round().clamp(0.0, 255.0) as u8;
+            if a > 0 {
+                canvas.blend_pixel(px, py, [rgba[0], rgba[1], rgba[2], a]);
+            }
+        }
+    }
+}
+
+fn spectral_snapshot_colors(band_energy: [f32; 3]) -> ([u8; 4], [u8; 4]) {
+    let max_e = band_energy[0].max(band_energy[1]).max(band_energy[2]);
+    if max_e <= 1e-7 {
+        return ([16, 185, 129, 130], [110, 231, 183, 235]);
+    }
+    let w_lo = (band_energy[0].max(0.0) / max_e).clamp(0.0, 1.0).powf(0.65);
+    let w_mid = (band_energy[1].max(0.0) / max_e).clamp(0.0, 1.0).powf(0.65);
+    let w_hi = (band_energy[2].max(0.0) / max_e).clamp(0.0, 1.0).powf(0.65);
+    let sum = (w_lo + w_mid + w_hi).max(1e-6);
+    let r = ((244.0 * w_lo + 34.0 * w_mid + 56.0 * w_hi) / sum).clamp(0.0, 255.0);
+    let g = ((63.0 * w_lo + 197.0 * w_mid + 189.0 * w_hi) / sum).clamp(0.0, 255.0);
+    let b = ((94.0 * w_lo + 94.0 * w_mid + 248.0 * w_hi) / sum).clamp(0.0, 255.0);
+    (
+        [r.round() as u8, g.round() as u8, b.round() as u8, 120],
+        [
+            (r + (255.0 - r) * 0.25).round() as u8,
+            (g + (255.0 - g) * 0.25).round() as u8,
+            (b + (255.0 - b) * 0.25).round() as u8,
+            235,
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1663,6 +2249,7 @@ mod tests {
                 source_anchor_tick: None,
                 target_output_tick: Flicks((1 + idx as i64) * (FLICKS_PER_SECOND / 2)),
                 origin: EventOrigin::Detected,
+                timing: frameshift_schema::EventTimingConstraint::Absolute,
             });
         }
 
@@ -1804,5 +2391,109 @@ mod tests {
         let snap = render_desktop_ui_snapshot(&ctrl, &vp, 1280, 720);
         assert_eq!(snap.width, 1280);
         assert_eq!(snap.height, 720);
+    }
+
+    #[test]
+    fn snapshot_with_audio_renders_real_pcm_waveform_and_scene3d_depth_plate_edge() {
+        use frameshift_media::SyntheticMediaGenerator;
+        use frameshift_schema::{Camera3DDef, SceneDepthPlateDef};
+
+        let mut project = Project::golden_scene_preset();
+        let depth_src = GraphNodeDef {
+            id: NodeId("depth_src".into()),
+            kind: NodeKind::Solid {
+                color_rgba: [0.5, 0.5, 0.5, 1.0],
+                color_space: frameshift_schema::ColorSpace::LinearRec709,
+            },
+            inputs: vec![],
+            enabled: true,
+        };
+        let scene_node = GraphNodeDef {
+            id: NodeId("scene3d_dp".into()),
+            kind: NodeKind::Scene3D {
+                camera: Camera3DDef::default(),
+                background_rgba: [0.0; 4],
+                depth_plate: Some(SceneDepthPlateDef {
+                    node_id: NodeId("depth_src".into()),
+                    near_z: 0.5,
+                    far_z: 6.0,
+                    invert: false,
+                    ..SceneDepthPlateDef::default()
+                }),
+            },
+            inputs: vec![],
+            enabled: true,
+        };
+        let out_node = GraphNodeDef {
+            id: NodeId("final_out".into()),
+            kind: NodeKind::ColorBasic {
+                exposure: 0.0,
+                contrast: 1.0,
+                saturation: 1.0,
+                flash_amount: 0.0,
+            },
+            inputs: vec![NodeId("scene3d_dp".into())],
+            enabled: true,
+        };
+        project.graph.nodes = vec![depth_src, scene_node, out_node];
+        project.graph.output_node = NodeId("final_out".into());
+        project.param_bindings.clear();
+        for c in &mut project.timeline.clips {
+            c.event_animations.clear();
+        }
+
+        let mut ctrl = WorkspaceUiController::from_project(project).unwrap();
+        ctrl.select_node(Some(NodeId("scene3d_dp".into()))).unwrap();
+
+        let vp = Rgba8Frame::filled(160, 90, Flicks::ZERO, [16, 24, 48, 255], AlphaMode::Straight)
+            .unwrap();
+        let snap_fallback = render_desktop_ui_snapshot(&ctrl, &vp, 1280, 720);
+
+        let (beat_buf, beat_ticks) = SyntheticMediaGenerator::generate_beat_audio(
+            ctrl.project().timeline.duration_ticks,
+            120,
+            48_000,
+        );
+        let mut ctx = SnapshotAudioContext {
+            detected_beats: beat_ticks[1..].to_vec(),
+            downbeat_ticks: vec![beat_ticks[0]],
+            ..Default::default()
+        };
+        let bgm_id = ctrl.project().timeline.audio_clips[0].id.clone();
+        let bgm_start = ctrl.project().timeline.audio_clips[0].timeline_start;
+        let bgm_end = ctrl.project().timeline.audio_clips[0].timeline_end;
+        ctx.clip_waveforms.insert(
+            bgm_id.clone(),
+            SnapshotAudioClipWaveform::from_audio_buffer(bgm_id, bgm_start, bgm_end, beat_buf),
+        );
+
+        let snap_audio_1 = render_desktop_ui_snapshot_with_audio(&ctrl, &vp, 1280, 720, Some(&ctx));
+        let snap_audio_2 = render_desktop_ui_snapshot_with_audio(&ctrl, &vp, 1280, 720, Some(&ctx));
+        assert_eq!(snap_audio_1.fnv1a_hash64(), snap_audio_2.fnv1a_hash64());
+        assert_ne!(
+            snap_fallback.fnv1a_hash64(),
+            snap_audio_1.fnv1a_hash64(),
+            "real PCM audio context must change A1 waveform rendering vs procedural fallback"
+        );
+
+        // Verify Scene3D depth_plate yellow connector edge was rendered in the right panel gutter.
+        let mut yellow_edge_px = 0usize;
+        for y in 75..160 {
+            for x in 1255..1272 {
+                if snap_audio_1.get_pixel(x, y) == Some(ACCENT_YELLOW) {
+                    yellow_edge_px += 1;
+                }
+            }
+        }
+        assert!(
+            yellow_edge_px >= 6,
+            "expected Scene3D.depth_plate.node_id edge drawn in right gutter, got {yellow_edge_px} px"
+        );
+        let scene_ref = ctrl
+            .project()
+            .graph
+            .node(&NodeId("scene3d_dp".into()))
+            .unwrap();
+        assert!(describe_node_params(scene_ref).contains("dp=depth_src"));
     }
 }

@@ -196,7 +196,8 @@ fn scene3d_shared_depth_occlusion_and_lookat_camera() {
                             ..Default::default()
                         },
                         background_rgba: [0.0, 0.0, 0.0, 0.0],
-                    },
+ depth_plate: None,
+},
                     inputs,
                     enabled: true,
                 },
@@ -312,7 +313,8 @@ fn scene3d_z_buffer_bokeh_dof_blurs_out_of_focus_object() {
                             ..Default::default()
                         },
                         background_rgba: [0.0, 0.0, 0.0, 0.0],
-                    },
+ depth_plate: None,
+},
                     inputs: vec![
                         NodeId::from("near_star"),
                         NodeId::from("focus_diamond"),
@@ -629,7 +631,8 @@ fn scene3d_safe_expr_easings_drive_camera_and_children() {
                 ..Default::default()
             },
             background_rgba: [0.0, 0.0, 0.0, 0.0],
-        },
+ depth_plate: None,
+},
         inputs: vec![NodeId::from("hero_heart"), NodeId::from("bundle")],
         enabled: true,
     };

@@ -1466,3 +1466,106 @@ fn load_image_frame_with_fit_png_fast_path_and_ffmpeg_fallbacks() {
         Err(MediaError::FfmpegFailed { .. })
     ));
 }
+
+#[test]
+fn p3_nv12_decode_probe_colorimetry_contain_rect_and_rgba_fallback() {
+    use frameshift_media::{
+        ChromaLocation, DecodedVideoFrame, DEFAULT_CACHE_MAX_BYTES, YuvColorInfo,
+        YuvColorMatrix, YuvColorRange, compute_contain_layout,
+    };
+
+    let mp4_path = std::env::temp_dir().join(format!(
+        "frameshift_p3_nv12_decode_{}.mp4",
+        std::process::id()
+    ));
+    let _guard = TempPathGuard(mp4_path.clone());
+
+    let probe = encode_synthetic_clip_mp4(&mp4_path, 8, 96, 48);
+    assert_eq!(probe.width, 96);
+    assert_eq!(probe.height, 48);
+    assert_eq!(probe.color_space.as_deref(), Some("bt709"));
+    assert_eq!(probe.color_range.as_deref(), Some("tv"));
+    assert_eq!(probe.chroma_location.as_deref(), Some("left"));
+
+    let color_info = probe.yuv_color_info();
+    assert_eq!(color_info.matrix, YuvColorMatrix::Bt709);
+    assert_eq!(color_info.range, YuvColorRange::Limited);
+    assert_eq!(color_info.chroma_location, ChromaLocation::Left);
+
+    // Untagged SD defaults to Bt601 + Limited + Left; HD defaults to Bt709.
+    let sd_default = YuvColorInfo::from_probe_tags(640, 480, None, None, None, None);
+    assert_eq!(sd_default.matrix, YuvColorMatrix::Bt601);
+    let hd_default = YuvColorInfo::from_probe_tags(1280, 720, None, None, None, None);
+    assert_eq!(hd_default.matrix, YuvColorMatrix::Bt709);
+
+    // SourceFit::Contain layout for 96x48 inside 96x96 -> centered vertically [0, 0.25, 1, 0.75]
+    let (inner_w, inner_h, rect) = compute_contain_layout(96, 48, 96, 96);
+    assert_eq!((inner_w, inner_h), (96, 48));
+    assert!((rect[0] - 0.0).abs() < 1e-6);
+    assert!((rect[1] - 0.25).abs() < 1e-6);
+    assert!((rect[2] - 1.0).abs() < 1e-6);
+    assert!((rect[3] - 0.75).abs() < 1e-6);
+
+    let mut pool = DecoderPool::default();
+
+    // Sequential NV12 Stretch decode
+    for idx in 0..4 {
+        let decoded = pool
+            .decode_video_frame_decoded(&mp4_path, &probe, idx, 96, 48, SourceFit::Stretch)
+            .unwrap();
+        let DecodedVideoFrame::Nv12(nv12) = decoded else {
+            panic!("expected Nv12 frame for even dimensions without alpha");
+        };
+        assert_eq!(nv12.width, 96);
+        assert_eq!(nv12.height, 48);
+        assert_eq!(nv12.y_plane.len(), 96 * 48);
+        assert_eq!(nv12.uv_plane.len(), 96 * 48 / 2);
+        assert_eq!(nv12.content_uv_rect, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(nv12.byte_len(), 96 * 48 * 3 / 2);
+        let rgba = nv12.to_rgba8_approx().unwrap();
+        assert_eq!(rgba.width, 96);
+        assert_eq!(rgba.height, 48);
+    }
+
+    // Contain NV12 decode preserves inner size + GPU content_uv_rect
+    let contain_decoded = pool
+        .decode_video_frame_decoded(&mp4_path, &probe, 0, 96, 96, SourceFit::Contain)
+        .unwrap();
+    let DecodedVideoFrame::Nv12(contain_nv12) = contain_decoded else {
+        panic!("expected Nv12 frame for Contain");
+    };
+    assert_eq!((contain_nv12.width, contain_nv12.height), (96, 48));
+    assert!((contain_nv12.content_uv_rect[1] - 0.25).abs() < 1e-6);
+    assert!((contain_nv12.content_uv_rect[3] - 0.75).abs() < 1e-6);
+
+    // Odd target dimension automatically falls back to Rgba8
+    let odd_decoded = pool
+        .decode_video_frame_decoded(&mp4_path, &probe, 0, 95, 48, SourceFit::Stretch)
+        .unwrap();
+    assert!(matches!(odd_decoded, DecodedVideoFrame::Rgba8(ref f) if f.width == 95 && f.height == 48));
+
+    // Alpha source pixel format automatically falls back to Rgba8
+    let mut alpha_probe = probe.clone();
+    alpha_probe.pixel_format = Some("yuva420p".into());
+    let alpha_decoded = pool
+        .decode_video_frame_decoded(&mp4_path, &alpha_probe, 0, 96, 48, SourceFit::Stretch)
+        .unwrap();
+    assert!(matches!(alpha_decoded, DecodedVideoFrame::Rgba8(_)));
+
+    // LruFrameCache 256 MiB default budget & NV12 caching
+    let default_cache = LruFrameCache::new(32);
+    assert_eq!(default_cache.max_bytes(), Some(DEFAULT_CACHE_MAX_BYTES));
+    assert_eq!(DEFAULT_CACHE_MAX_BYTES, 256 * 1024 * 1024);
+
+    let nv12_bytes = contain_nv12.byte_len();
+    let mut byte_cache = LruFrameCache::with_max_bytes(16, nv12_bytes * 2);
+    byte_cache.insert_nv12("clip", 0, contain_nv12.clone());
+    byte_cache.insert_nv12("clip", 1, contain_nv12.clone());
+    assert_eq!(byte_cache.len(), 2);
+    assert_eq!(byte_cache.telemetry().current_bytes, nv12_bytes * 2);
+    byte_cache.insert_nv12("clip", 2, contain_nv12);
+    assert_eq!(byte_cache.len(), 2);
+    assert!(byte_cache.get_decoded("clip", 0).is_none());
+    assert!(byte_cache.get_decoded("clip", 1).is_some());
+    assert!(byte_cache.get_decoded("clip", 2).is_some());
+}

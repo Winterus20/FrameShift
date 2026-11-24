@@ -551,7 +551,7 @@ impl AudioBuffer {
         Self::new(self.sample_rate, self.channels, out)
     }
 
-    fn to_mono_mixdown(&self) -> Vec<f32> {
+    pub(crate) fn to_mono_mixdown(&self) -> Vec<f32> {
         let frames = self.frame_count();
         let ch_count = self.channels as usize;
         let inv_ch = 1.0 / (ch_count as f32);
@@ -1190,7 +1190,7 @@ fn wsola_window_len(sample_rate: u32, in_frames: usize) -> usize {
     .min(in_frames.max(4))
 }
 
-fn make_hann_window(len: usize) -> Vec<f32> {
+pub(crate) fn make_hann_window(len: usize) -> Vec<f32> {
     let mut w = Vec::with_capacity(len);
     let denom = len as f64;
     for i in 0..len {

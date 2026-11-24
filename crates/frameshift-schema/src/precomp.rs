@@ -94,7 +94,16 @@ pub fn precompose(
         if selected.contains(&outside.id) {
             continue;
         }
-        for input in &outside.inputs {
+        let depth_plate_id = if let NodeKind::Scene3D {
+            depth_plate: Some(dp),
+            ..
+        } = &outside.kind
+        {
+            Some(&dp.node_id)
+        } else {
+            None
+        };
+        for input in outside.inputs.iter().chain(depth_plate_id) {
             if selected.contains(input) {
                 if !matches!(outside.kind, NodeKind::Transform2D { .. }) {
                     return Err(fail(format!(
@@ -179,6 +188,14 @@ pub fn precompose(
                 *input = precomp_node_id.clone();
             }
         }
+        if let NodeKind::Scene3D {
+            depth_plate: Some(dp),
+            ..
+        } = &mut node.kind
+            && selected.contains(&dp.node_id)
+        {
+            dp.node_id = precomp_node_id.clone();
+        }
     }
     if selected.contains(&candidate.output_node) {
         candidate.output_node = precomp_node_id;
@@ -245,6 +262,14 @@ pub fn unprecompose(
                 *input = parent.clone();
             }
         }
+        if let NodeKind::Scene3D {
+            depth_plate: Some(dp),
+            ..
+        } = &mut node.kind
+            && let Some(parent) = input_replacements.get(&dp.node_id)
+        {
+            dp.node_id = parent.clone();
+        }
     }
     expanded_nodes.retain(|node| !matches!(node.kind, NodeKind::PrecompInput { .. }));
 
@@ -275,6 +300,14 @@ pub fn unprecompose(
             if input == precomp_node_id {
                 *input = expanded_output.clone();
             }
+        }
+        if let NodeKind::Scene3D {
+            depth_plate: Some(dp),
+            ..
+        } = &mut node.kind
+            && &dp.node_id == precomp_node_id
+        {
+            dp.node_id = expanded_output.clone();
         }
     }
     if candidate.output_node == *precomp_node_id {

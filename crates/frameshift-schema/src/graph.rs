@@ -1,4 +1,5 @@
 use crate::error::SchemaError;
+use crate::project::AnimationEasing;
 use frameshift_time::Flicks;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -163,6 +164,65 @@ pub enum MatteMode {
     Red,
 }
 
+/// Channel mapping mode for `NodeKind::DisplacementMap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplacementMode {
+    #[default]
+    Rg,
+    Luma,
+    Polar,
+    SignedRg,
+}
+
+/// Alias matching design-doc terminology for [`DisplacementMode`].
+pub type DisplacementChannelMode = DisplacementMode;
+
+/// Edge sampling policy for `NodeKind::DisplacementMap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplacementWrap {
+    #[default]
+    Clamp,
+    Mirror,
+    Wrap,
+    Transparent,
+}
+
+/// Alias matching design-doc terminology for [`DisplacementWrap`].
+pub type DisplacementEdgeMode = DisplacementWrap;
+
+/// Composite operator for `NodeKind::FrameEcho` ghost trail accumulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EchoOperator {
+    #[default]
+    CompositeUnder,
+    CompositeOver,
+    Add,
+    Screen,
+    Maximum,
+}
+
+/// Single control vertex (with relative Bézier handles) for `NodeKind::ShapeMask`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ShapeMaskVertex {
+    pub pos: [f32; 2],
+    #[serde(default)]
+    pub in_tangent: [f32; 2],
+    #[serde(default)]
+    pub out_tangent: [f32; 2],
+}
+
+/// Keyframed shape pose for `NodeKind::ShapeMask` morphing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShapeMaskKeyframe {
+    pub tick: Flicks,
+    pub vertices: Vec<ShapeMaskVertex>,
+    #[serde(default)]
+    pub easing: AnimationEasing,
+}
+
 /// Text range unit used by the headless `VectorText` animator.
 ///
 /// `Grapheme` follows Unicode combining marks and joiner sequences; when shaping
@@ -318,6 +378,71 @@ pub enum Camera3DMode {
     Euler,
     /// Aims camera at `target` and applies `rot_deg[2]` as Dutch roll.
     LookAt,
+}
+
+/// Shared camera & Z-buffer Bokeh DoF configuration for `NodeKind::Scene3D`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SceneDepthPlateDef {
+    /// Upstream 2D node producing the grayscale depth map (`1.0` = near, `0.0` = far).
+    pub node_id: NodeId,
+    /// Eye-space near distance corresponding to `depth = 1.0`.
+    #[serde(default = "default_depth_plate_near")]
+    pub near_z: f32,
+    /// Eye-space far distance corresponding to `depth = 0.0`.
+    #[serde(default = "default_depth_plate_far")]
+    pub far_z: f32,
+    /// Invert depth polarity (`true` if `0.0` = near, `1.0` = far).
+    #[serde(default)]
+    pub invert: bool,
+    /// Non-linear gamma shaping applied to normalized depth (`pow(d, depth_gamma)`, default `1.0`).
+    #[serde(default = "default_one")]
+    pub depth_gamma: f32,
+    /// Maps normalized depth in inverse-Z disparity space (`1 / mix(1/far_z, 1/near_z, d)`)
+    /// matching Depth Anything V2 output when `true` (default), or linear eye-Z when `false`.
+    #[serde(default = "default_true")]
+    pub disparity_mode: bool,
+    /// Decodes 16-bit RG16-packed depth (`R = hi, G = lo`) instead of 8-bit R/luma when `true`.
+    #[serde(default)]
+    pub rg16_packed: bool,
+}
+
+impl Default for SceneDepthPlateDef {
+    fn default() -> Self {
+        Self {
+            node_id: NodeId::from(""),
+            near_z: default_depth_plate_near(),
+            far_z: default_depth_plate_far(),
+            invert: false,
+            depth_gamma: 1.0,
+            disparity_mode: true,
+            rg16_packed: false,
+        }
+    }
+}
+
+/// Anime4K v4.x FastS multi-pass preset chains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Anime4KPreset {
+    /// `Clamp_Highlights` -> `Restore_CNN_S` -> `Upscale_CNN_x2_S` (2x->1x supersampling).
+    #[default]
+    ModeA,
+    /// `Clamp_Highlights` -> `Restore_CNN_Soft_S` -> `Upscale_CNN_x2_S` (720p/aliased source).
+    ModeB,
+    /// `Clamp_Highlights` -> `Upscale_Denoise_CNN_x2_S` (480p/noisy source).
+    ModeC,
+    /// `Clamp_Highlights` -> `Restore_CNN_S` (1:1 restoration without 2x upscale).
+    RestoreOnly,
+    /// `Clamp_Highlights` -> `Darken_HQ` -> `Thin_HQ` (line-art darkening & thinning).
+    LineArt,
+}
+
+fn default_depth_plate_near() -> f32 {
+    0.5
+}
+
+fn default_depth_plate_far() -> f32 {
+    6.0
 }
 
 /// Shared camera & Z-buffer Bokeh DoF configuration for `NodeKind::Scene3D`.
@@ -732,6 +857,17 @@ pub enum NodeKind {
         #[serde(default = "default_anime_anti_ringing")]
         anti_ringing: f32,
     },
+    /// Anime4K v4.x FastS multi-pass WGSL CNN restoration, 2x->1x supersampling, and line-art
+    /// enhancement (`ModeA`, `ModeB`, `ModeC`, `RestoreOnly`, `LineArt`) (1 input).
+    #[serde(rename = "anime4k", alias = "anime4_k", alias = "Anime4K")]
+    Anime4K {
+        #[serde(default)]
+        preset: Anime4KPreset,
+        #[serde(default = "default_one")]
+        strength: f32,
+        #[serde(default = "default_true")]
+        clamp_highlights: bool,
+    },
     /// Cinematic lens distortion, chromatic edge, film grain, halation, and vignette (1 input).
     FilmOptics {
         #[serde(default)]
@@ -1049,6 +1185,10 @@ pub enum NodeKind {
         /// Background clear color in Linear Rec.709 premultiplied alpha (default transparent).
         #[serde(default)]
         background_rgba: [f32; 4],
+        /// Optional 2D depth plate (e.g. from `Depth-Anything-V2-Small`) seeded into the
+        /// `Scene3D` `Depth32Float` buffer before drawing 3D objects.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        depth_plate: Option<SceneDepthPlateDef>,
     },
     /// 4-corner projective perspective warp in normalized `[0, 1]` canvas coordinates (1 input).
     #[serde(alias = "corner_pin")]
@@ -1185,6 +1325,94 @@ pub enum NodeKind {
         #[serde(default)]
         invert: bool,
     },
+    /// Pyramidal GPU optical-flow motion blur (RSMB-style) (1 input).
+    #[serde(rename = "optical_flow_blur", alias = "OpticalFlowBlur")]
+    OpticalFlowBlur {
+        #[serde(default = "default_one")]
+        shutter_amount: f32,
+        #[serde(default = "default_flow_samples")]
+        samples: u32,
+        #[serde(default = "default_flow_max_blur_px")]
+        max_blur_px: f32,
+        #[serde(default = "default_flow_sensitivity")]
+        sensitivity: f32,
+        #[serde(default = "default_flow_smoothness")]
+        flow_smoothness: f32,
+        #[serde(default)]
+        visualize_flow: bool,
+    },
+    /// 2-input UV displacement map (`inputs[0]` = source, `inputs[1]` = displacement map).
+    #[serde(alias = "displacement_map")]
+    DisplacementMap {
+        #[serde(default)]
+        channel_mode: DisplacementMode,
+        #[serde(default)]
+        edge_mode: DisplacementWrap,
+        #[serde(default = "default_disp_scale")]
+        scale_x: f32,
+        #[serde(default = "default_disp_scale")]
+        scale_y: f32,
+        #[serde(default = "default_half")]
+        neutral_level: f32,
+        #[serde(default)]
+        angle_rad: f32,
+        #[serde(default)]
+        chromatic_split: f32,
+        #[serde(default = "default_one")]
+        opacity: f32,
+    },
+    /// Seek-independent temporal echo / ghost trail accumulator (1 input).
+    #[serde(alias = "frame_echo")]
+    FrameEcho {
+        #[serde(default = "default_echo_step_ticks")]
+        echo_step_ticks: i64,
+        #[serde(default = "default_echo_count")]
+        echo_count: u32,
+        #[serde(default = "default_one")]
+        starting_intensity: f32,
+        #[serde(default = "default_echo_decay")]
+        decay: f32,
+        #[serde(default = "default_white_rgb")]
+        color_decay_rgb: [f32; 3],
+        #[serde(default)]
+        hue_shift_deg: f32,
+        #[serde(default)]
+        operator: EchoOperator,
+    },
+    /// Keyframeable Bézier/polygon matte generator (0 inputs, feeds into `MaskMatte` or `Blend`).
+    #[serde(alias = "shape_mask")]
+    ShapeMask {
+        #[serde(default)]
+        vertices: Vec<ShapeMaskVertex>,
+        #[serde(default)]
+        keyframes: Vec<ShapeMaskKeyframe>,
+        #[serde(default = "default_true")]
+        closed: bool,
+        #[serde(default)]
+        feather_px: f32,
+        #[serde(default)]
+        expand_px: f32,
+        #[serde(default)]
+        invert: bool,
+        #[serde(default = "default_one")]
+        opacity: f32,
+    },
+}
+
+fn default_disp_scale() -> f32 {
+    0.05
+}
+
+fn default_echo_step_ticks() -> i64 {
+    -29_400_000
+}
+
+fn default_echo_count() -> u32 {
+    5
+}
+
+fn default_echo_decay() -> f32 {
+    0.65
 }
 
 fn default_one() -> f32 {
@@ -1519,6 +1747,22 @@ fn default_blur_samples() -> u32 {
     16
 }
 
+fn default_flow_samples() -> u32 {
+    12
+}
+
+fn default_flow_max_blur_px() -> f32 {
+    48.0
+}
+
+fn default_flow_sensitivity() -> f32 {
+    0.35
+}
+
+fn default_flow_smoothness() -> f32 {
+    0.25
+}
+
 fn default_scale3() -> [f32; 3] {
     [1.0, 1.0, 1.0]
 }
@@ -1544,6 +1788,7 @@ impl NodeKind {
         "halftone_glow",
         "deep_glow",
         "anime_sharpen",
+        "anime4k",
         "film_optics",
         "custom_wgsl",
         "transform3_d",
@@ -1561,6 +1806,10 @@ impl NodeKind {
         "blur_mo_curves",
         "null3_d",
         "depth_matte",
+        "optical_flow_blur",
+        "displacement_map",
+        "frame_echo",
+        "shape_mask",
     ];
 
     /// Built-in WGSL transition shader names supported by `ShaderTransition`.
@@ -1595,7 +1844,8 @@ impl NodeKind {
             | NodeKind::ParticleField3D { .. }
             | NodeKind::RibbonTrail3D { .. }
             | NodeKind::Scene3D { .. }
-            | NodeKind::Null3D { .. } => 0,
+            | NodeKind::Null3D { .. }
+            | NodeKind::ShapeMask { .. } => 0,
             NodeKind::Transform2D { .. }
             | NodeKind::Transform3D { .. }
             | NodeKind::ColorBasic { .. }
@@ -1607,16 +1857,20 @@ impl NodeKind {
             | NodeKind::HalftoneGlow { .. }
             | NodeKind::DeepGlow { .. }
             | NodeKind::AnimeSharpen { .. }
+            | NodeKind::Anime4K { .. }
             | NodeKind::FilmOptics { .. }
             | NodeKind::CornerPin { .. }
             | NodeKind::GridWarp { .. }
             | NodeKind::BackdropScrim { .. }
             | NodeKind::AdjustmentLayer { .. }
-            | NodeKind::BlurMoCurves { .. } => 1,
+            | NodeKind::BlurMoCurves { .. }
+            | NodeKind::OpticalFlowBlur { .. }
+            | NodeKind::FrameEcho { .. } => 1,
             NodeKind::MaskMatte { .. }
             | NodeKind::DepthMatte { .. }
             | NodeKind::Blend { .. }
-            | NodeKind::ShaderTransition { .. } => 2,
+            | NodeKind::ShaderTransition { .. }
+            | NodeKind::DisplacementMap { .. } => 2,
             NodeKind::CustomWgsl {
                 expected_inputs, ..
             } => (*expected_inputs).min(2) as usize,
@@ -1894,6 +2148,174 @@ pub(crate) fn validate_dag_nodes(
                     "requires finite 0.0 <= near_depth ({near_depth}) <= far_depth ({far_depth}) and feather ({feather}) >= 0.0"
                 ),
             });
+        }
+
+        if let NodeKind::OpticalFlowBlur {
+            shutter_amount,
+            samples,
+            max_blur_px,
+            sensitivity,
+            flow_smoothness,
+            ..
+        } = &node.kind
+        {
+            if !shutter_amount.is_finite() || !(0.0..=8.0).contains(shutter_amount) {
+                return Err(SchemaError::InvalidOpticalFlowBlur {
+                    node_id: node.id.clone(),
+                    message: format!(
+                        "shutter_amount ({shutter_amount}) must be finite and in 0.0..=8.0"
+                    ),
+                });
+            }
+            if !(1..=64).contains(samples) {
+                return Err(SchemaError::InvalidOpticalFlowBlur {
+                    node_id: node.id.clone(),
+                    message: format!("samples ({samples}) must be in 1..=64"),
+                });
+            }
+            if !max_blur_px.is_finite() || !(0.0..=512.0).contains(max_blur_px) {
+                return Err(SchemaError::InvalidOpticalFlowBlur {
+                    node_id: node.id.clone(),
+                    message: format!(
+                        "max_blur_px ({max_blur_px}) must be finite and in 0.0..=512.0"
+                    ),
+                });
+            }
+            if !sensitivity.is_finite() || !(0.001..=2.0).contains(sensitivity) {
+                return Err(SchemaError::InvalidOpticalFlowBlur {
+                    node_id: node.id.clone(),
+                    message: format!(
+                        "sensitivity ({sensitivity}) must be finite and in 0.001..=2.0"
+                    ),
+                });
+            }
+            if !flow_smoothness.is_finite() || !(0.0..=1.0).contains(flow_smoothness) {
+                return Err(SchemaError::InvalidOpticalFlowBlur {
+                    node_id: node.id.clone(),
+                    message: format!(
+                        "flow_smoothness ({flow_smoothness}) must be finite and in 0.0..=1.0"
+                    ),
+                });
+            }
+        }
+
+        if let NodeKind::Anime4K { strength, .. } = &node.kind
+            && (!strength.is_finite() || !(0.0..=2.0).contains(strength))
+        {
+            return Err(SchemaError::InvalidAnime4K {
+                node_id: node.id.clone(),
+                message: format!("strength ({strength}) must be finite and in 0.0..=2.0"),
+            });
+        }
+
+        if let NodeKind::DisplacementMap {
+            scale_x,
+            scale_y,
+            neutral_level,
+            angle_rad,
+            chromatic_split,
+            opacity,
+            ..
+        } = &node.kind
+            && (!scale_x.is_finite()
+                || !scale_y.is_finite()
+                || !neutral_level.is_finite()
+                || !angle_rad.is_finite()
+                || !chromatic_split.is_finite()
+                || !opacity.is_finite()
+                || !(0.0..=1.0).contains(opacity)
+                || !(0.0..=1.0).contains(chromatic_split))
+        {
+            return Err(SchemaError::InvalidDisplacementMap {
+                node_id: node.id.clone(),
+                message: "scale_x/scale_y/neutral_level/angle_rad must be finite; opacity and chromatic_split must be in [0.0, 1.0]".into(),
+            });
+        }
+
+        if let NodeKind::FrameEcho {
+            echo_count,
+            starting_intensity,
+            decay,
+            color_decay_rgb,
+            hue_shift_deg,
+            ..
+        } = &node.kind
+        {
+            if *echo_count > 24 {
+                return Err(SchemaError::InvalidFrameEcho {
+                    node_id: node.id.clone(),
+                    message: format!("echo_count ({echo_count}) must be <= 24"),
+                });
+            }
+            if !starting_intensity.is_finite()
+                || *starting_intensity < 0.0
+                || !decay.is_finite()
+                || !(0.0..=1.0).contains(decay)
+                || color_decay_rgb.iter().any(|c| !c.is_finite() || *c < 0.0)
+                || !hue_shift_deg.is_finite()
+            {
+                return Err(SchemaError::InvalidFrameEcho {
+                    node_id: node.id.clone(),
+                    message: "starting_intensity >= 0, decay in [0, 1], color_decay_rgb >= 0, and hue_shift_deg must be finite".into(),
+                });
+            }
+        }
+
+        if let NodeKind::ShapeMask {
+            vertices,
+            keyframes,
+            feather_px,
+            expand_px,
+            opacity,
+            ..
+        } = &node.kind
+        {
+            if !feather_px.is_finite()
+                || *feather_px < 0.0
+                || !expand_px.is_finite()
+                || !opacity.is_finite()
+                || !(0.0..=1.0).contains(opacity)
+            {
+                return Err(SchemaError::InvalidShapeMask {
+                    node_id: node.id.clone(),
+                    message: "feather_px >= 0, expand_px finite, and opacity in [0.0, 1.0] required".into(),
+                });
+            }
+            let vertex_finite = |v: &ShapeMaskVertex| {
+                v.pos[0].is_finite()
+                    && v.pos[1].is_finite()
+                    && v.in_tangent[0].is_finite()
+                    && v.in_tangent[1].is_finite()
+                    && v.out_tangent[0].is_finite()
+                    && v.out_tangent[1].is_finite()
+            };
+            if vertices.iter().any(|v| !vertex_finite(v)) {
+                return Err(SchemaError::InvalidShapeMask {
+                    node_id: node.id.clone(),
+                    message: "vertices must contain only finite coordinates".into(),
+                });
+            }
+            let mut prev_tick: Option<Flicks> = None;
+            for kf in keyframes {
+                if let Some(pt) = prev_tick
+                    && kf.tick < pt
+                {
+                    return Err(SchemaError::InvalidShapeMask {
+                        node_id: node.id.clone(),
+                        message: format!(
+                            "keyframes must be ordered by non-decreasing tick ({} < {})",
+                            kf.tick, pt
+                        ),
+                    });
+                }
+                prev_tick = Some(kf.tick);
+                if kf.vertices.iter().any(|v| !vertex_finite(v)) {
+                    return Err(SchemaError::InvalidShapeMask {
+                        node_id: node.id.clone(),
+                        message: "keyframe vertices must contain only finite coordinates".into(),
+                    });
+                }
+            }
         }
 
         if let NodeKind::Transform3D {
@@ -2545,7 +2967,44 @@ pub(crate) fn validate_dag_nodes(
                 });
             }
 
-            if let NodeKind::Scene3D { camera, .. } = &node.kind {
+            if let NodeKind::Scene3D {
+                camera,
+                depth_plate,
+                ..
+            } = &node.kind
+            {
+                if let Some(dp) = depth_plate {
+                    if !by_id.contains_key(&dp.node_id) {
+                        return Err(SchemaError::MissingNode(dp.node_id.clone()));
+                    }
+                    if !dp.near_z.is_finite()
+                        || !dp.far_z.is_finite()
+                        || dp.near_z <= 0.0
+                        || dp.far_z <= dp.near_z
+                    {
+                        return Err(SchemaError::InvalidScene3D {
+                            node_id: node.id.clone(),
+                            message: format!(
+                                "depth_plate requires finite 0.0 < near_z ({}) < far_z ({})",
+                                dp.near_z, dp.far_z
+                            ),
+                        });
+                    }
+                    if !dp.depth_gamma.is_finite() || !(0.05..=8.0).contains(&dp.depth_gamma) {
+                        return Err(SchemaError::InvalidScene3D {
+                            node_id: node.id.clone(),
+                            message: format!(
+                                "depth_plate.depth_gamma ({}) must be finite and in 0.05..=8.0",
+                                dp.depth_gamma
+                            ),
+                        });
+                    }
+                    *indegree.get_mut(&node.id).unwrap() += 1;
+                    dependents
+                        .get_mut(&dp.node_id)
+                        .unwrap()
+                        .push(node.id.clone());
+                }
                 if !camera.near.is_finite() || camera.near <= 0.0 {
                     return Err(SchemaError::InvalidScene3D {
                         node_id: node.id.clone(),
@@ -2691,7 +3150,21 @@ fn extract_cycle_nodes(by_id: &BTreeMap<NodeId, &GraphNodeDef>) -> Vec<NodeId> {
         stack.push(curr.clone());
 
         if let Some(node) = by_id.get(curr) {
-            for upstream in node.inputs.iter().chain(node_parent(&node.kind)) {
+            let depth_plate_id = if let NodeKind::Scene3D {
+                depth_plate: Some(dp),
+                ..
+            } = &node.kind
+            {
+                Some(&dp.node_id)
+            } else {
+                None
+            };
+            for upstream in node
+                .inputs
+                .iter()
+                .chain(node_parent(&node.kind))
+                .chain(depth_plate_id)
+            {
                 match color.get(upstream).copied().unwrap_or(Color::White) {
                     Color::Gray => {
                         let start_idx = stack.iter().position(|id| id == upstream).unwrap_or(0);

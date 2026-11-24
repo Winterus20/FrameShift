@@ -3,7 +3,8 @@ use crate::graph::{
     BlendMode, ColorSpace, GraphNodeDef, NodeId, NodeKind, RenderGraphDef, SourceFit,
 };
 use crate::project::{
-    AssetDef, ClipDef, CreativeDecisionRecord, EventAnchorDef, PreferenceEntry, Project,
+    AssetDef, ClipDef, CreativeDecisionRecord, EventAnchorDef, KeyframeTrackDef, PreferenceEntry,
+    Project,
 };
 use frameshift_time::{
     BezierSpeedKeyframe, Flicks, ImpactCurveStyle, ImpactSolveRequest, ImpactSolver, KeyframeEase,
@@ -110,6 +111,10 @@ pub enum ProjectCommand {
     },
     RecordCreativeDecision(CreativeDecisionRecord),
     SetPreference(PreferenceEntry),
+    UpsertKeyframeTrack(KeyframeTrackDef),
+    RemoveKeyframeTrack {
+        id: String,
+    },
     ReplaceProject {
         project: Project,
     },
@@ -449,11 +454,36 @@ fn apply_to_project(project: &mut Project, cmd: ProjectCommand) -> Result<(), Sc
                 project.preferences.push(entry);
             }
         }
+        ProjectCommand::UpsertKeyframeTrack(track) => {
+            if let Some(existing) = project
+                .keyframe_tracks
+                .iter_mut()
+                .find(|t| t.id == track.id)
+            {
+                *existing = track;
+            } else {
+                project.keyframe_tracks.push(track);
+            }
+        }
+        ProjectCommand::RemoveKeyframeTrack { id } => {
+            let pos = project
+                .keyframe_tracks
+                .iter()
+                .position(|t| t.id == id)
+                .ok_or_else(|| SchemaError::InvalidKeyframeTrack {
+                    track_id: id,
+                    message: "keyframe track not found".into(),
+                })?;
+            project.keyframe_tracks.remove(pos);
+        }
         ProjectCommand::ReplaceProject {
             project: replacement,
         } => {
             *project = replacement;
         }
+    }
+    if !project.events.is_empty() {
+        project.recompute_event_constraints()?;
     }
     Ok(())
 }

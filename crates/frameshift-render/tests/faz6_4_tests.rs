@@ -73,6 +73,7 @@ fn make_test_project(
             final_profile: profile(RenderProfileKind::Final),
         },
         param_bindings,
+        keyframe_tracks: vec![],
         creative_decisions: vec![],
         preferences: vec![],
         proxy_config: Default::default(),

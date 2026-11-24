@@ -10,6 +10,7 @@ pub mod font_locator;
 pub mod hud_path;
 pub mod mesh3d;
 pub mod shape3d;
+pub mod shape_mask;
 pub mod shaper;
 pub mod slug;
 pub mod text;
@@ -44,6 +45,10 @@ pub use mesh3d::{
     Text3DMeshOptions,
 };
 pub use shape3d::{build_shape3d_mesh, ProceduralShapeKind, Shape3DParams};
+pub use shape_mask::{
+    ShapeMaskConfig, flatten_shape_mask_contour, interpolate_shape_mask_vertices,
+    render_shape_mask_crisp_rgba16f, render_shape_mask_node_rgba16f, render_shape_mask_rgba16f,
+};
 pub use text::{
     draw_vector_text, pair_kerning_units, rasterize_vector_text_node,
     rasterize_vector_text_rgba16f, render_anime_title_card, render_label_badge,

@@ -666,6 +666,7 @@ fn project_animator_updates_faz6_1_node_parameters() {
                 expression: "0.8".into(),
             },
         ],
+        keyframe_tracks: vec![],
         creative_decisions: vec![],
         preferences: vec![],
         proxy_config: Default::default(),

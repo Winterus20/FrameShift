@@ -59,7 +59,7 @@ fn eval_signed_coc_msaa(coord: vec2<i32>, max_coord: vec2<i32>) -> vec4<f32> {
     let max_rad = clamp(u.screen_params.x, 0.0, 48.0);
     let alpha = clamp(col.a, 0.0, 1.0);
 
-    if (raw_d >= 0.99999) {
+    if (raw_d >= 0.99999 || alpha <= 1e-4) {
         return vec4<f32>(0.0, far, alpha, 1.0);
     }
 

@@ -244,7 +244,7 @@ impl TemplatePackage {
 
         let mut file_paths = BTreeSet::new();
         for file in &self.manifest.files {
-            validate_package_relative_path(&file.relative_path).map_err(&fail)?;
+            validate_package_relative_path(&file.relative_path).map_err(fail)?;
             if !file_paths.insert(file.relative_path.as_str()) {
                 return Err(fail(format!(
                     "duplicate manifest file path '{}'",
@@ -265,7 +265,7 @@ impl TemplatePackage {
         .into_iter()
         .flatten()
         {
-            validate_package_relative_path(path).map_err(&fail)?;
+            validate_package_relative_path(path).map_err(fail)?;
         }
         validate_review(&self.template_id, &self.review, "packages")?;
         Ok(())
@@ -751,7 +751,7 @@ fn apply_slot_value(
         ) => {
             let node = find_node_mut_recursive(&mut project.graph, node_id)
                 .ok_or_else(|| fail(format!("node '{node_id}' no longer exists")))?;
-            apply_node_color(&mut node.kind, field.as_deref(), *rgba).map_err(&fail)?;
+            apply_node_color(&mut node.kind, field.as_deref(), *rgba).map_err(fail)?;
         }
         (
             TemplateSlotTarget::NodeChoice { node_id, field },
@@ -759,7 +759,7 @@ fn apply_slot_value(
         ) => {
             let node = find_node_mut_recursive(&mut project.graph, node_id)
                 .ok_or_else(|| fail(format!("node '{node_id}' no longer exists")))?;
-            apply_node_choice(&mut node.kind, field, choice).map_err(&fail)?;
+            apply_node_choice(&mut node.kind, field, choice).map_err(fail)?;
         }
         (
             TemplateSlotTarget::ClipSpeedCurve { clip_id },

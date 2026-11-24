@@ -59,6 +59,7 @@ fn make_project(
             final_profile: profile(RenderProfileKind::Final),
         },
         param_bindings,
+        keyframe_tracks: vec![],
         creative_decisions: vec![],
         preferences: vec![],
         proxy_config: Default::default(),
@@ -700,7 +701,8 @@ fn null3d_parent_chain_pivot_and_mirror_edges_in_scene3d() {
                         ..Default::default()
                     },
                     background_rgba: [0.0, 0.0, 0.0, 0.0],
-                },
+ depth_plate: None,
+},
                 inputs: vec![NodeId::from("null_rig"), NodeId::from("card")],
                 enabled: true,
             },

@@ -446,3 +446,467 @@ fn new_mcp_tools_and_render_options_work_end_to_end() {
         .unwrap()
         .contains("unknown platform_preset"));
 }
+
+#[test]
+fn wave4_mcp_tools_cover_lint_diff_dsl_template_tracker_nle_and_ai_manifest() {
+    use frameshift_media::{AlphaMode, FfmpegBridge, Rgba8Frame};
+    use frameshift_schema::{
+        BlendMode, ColorSpace, GraphNodeDef, NodeId, NodeKind, RenderGraphDef, Resolution,
+        SourceFit,
+    };
+    use frameshift_time::{FLICKS_PER_SECOND, FPS_24, SpeedCurve};
+
+    let tmp = unique_temp_dir("wave4");
+
+    let mut project = Project::golden_scene_preset();
+    project.param_bindings.clear();
+    project.timeline.clips[0].event_animations.clear();
+    project.timeline.fps = FPS_24;
+    project.timeline.duration_ticks = Flicks(FLICKS_PER_SECOND / 6); // 4 frames
+    project.timeline.clips.truncate(1);
+    project.timeline.clips[0].timeline_end = project.timeline.duration_ticks;
+    project.timeline.clips[0].speed_curve = SpeedCurve::constant(1.0).unwrap();
+    project.render_profiles.draft.resolution = Resolution {
+        width: 96,
+        height: 64,
+    };
+    project.render_profiles.draft.motion_blur_sub_samples = 1;
+    project.graph = RenderGraphDef {
+        output_node: NodeId::from("corner_out"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("src_a"),
+                kind: NodeKind::SourceVideo {
+                    asset_id: "asset_clip_a".into(),
+                    clip_id: Some("clip_a".into()),
+                    color_space: ColorSpace::DisplaySrgb,
+                    fit: SourceFit::Stretch,
+                },
+                inputs: Vec::new(),
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("follow_2d"),
+                kind: NodeKind::Transform2D {
+                    translate: [0.0, 0.0],
+                    scale: [1.0, 1.0],
+                    rotation_rad: 0.0,
+                    anchor: [0.5, 0.5],
+                    filter: Default::default(),
+                },
+                inputs: vec![NodeId::from("src_a")],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("corner_out"),
+                kind: NodeKind::CornerPin {
+                    tl: [0.0, 0.0],
+                    tr: [1.0, 0.0],
+                    br: [1.0, 1.0],
+                    bl: [0.0, 1.0],
+                    opacity: 1.0,
+                    filter: Default::default(),
+                },
+                inputs: vec![NodeId::from("follow_2d")],
+                enabled: true,
+            },
+        ],
+    };
+
+    let mut server = McpServer::new(project).expect("valid server");
+
+    // 1. tools/list & describe_schema coverage.
+    let tools_res: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} })
+                .to_string(),
+        ),
+    )
+    .unwrap();
+    let tools = tools_res["result"]["tools"].as_array().unwrap();
+    for expected in [
+        "lint_project",
+        "diff_frame",
+        "compile_motion_dsl",
+        "template_metadata",
+        "template_instantiate",
+        "track_point",
+        "track_planar",
+        "export_nle",
+        "import_nle",
+        "ai_models",
+        "ai_run_manifest",
+    ] {
+        assert!(
+            tools.iter().any(|t| t["name"] == expected),
+            "tools/list missing '{expected}'"
+        );
+    }
+
+    let desc = server.describe_schema();
+    for kind in ["displacement_map", "frame_echo", "shape_mask"] {
+        assert!(desc.node_kinds.iter().any(|k| k == kind));
+    }
+    for cmd in ["upsert_keyframe_track", "remove_keyframe_track"] {
+        assert!(desc.project_commands.iter().any(|c| c == cmd));
+    }
+
+    // 2. lint_project (clean -> ok=true, then inject off-screen text -> LNT-TXT-001).
+    let lint_ok: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "lint_project", "arguments": { "check_media": false } }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    assert!(lint_ok["result"]["structuredContent"]["ok"].as_bool().unwrap());
+
+    // 3. diff_frame on two PNG files + 3-panel heatmap output.
+    let png_a = tmp.0.join("a.png");
+    let png_b = tmp.0.join("b.png");
+    let png_diff = tmp.0.join("diff.png");
+    let frame_a =
+        Rgba8Frame::filled(32, 32, Flicks::ZERO, [10, 20, 30, 255], AlphaMode::Straight).unwrap();
+    let mut frame_b = frame_a.clone();
+    frame_b.set_pixel(5, 6, [240, 200, 100, 255]);
+    frame_a.save_png(&png_a).unwrap();
+    frame_b.save_png(&png_b).unwrap();
+
+    let diff_res: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "diff_frame",
+                    "arguments": {
+                        "path_a": png_a,
+                        "path_b": png_b,
+                        "threshold": 2,
+                        "out_diff_png": png_diff
+                    }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    let diff_sc = &diff_res["result"]["structuredContent"];
+    assert_eq!(diff_sc["changed_pixels"], 1);
+    assert_eq!(diff_sc["changed_bbox"], json!([5, 6, 1, 1]));
+    assert!(png_diff.is_file());
+
+    // 4. compile_motion_dsl.
+    let dsl_script = r#"
+---
+name: "MCP DSL Scene"
+fps: 24
+res: 160x90
+---
+asset clip_a video path="synthetic://clip_a"
+shot c1 asset=clip_a range=0s..1s src=0s fit=cover
+text "OK" at=0s..1s pos=(0.5, 0.5) size=0.08 color=#FFFFFF
+"#;
+    let dsl_res: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "compile_motion_dsl",
+                    "arguments": { "input": dsl_script }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        dsl_res["result"]["structuredContent"]["project"]["name"],
+        "MCP DSL Scene"
+    );
+    assert!(
+        dsl_res["result"]["structuredContent"]["lint_report"]["ok"]
+            .as_bool()
+            .unwrap()
+    );
+
+    // 5. template_metadata + template_instantiate.
+    let spec = json!({
+        "spec_version": 1,
+        "template_id": "mcp_montage",
+        "name": "MCP Montage",
+        "props_schema": [
+            { "id": "clips", "label": "Clips", "kind": { "type": "video_clip_list", "min_items": 1, "max_items": 4 }, "required": true },
+            { "id": "bgm", "label": "BGM", "kind": { "type": "audio_file" }, "required": true }
+        ],
+        "metadata_rules": {
+            "default_fps": { "num": 24, "den": 1 },
+            "aspect_presets": { "16:9": { "width": 160, "height": 90 } },
+            "duration_policy": { "kind": "beat_count", "beats": 4 },
+            "beat_source": "beat_grid",
+            "cuts_per_beat": { "num": 1, "den": 1 },
+            "min_segment_ms": 200
+        }
+    });
+    let props = json!({
+        "clips": ["synthetic://clip_a"],
+        "bgm": "synthetic://beat"
+    });
+    let tmpl_meta: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "template_metadata",
+                    "arguments": { "spec": spec, "props": props }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        tmpl_meta["result"]["structuredContent"]["template_id"],
+        "mcp_montage"
+    );
+
+    let tmpl_out = tmp.0.join("tmpl_proj.json");
+    let tmpl_inst: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "template_instantiate",
+                    "arguments": {
+                        "spec": spec,
+                        "props": props,
+                        "out_path": tmpl_out
+                    }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    assert!(
+        tmpl_inst["result"]["structuredContent"]["lint_report"]["ok"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(tmpl_out.is_file());
+
+    // 6. track_point + track_planar on active session.
+    let pt_res: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "track_point",
+                    "arguments": {
+                        "asset_id": "asset_clip_a",
+                        "target_node_id": "follow_2d",
+                        "x": 0.5,
+                        "y": 0.5,
+                        "bind_mode": "transform2d"
+                    }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(pt_res["result"]["structuredContent"]["frames_tracked"], 4);
+    assert!(!server.project().keyframe_tracks.is_empty());
+
+    let pl_res: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "track_planar",
+                    "arguments": {
+                        "source_node_id": "src_a",
+                        "target_node_id": "corner_out",
+                        "corners": [[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8]],
+                        "bind_mode": "corner_pin"
+                    }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(pl_res["result"]["structuredContent"]["frames_tracked"], 4);
+
+    // 7. export_nle + import_nle (OTIO & FCPXML).
+    let otio_out = tmp.0.join("out.otio");
+    let exp_otio: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "export_nle",
+                    "arguments": { "format": "otio", "out_path": otio_out }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    assert!(otio_out.is_file());
+    let otio_text = exp_otio["result"]["structuredContent"]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let imp_otio: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "import_nle",
+                    "arguments": { "format": "otio", "input": otio_text }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        imp_otio["result"]["structuredContent"]["format"],
+        "otio"
+    );
+
+    let exp_fcpxml: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": { "name": "export_nle", "arguments": { "format": "fcpxml" } }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    let fcpxml_text = exp_fcpxml["result"]["structuredContent"]["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let imp_fcpxml: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": {
+                    "name": "import_nle",
+                    "arguments": { "format": "fcpxml", "input": fcpxml_text }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        imp_fcpxml["result"]["structuredContent"]["format"],
+        "fcpxml"
+    );
+
+    // 8. ai_models + ai_run_manifest (synthetic_test mode with verified SHA-256).
+    let models_root = tmp.0.join("models");
+    let model_dir = models_root.join("demo_matte");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    let onnx_path = model_dir.join("demo.onnx");
+    let onnx_bytes = b"mcp-demo-onnx";
+    std::fs::write(&onnx_path, onnx_bytes).unwrap();
+    let sha = FfmpegBridge::hash_bytes(onnx_bytes).sha256;
+    std::fs::write(
+        model_dir.join("model_manifest.json"),
+        serde_json::to_string_pretty(&json!({
+            "schema_version": "frameshift.ai_model.v1",
+            "id": "demo_matte",
+            "task": "matte",
+            "onnx_file": "demo.onnx",
+            "sha256": sha,
+            "license": "MIT"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let ai_list: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "tools/call",
+                "params": {
+                    "name": "ai_models",
+                    "arguments": { "models_dir": models_root }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(ai_list["result"]["structuredContent"]["count"], 1);
+    assert_eq!(
+        ai_list["result"]["structuredContent"]["models"][0]["manifest"]["id"],
+        "demo_matte"
+    );
+
+    let ai_out_png = tmp.0.join("ai_out.png");
+    let ai_run_res: Value = serde_json::from_str(
+        &server.handle_jsonrpc_str(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 14,
+                "method": "tools/call",
+                "params": {
+                    "name": "ai_run_manifest",
+                    "arguments": {
+                        "model_id": "demo_matte",
+                        "models_dir": models_root,
+                        "input_path": png_a,
+                        "out_path": ai_out_png,
+                        "synthetic_test": true
+                    }
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        ai_run_res["result"]["structuredContent"]["report"]["model_id"],
+        "demo_matte"
+    );
+    assert!(
+        ai_run_res["result"]["structuredContent"]["report"]["sha256_verified"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(ai_out_png.is_file());
+    let _ = BlendMode::Normal;
+}

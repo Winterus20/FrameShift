@@ -1,7 +1,7 @@
 # FrameShift — Detaylı Implementasyon Planı
 
-**Durum:** Onaylanan Yön / Faz 0 Başlangıcına Hazır (Henüz kodlama başlamamıştır)  
-**Tarih:** 2026-11-21  
+**Durum:** Tarihsel Faz 0–5 Ana Planı — Aşağıdaki Faz 0–5 çekirdek yol haritası (M1–M5), Faz 6.1–6.6, Anime P0, GPU `OpticalFlowBlur`/ONNX, 5 Temel Yetenek ve P1/P2/P3/P5 sütunları 9 crate'lik workspace'te (60 WGSL shader, 40 `NodeKind`, 50 CLI alt komutu, 32 MCP aracı) tamamlanmıştır; **Faz 4 / P4 etkileşimli masaüstü GUI penceresi** kullanıcı kararıyla sonraki faza bırakılmıştır. Güncel durum ve doğrulamalar için [brain/state.md](brain/state.md) dosyasına bakınız.  
+**Tarih:** 2026-11-21 *(Güncel durum notu: 2026-11-24)*  
 **Dayanak:** [AGENTS.md](AGENTS.md), [PROJECT_NOTES.md](PROJECT_NOTES.md), [ADR-0001](brain/decisions/0001-independent-native-gpu-core.md), [ADR-0002](brain/decisions/0002-rational-timebase-flicks.md), [ADR-0003](brain/decisions/0003-semantic-event-constraint-timing.md)
 
 ---

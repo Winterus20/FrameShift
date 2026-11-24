@@ -360,6 +360,24 @@ impl WorkspaceUiController {
         render_desktop_ui_snapshot(self, viewport_frame, width, height)
     }
 
+    /// Renders a visual dark-mode desktop editor UI snapshot with an optional
+    /// [`SnapshotAudioContext`](crate::snapshot::SnapshotAudioContext) for real PCM waveforms.
+    pub fn render_desktop_ui_snapshot_with_audio(
+        &self,
+        viewport_frame: &Rgba8Frame,
+        width: u32,
+        height: u32,
+        audio: Option<&crate::snapshot::SnapshotAudioContext>,
+    ) -> Rgba8Frame {
+        crate::snapshot::render_desktop_ui_snapshot_with_audio(
+            self,
+            viewport_frame,
+            width,
+            height,
+            audio,
+        )
+    }
+
     fn reconcile_selection(&mut self) {
         let project = self.session.project();
         if let Some(ref node_id) = self.selected_node
@@ -421,6 +439,10 @@ fn describe_command(cmd: &ProjectCommand) -> String {
             format!("RecordCreativeDecision({})", d.decision_id)
         }
         ProjectCommand::SetPreference(p) => format!("SetPreference({})", p.key),
+        ProjectCommand::UpsertKeyframeTrack(t) => format!("UpsertKeyframeTrack({})", t.id),
+        ProjectCommand::RemoveKeyframeTrack { id } => {
+            format!("RemoveKeyframeTrack({id})")
+        }
         ProjectCommand::ReplaceProject { .. } => "ReplaceProject".into(),
     }
 }

@@ -1,7 +1,7 @@
 use crate::audio::AudioBuffer;
 use crate::error::MediaError;
 use crate::frame::Sha256;
-use crate::frame::{AlphaMode, Rgba8Frame, fit_rgba8_frame};
+use crate::frame::{AlphaMode, DecodedVideoFrame, Nv12Frame, Rgba8Frame, YuvColorInfo, fit_rgba8_frame, validated_nv12_plane_lens};
 use frameshift_time::{FLICKS_PER_SECOND, Flicks, PtsIndex, Rational32};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -568,11 +568,21 @@ impl HwAccelDetector {
 }
 
 /// Metadata summary extracted from a media container via `ffprobe`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaProbeInfo {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub pixel_format: Option<String>,
+    #[serde(default)]
+    pub color_space: Option<String>,
+    #[serde(default)]
+    pub color_transfer: Option<String>,
+    #[serde(default)]
+    pub color_primaries: Option<String>,
+    #[serde(default)]
+    pub color_range: Option<String>,
+    #[serde(default)]
+    pub chroma_location: Option<String>,
     pub width: u32,
     pub height: u32,
     pub fps: Option<Rational32>,
@@ -581,6 +591,30 @@ pub struct MediaProbeInfo {
     pub has_audio: bool,
     pub audio_sample_rate: Option<u32>,
     pub audio_channels: Option<u16>,
+}
+
+impl MediaProbeInfo {
+    /// Derives [`YuvColorInfo`] from the probed stream colorimetry tags.
+    pub fn yuv_color_info(&self) -> YuvColorInfo {
+        YuvColorInfo::from_probe_tags(
+            self.width,
+            self.height,
+            self.color_space.as_deref(),
+            self.color_transfer.as_deref(),
+            self.color_range.as_deref(),
+            self.chroma_location.as_deref(),
+        )
+    }
+
+    /// Returns `true` when NV12 4:2:0 decoding is valid for `(target_width, target_height)`
+    /// and the source pixel format carries no alpha channel.
+    pub fn prefers_nv12_decode(&self, target_width: u32, target_height: u32) -> bool {
+        !YuvColorInfo::should_fallback_to_rgba(
+            target_width,
+            target_height,
+            self.pixel_format.as_deref(),
+        )
+    }
 }
 
 /// Subprocess raw-pipe bridge to `ffmpeg` and `ffprobe`.
@@ -632,7 +666,7 @@ impl FfmpegBridge {
                 "-v",
                 "error",
                 "-show_entries",
-                "stream=codec_type,codec_name,width,height,pix_fmt,time_base,avg_frame_rate,r_frame_rate,start_pts,duration_ts,sample_rate,channels",
+                "stream=codec_type,codec_name,width,height,pix_fmt,color_space,color_transfer,color_primaries,color_range,chroma_location,time_base,avg_frame_rate,r_frame_rate,start_pts,duration_ts,sample_rate,channels",
                 "-show_entries",
                 "frame=media_type,pts,best_effort_timestamp,pts_time",
                 "-of",
@@ -751,6 +785,11 @@ impl FfmpegBridge {
             video_codec: video_stream.codec_name.clone(),
             audio_codec: audio_stream.and_then(|s| s.codec_name.clone()),
             pixel_format: video_stream.pix_fmt.clone(),
+            color_space: video_stream.color_space.clone(),
+            color_transfer: video_stream.color_transfer.clone(),
+            color_primaries: video_stream.color_primaries.clone(),
+            color_range: video_stream.color_range.clone(),
+            chroma_location: video_stream.chroma_location.clone(),
             width,
             height,
             fps,
@@ -823,6 +862,192 @@ impl FfmpegBridge {
             height,
             SourceFit::Stretch,
         )
+    }
+
+    /// Decodes a single frame at `source_tick`, preferring NV12 planar output when
+    /// `(width, height)` are even and `probe.pixel_format` has no alpha channel, and
+    /// falling back automatically to `Rgba8` otherwise.
+    pub fn decode_video_frame_decoded_with_fit(
+        path: &Path,
+        probe: &MediaProbeInfo,
+        source_tick: Flicks,
+        width: u32,
+        height: u32,
+        fit: SourceFit,
+    ) -> Result<DecodedVideoFrame, MediaError> {
+        if width == 0 || height == 0 {
+            return Err(MediaError::InvalidDimensions { width, height });
+        }
+        if !probe.prefers_nv12_decode(width, height) {
+            return Self::decode_video_frame_with_fit(
+                path,
+                &probe.pts_index,
+                source_tick,
+                width,
+                height,
+                fit,
+            )
+            .map(DecodedVideoFrame::Rgba8);
+        }
+
+        let matched = probe.pts_index.lookup_frame(source_tick).ok_or_else(|| {
+            MediaError::EmptyMediaStream(format!(
+                "cannot decode from empty PtsIndex for '{}'",
+                path.display()
+            ))
+        })?;
+
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-v", "error", "-nostdin"]);
+        if let Some(seek_sec) = midpoint_seek_seconds(&probe.pts_index, matched.frame_index) {
+            cmd.arg("-ss").arg(format!("{seek_sec:.9}"));
+        }
+        cmd.arg("-i")
+            .arg(path)
+            .args(["-fps_mode", "passthrough", "-frames:v", "1"]);
+        let (decode_w, decode_h, content_uv_rect) = append_nv12_fitted_output(
+            &mut cmd,
+            Some((probe.width, probe.height)),
+            width,
+            height,
+            fit,
+        );
+        cmd.args(["-pix_fmt", "nv12", "-f", "rawvideo", "pipe:1"]);
+
+        let output = cmd.output().map_err(|e| MediaError::BinarySpawnFailed {
+            binary: "ffmpeg".into(),
+            reason: e.to_string(),
+        })?;
+        if !output.status.success() {
+            return Err(MediaError::FfmpegFailed {
+                exit_code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+
+        let (y_len, uv_len) = validated_nv12_plane_lens(decode_w, decode_h)?;
+        let expected = y_len + uv_len;
+        if output.stdout.len() != expected {
+            return Err(MediaError::BufferLengthMismatch {
+                expected,
+                actual: output.stdout.len(),
+            });
+        }
+
+        Nv12Frame::from_contiguous(
+            decode_w,
+            decode_h,
+            matched.pts,
+            &output.stdout,
+            probe.yuv_color_info(),
+            content_uv_rect,
+        )
+        .map(DecodedVideoFrame::Nv12)
+    }
+
+    /// Decodes a window of frames using NV12 when supported or automatic `Rgba8` fallback.
+    pub fn decode_video_window_decoded_with_fit(
+        path: &Path,
+        probe: &MediaProbeInfo,
+        start_frame_index: usize,
+        window_len: usize,
+        width: u32,
+        height: u32,
+        fit: SourceFit,
+    ) -> Result<Vec<(usize, DecodedVideoFrame)>, MediaError> {
+        if width == 0 || height == 0 {
+            return Err(MediaError::InvalidDimensions { width, height });
+        }
+        if probe.pts_index.is_empty() {
+            return Err(MediaError::EmptyMediaStream(format!(
+                "cannot decode from empty PtsIndex for '{}'",
+                path.display()
+            )));
+        }
+        if start_frame_index >= probe.pts_index.len() || window_len == 0 {
+            return Ok(Vec::new());
+        }
+        if !probe.prefers_nv12_decode(width, height) {
+            return Self::decode_video_window_with_fit(
+                path,
+                &probe.pts_index,
+                start_frame_index,
+                window_len,
+                width,
+                height,
+                fit,
+            )
+            .map(|frames| {
+                frames
+                    .into_iter()
+                    .map(|(i, f)| (i, DecodedVideoFrame::Rgba8(f)))
+                    .collect()
+            });
+        }
+
+        let count = window_len.min(probe.pts_index.len() - start_frame_index);
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-v", "error", "-nostdin"]);
+        if let Some(seek_sec) = midpoint_seek_seconds(&probe.pts_index, start_frame_index) {
+            cmd.arg("-ss").arg(format!("{seek_sec:.9}"));
+        }
+        let count_arg = count.to_string();
+        cmd.arg("-i")
+            .arg(path)
+            .args(["-fps_mode", "passthrough", "-frames:v", &count_arg]);
+        let (decode_w, decode_h, content_uv_rect) = append_nv12_fitted_output(
+            &mut cmd,
+            Some((probe.width, probe.height)),
+            width,
+            height,
+            fit,
+        );
+        cmd.args(["-pix_fmt", "nv12", "-f", "rawvideo", "pipe:1"]);
+
+        let output = cmd.output().map_err(|e| MediaError::BinarySpawnFailed {
+            binary: "ffmpeg".into(),
+            reason: e.to_string(),
+        })?;
+        if !output.status.success() {
+            return Err(MediaError::FfmpegFailed {
+                exit_code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+
+        let (y_len, uv_len) = validated_nv12_plane_lens(decode_w, decode_h)?;
+        let expected_bytes = y_len + uv_len;
+        if output.stdout.is_empty() || !output.stdout.len().is_multiple_of(expected_bytes) {
+            return Err(MediaError::BufferLengthMismatch {
+                expected: expected_bytes,
+                actual: output.stdout.len(),
+            });
+        }
+        let actual_frames = output.stdout.len() / expected_bytes;
+        if actual_frames > count {
+            return Err(MediaError::BufferLengthMismatch {
+                expected: count * expected_bytes,
+                actual: output.stdout.len(),
+            });
+        }
+
+        let pts_slice = probe.pts_index.as_slice();
+        let color_info = probe.yuv_color_info();
+        let mut decoded = Vec::with_capacity(actual_frames);
+        for (i, chunk) in output.stdout.chunks_exact(expected_bytes).enumerate() {
+            let frame_idx = start_frame_index + i;
+            let pts = pts_slice[frame_idx];
+            let frame = Nv12Frame::from_contiguous(
+                decode_w,
+                decode_h,
+                pts,
+                chunk,
+                color_info,
+                content_uv_rect,
+            )?;
+            decoded.push((frame_idx, DecodedVideoFrame::Nv12(frame)));
+        }
+        Ok(decoded)
     }
 
     /// Decodes a window of frames into `(width, height)` using `fit`.
@@ -1745,6 +1970,11 @@ struct FfprobeStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
     pix_fmt: Option<String>,
+    color_space: Option<String>,
+    color_transfer: Option<String>,
+    color_primaries: Option<String>,
+    color_range: Option<String>,
+    chroma_location: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     time_base: Option<String>,
@@ -1762,6 +1992,67 @@ struct FfprobeFrame {
     pts: Option<i64>,
     best_effort_timestamp: Option<i64>,
     pts_time: Option<String>,
+}
+
+/// Computes the even-aligned inner `(width, height)` and GPU `content_uv_rect`
+/// (`[u_min, v_min, u_max, v_max]`) for [`SourceFit::Contain`] without CPU RGBA padding.
+pub fn compute_contain_layout(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (u32, u32, [f32; 4]) {
+    if src_w == 0 || src_h == 0 || dst_w < 2 || dst_h < 2 {
+        return (dst_w, dst_h, [0.0, 0.0, 1.0, 1.0]);
+    }
+    let (inner_w, inner_h) = if (src_w as u64) * (dst_h as u64) >= (dst_w as u64) * (src_h as u64) {
+        let w = (dst_w / 2) * 2;
+        let scaled_h = ((w as f64) * (src_h as f64) / (src_w as f64)).round() as u32;
+        let even_h = ((scaled_h / 2) * 2).clamp(2, (dst_h / 2) * 2);
+        (w.max(2), even_h)
+    } else {
+        let h = (dst_h / 2) * 2;
+        let scaled_w = ((h as f64) * (src_w as f64) / (src_h as f64)).round() as u32;
+        let even_w = ((scaled_w / 2) * 2).clamp(2, (dst_w / 2) * 2);
+        (even_w, h.max(2))
+    };
+    let pad_x = (dst_w.saturating_sub(inner_w)) as f32 * 0.5;
+    let pad_y = (dst_h.saturating_sub(inner_h)) as f32 * 0.5;
+    let inv_w = 1.0 / (dst_w as f32);
+    let inv_h = 1.0 / (dst_h as f32);
+    let rect = [
+        pad_x * inv_w,
+        pad_y * inv_h,
+        (pad_x + inner_w as f32) * inv_w,
+        (pad_y + inner_h as f32) * inv_h,
+    ];
+    (inner_w, inner_h, rect)
+}
+
+pub(crate) fn append_nv12_fitted_output(
+    cmd: &mut Command,
+    src_dims: Option<(u32, u32)>,
+    dst_w: u32,
+    dst_h: u32,
+    fit: SourceFit,
+) -> (u32, u32, [f32; 4]) {
+    match fit {
+        SourceFit::Stretch => {
+            cmd.arg("-s").arg(format!("{dst_w}x{dst_h}"));
+            (dst_w, dst_h, [0.0, 0.0, 1.0, 1.0])
+        }
+        SourceFit::Cover => {
+            cmd.arg("-vf").arg(format!(
+                "scale={dst_w}:{dst_h}:force_original_aspect_ratio=increase:force_divisible_by=2,crop={dst_w}:{dst_h}:(in_w-{dst_w})/2:(in_h-{dst_h})/2"
+            ));
+            (dst_w, dst_h, [0.0, 0.0, 1.0, 1.0])
+        }
+        SourceFit::Contain => {
+            if let Some((sw, sh)) = src_dims {
+                let (inner_w, inner_h, rect) = compute_contain_layout(sw, sh, dst_w, dst_h);
+                cmd.arg("-vf").arg(format!("scale={inner_w}:{inner_h}"));
+                (inner_w, inner_h, rect)
+            } else {
+                cmd.arg("-s").arg(format!("{dst_w}x{dst_h}"));
+                (dst_w, dst_h, [0.0, 0.0, 1.0, 1.0])
+            }
+        }
+    }
 }
 
 pub(crate) fn append_fitted_output(cmd: &mut Command, width: u32, height: u32, fit: SourceFit) {

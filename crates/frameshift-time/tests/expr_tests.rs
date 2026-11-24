@@ -6,6 +6,10 @@ fn sample_ctx() -> ExprContext {
         output_tick: 1_058_400_000,
         beat_phase: 0.25,
         audio_rms: 0.8,
+        audio_sub: 0.9,
+        audio_mid: 0.6,
+        audio_high: 0.3,
+        downbeat_phase: 0.125,
         event_delta_sec: -0.5,
         progress: 0.5,
     }
@@ -19,10 +23,19 @@ fn safe_expr_evaluates_arithmetic_precedence_unary_and_variables() {
     assert!((expr.eval_default(&ctx).unwrap() - 9.0).abs() < 1e-12);
 
     let vars = SafeExpr::parse(
-        "t_sec + beat_phase * 2.0 + audio_rms - abs(event_delta_sec) + progress + output_tick * 1e-9",
+        "t_sec + beat_phase * 2.0 + audio_rms + audio_sub * 0.5 + audio_mid * 0.25 + audio_high + downbeat_phase - abs(event_delta_sec) + progress + output_tick * 1e-9",
     )
     .unwrap();
-    let expected = 1.5 + 0.25 * 2.0 + 0.8 - 0.5 + 0.5 + (1_058_400_000.0 * 1e-9);
+    let expected = 1.5
+        + 0.25 * 2.0
+        + 0.8
+        + 0.9 * 0.5
+        + 0.6 * 0.25
+        + 0.3
+        + 0.125
+        - 0.5
+        + 0.5
+        + (1_058_400_000.0 * 1e-9);
     assert!((vars.eval_default(&ctx).unwrap() - expected).abs() < 1e-12);
 }
 
@@ -63,9 +76,9 @@ fn safe_expr_rejects_errors_deterministically_without_panicking() {
     let div_zero = SafeExpr::parse("1.0 / (progress - 0.5)").unwrap();
     assert_eq!(div_zero.eval_default(&ctx), Err(ExprError::DivisionByZero));
 
-    // NaN from fractional power of negative base
+    // Fractional power of negative base is NaN-protected (returns 0.0)
     let neg_sqrt = SafeExpr::parse("pow(-1.0, 0.5)").unwrap();
-    assert_eq!(neg_sqrt.eval_default(&ctx), Err(ExprError::NonFiniteValue));
+    assert_eq!(neg_sqrt.eval_default(&ctx).unwrap(), 0.0);
 
     // Infinity from overflow
     let inf_expr = SafeExpr::parse("pow(10.0, 400.0)").unwrap();
@@ -107,8 +120,8 @@ fn safe_expr_rejects_errors_deterministically_without_panicking() {
         Err(ExprError::UnknownIdentifier("unknown_var".into()))
     );
     assert_eq!(
-        SafeExpr::parse("sqrt(4.0)"),
-        Err(ExprError::UnknownFunction("sqrt".into()))
+        SafeExpr::parse("unknown_fn(4.0)"),
+        Err(ExprError::UnknownFunction("unknown_fn".into()))
     );
     assert_eq!(
         SafeExpr::parse("sin(1.0, 2.0)"),
@@ -438,4 +451,135 @@ fn safe_expr_floor_fract_mod_and_cubic_bezier() {
             Err(ExprError::NonFiniteValue)
         );
     }
+}
+
+#[test]
+fn safe_expr_operators_logic_and_short_circuit_cond() {
+    let ctx = sample_ctx();
+
+    // Modulo operator matches floor-based Euclidean rule and catches /0
+    assert!((SafeExpr::parse("5.5 % 2.0").unwrap().eval_default(&ctx).unwrap() - 1.5).abs() < 1e-12);
+    assert!((SafeExpr::parse("-0.25 % 1.0").unwrap().eval_default(&ctx).unwrap() - 0.75).abs() < 1e-12);
+    assert_eq!(
+        SafeExpr::parse("1.0 % 0.0").unwrap().eval_default(&ctx),
+        Err(ExprError::DivisionByZero)
+    );
+
+    // Comparisons and precedence: arithmetic before cmp, cmp before eq, eq before &&, && before ||
+    assert_eq!(SafeExpr::parse("1.0 + 2.0 < 4.0").unwrap().eval_default(&ctx).unwrap(), 1.0);
+    assert_eq!(SafeExpr::parse("3.0 <= 3.0").unwrap().eval_default(&ctx).unwrap(), 1.0);
+    assert_eq!(SafeExpr::parse("3.0 > 3.0").unwrap().eval_default(&ctx).unwrap(), 0.0);
+    assert_eq!(SafeExpr::parse("4.0 >= 3.0").unwrap().eval_default(&ctx).unwrap(), 1.0);
+    assert_eq!(SafeExpr::parse("1.0 + 1.0 == 2.0").unwrap().eval_default(&ctx).unwrap(), 1.0);
+    assert_eq!(SafeExpr::parse("1.0 != 2.0").unwrap().eval_default(&ctx).unwrap(), 1.0);
+    assert_eq!(SafeExpr::parse("1.0 == 1.0 || 0.0 && 1.0").unwrap().eval_default(&ctx).unwrap(), 1.0);
+    assert_eq!(SafeExpr::parse("!0.0").unwrap().eval_default(&ctx).unwrap(), 1.0);
+    assert_eq!(SafeExpr::parse("!2.5").unwrap().eval_default(&ctx).unwrap(), 0.0);
+    assert_eq!(SafeExpr::parse("!(1.0 == 2.0)").unwrap().eval_default(&ctx).unwrap(), 1.0);
+
+    // Short-circuit &&, ||, if(), select() avoid division by zero and skip branch fuel
+    let sc_and = SafeExpr::parse("0.0 && (1.0 / 0.0 > 0.0)").unwrap();
+    assert_eq!(sc_and.eval(&ctx, 2).unwrap(), 0.0);
+
+    let sc_or = SafeExpr::parse("1.0 || (1.0 / 0.0 > 0.0)").unwrap();
+    assert_eq!(sc_or.eval(&ctx, 2).unwrap(), 1.0);
+
+    let sc_if = SafeExpr::parse("if(t_sec > 10.0, 1.0 / 0.0, 42.0)").unwrap();
+    assert_eq!(sc_if.eval_default(&ctx).unwrap(), 42.0);
+
+    let sc_select = SafeExpr::parse("select(t_sec > 0.0, t_sec * 2.0, 1.0 / 0.0)").unwrap();
+    assert!((sc_select.eval_default(&ctx).unwrap() - 3.0).abs() < 1e-12);
+
+    // Arity and malformed operator rejections
+    assert_eq!(
+        SafeExpr::parse("if(1.0, 2.0)"),
+        Err(ExprError::InvalidArity {
+            func: "if".into(),
+            expected: 3,
+            actual: 2,
+        })
+    );
+    assert!(matches!(SafeExpr::parse("1.0 = 2.0"), Err(ExprError::SyntaxError(_))));
+    assert!(matches!(SafeExpr::parse("1.0 & 2.0"), Err(ExprError::SyntaxError(_))));
+    assert!(matches!(SafeExpr::parse("1.0 | 2.0"), Err(ExprError::SyntaxError(_))));
+}
+
+#[test]
+fn safe_expr_ceil_sqrt_log_mix_pow_spring_and_wiggle() {
+    let ctx = sample_ctx();
+
+    assert_eq!(SafeExpr::parse("ceil(1.1)").unwrap().eval_default(&ctx).unwrap(), 2.0);
+    assert_eq!(SafeExpr::parse("ceil(-1.1)").unwrap().eval_default(&ctx).unwrap(), -1.0);
+
+    assert_eq!(SafeExpr::parse("sqrt(9.0)").unwrap().eval_default(&ctx).unwrap(), 3.0);
+    assert_eq!(SafeExpr::parse("sqrt(-5.0)").unwrap().eval_default(&ctx).unwrap(), 0.0);
+
+    assert!((SafeExpr::parse("log(1.0)").unwrap().eval_default(&ctx).unwrap()).abs() < 1e-12);
+    let log_clamped = SafeExpr::parse("log(-3.0)").unwrap().eval_default(&ctx).unwrap();
+    assert!((log_clamped - 1e-12_f64.ln()).abs() < 1e-12);
+
+    assert!((SafeExpr::parse("mix(10.0, 20.0, 0.25)").unwrap().eval_default(&ctx).unwrap() - 12.5).abs() < 1e-12);
+    assert_eq!(SafeExpr::parse("pow(-2.0, 3.0)").unwrap().eval_default(&ctx).unwrap(), -8.0);
+    assert_eq!(SafeExpr::parse("pow(-2.0, 0.5)").unwrap().eval_default(&ctx).unwrap(), 0.0);
+
+    // Analytical damped spring step response: 0 for t<=0, overshoot for zeta<1, settles to 1.0
+    assert_eq!(
+        SafeExpr::parse("spring(-0.1, 200.0, 0.4)").unwrap().eval_default(&ctx).unwrap(),
+        0.0
+    );
+    assert_eq!(
+        SafeExpr::parse("spring(0.0, 200.0, 0.4)").unwrap().eval_default(&ctx).unwrap(),
+        0.0
+    );
+    let underdamped_peak = SafeExpr::parse("spring(0.25, 250.0, 0.35)").unwrap().eval_default(&ctx).unwrap();
+    assert!(underdamped_peak > 1.0, "underdamped spring should overshoot 1.0, got {underdamped_peak}");
+    let critical = SafeExpr::parse("spring(0.5, 100.0, 1.0)").unwrap().eval_default(&ctx).unwrap();
+    assert!(critical > 0.9 && critical <= 1.0, "critical damping should stay <= 1.0, got {critical}");
+    let overdamped = SafeExpr::parse("spring(0.5, 100.0, 2.0)").unwrap().eval_default(&ctx).unwrap();
+    assert!(overdamped > 0.5 && overdamped < 1.0, "overdamped should approach 1.0 monotonically, got {overdamped}");
+    let settled = SafeExpr::parse("spring(40.0, 100.0, 0.8)").unwrap().eval_default(&ctx).unwrap();
+    assert!((settled - 1.0).abs() < 1e-12);
+
+    // Fuel check for spring (Call=1 + 3 args + 3 extra = 7)
+    let sp = SafeExpr::parse("spring(0.5, 100.0, 0.5)").unwrap();
+    assert_eq!(sp.eval(&ctx, 6), Err(ExprError::FuelExhausted { max_fuel: 6 }));
+    assert!(sp.eval(&ctx, 7).is_ok());
+
+    // Wiggle: deterministic, seek-independent, seed-sensitive, bounded in [-amp, amp]
+    let w_expr = SafeExpr::parse("wiggle(4.0, 0.75, 42.0)").unwrap();
+    let w_other_seed = SafeExpr::parse("wiggle(4.0, 0.75, 99.0)").unwrap();
+    let wiggle_ctx = ExprContext {
+        t_sec: 1.37,
+        ..ctx
+    };
+    let v1 = w_expr.eval_default(&wiggle_ctx).unwrap();
+    let v2 = w_expr.eval_default(&wiggle_ctx).unwrap();
+    assert_eq!(v1.to_bits(), v2.to_bits());
+    assert_ne!(v1, w_other_seed.eval_default(&wiggle_ctx).unwrap());
+
+    for step in 0..200 {
+        let seek_ctx = ExprContext {
+            t_sec: step as f64 * 0.037,
+            ..ctx
+        };
+        let val = w_expr.eval_default(&seek_ctx).unwrap();
+        assert!(val.abs() <= 0.75 + 1e-12, "wiggle exceeded amp: {val}");
+    }
+
+    assert_eq!(
+        SafeExpr::parse("wiggle(0.0, 1.0, 1.0)").unwrap().eval_default(&ctx).unwrap(),
+        0.0
+    );
+    assert_eq!(
+        SafeExpr::parse("wiggle(4.0, 0.0, 1.0)").unwrap().eval_default(&ctx).unwrap(),
+        0.0
+    );
+
+    let nan_ctx = ExprContext {
+        t_sec: f64::NAN,
+        ..ctx
+    };
+    assert_eq!(w_expr.eval_default(&nan_ctx), Err(ExprError::NonFiniteValue));
+    assert_eq!(w_expr.eval(&ctx, 6), Err(ExprError::FuelExhausted { max_fuel: 6 }));
+    assert!(w_expr.eval(&ctx, 7).is_ok());
 }

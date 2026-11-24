@@ -1,5 +1,7 @@
 use bytemuck::{Pod, Zeroable};
-use frameshift_schema::{BlendMode, MatteMode, SampleFilter};
+use frameshift_schema::{
+    BlendMode, DisplacementMode, DisplacementWrap, EchoOperator, MatteMode, SampleFilter,
+};
 
 /// Uniform buffer for `transform.wgsl` (64 bytes, 16-byte aligned).
 #[repr(C)]
@@ -433,6 +435,80 @@ impl BlurMoCurvesUniform {
     }
 }
 
+/// Uniform buffer for `fx_optical_flow_step.wgsl` (32 bytes, 16-byte aligned).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct OpticalFlowStepUniform {
+    /// `xy` = 1.0 / level_resolution, `z` = flow_smoothness, `w` = sensitivity.
+    pub texel_and_params: [f32; 4],
+    /// `x` = max_flow_px, `y` = max_step_px, `z` = invert_sign (0/1), `w` = has_coarse (0/1).
+    pub limits_and_flags: [f32; 4],
+}
+
+impl OpticalFlowStepUniform {
+    pub fn new(
+        level_width: u32,
+        level_height: u32,
+        flow_smoothness: f32,
+        sensitivity: f32,
+        max_flow_px: f32,
+        max_step_px: f32,
+        has_coarse: bool,
+    ) -> Self {
+        Self {
+            texel_and_params: [
+                1.0 / level_width.max(1) as f32,
+                1.0 / level_height.max(1) as f32,
+                flow_smoothness.clamp(0.0, 1.0),
+                sensitivity.clamp(0.001, 2.0),
+            ],
+            limits_and_flags: [
+                max_flow_px.max(1.0),
+                max_step_px.max(0.5),
+                0.0,
+                if has_coarse { 1.0 } else { 0.0 },
+            ],
+        }
+    }
+}
+
+/// Uniform buffer for `fx_optical_flow_blur.wgsl` (32 bytes, 16-byte aligned).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct OpticalFlowBlurUniform {
+    /// `xy` = resolution, `z` = shutter_amount, `w` = max_blur_px.
+    pub res_and_shutter: [f32; 4],
+    /// `x` = samples, `y` = visualize_flow (0/1), `z` = flow_sign (1/-1), `w` = reserved.
+    pub flags: [f32; 4],
+}
+
+impl OpticalFlowBlurUniform {
+    pub fn new(
+        width: u32,
+        height: u32,
+        shutter_amount: f32,
+        max_blur_px: f32,
+        samples: u32,
+        visualize_flow: bool,
+        invert_flow_sign: bool,
+    ) -> Self {
+        Self {
+            res_and_shutter: [
+                width.max(1) as f32,
+                height.max(1) as f32,
+                shutter_amount.max(0.0),
+                max_blur_px.max(0.0),
+            ],
+            flags: [
+                samples.clamp(1, 64) as f32,
+                if visualize_flow { 1.0 } else { 0.0 },
+                if invert_flow_sign { -1.0 } else { 1.0 },
+                0.0,
+            ],
+        }
+    }
+}
+
 /// Uniform buffer for `fx_anime_impact_frame.wgsl` (48 bytes, 16-byte aligned).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
@@ -654,6 +730,22 @@ impl AnimeSharpenUniform {
             sharpen_amount,
             anti_ringing,
             _pad: [0.0; 3],
+        }
+    }
+}
+
+/// Uniform buffer for `fx_anime4k_*.wgsl` (16 bytes, 16-byte aligned).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct Anime4KUniform {
+    /// `x = texel_x`, `y = texel_y`, `z = strength (0..=2)`, `w = scale_flag (1.0 or 2.0)`.
+    pub params: [f32; 4],
+}
+
+impl Anime4KUniform {
+    pub fn new(texel_size: [f32; 2], strength: f32, scale_flag: f32) -> Self {
+        Self {
+            params: [texel_size[0], texel_size[1], strength, scale_flag],
         }
     }
 }
@@ -1229,6 +1321,7 @@ const _: () = {
     assert!(std::mem::size_of::<HalftoneGlowUniform>() == 48);
     assert!(std::mem::size_of::<BloomPassUniform>() == 64);
     assert!(std::mem::size_of::<AnimeSharpenUniform>() == 32);
+    assert!(std::mem::size_of::<Anime4KUniform>() == 16);
     assert!(std::mem::size_of::<FilmOpticsUniform>() == 48);
     assert!(std::mem::size_of::<FilmHalationUniform>() == 32);
     assert!(std::mem::size_of::<BackdropScrimUniform>() == 64);
@@ -1248,4 +1341,276 @@ const _: () = {
     assert!(std::mem::size_of::<SlugUniform>() == 160);
     assert!(std::mem::size_of::<Text2DFxUniform>() == 112);
     assert!(std::mem::size_of::<Text2DJfaUniform>() == 16);
+    assert!(std::mem::size_of::<Scene3DDepthSeedUniform>() == 32);
+    assert!(std::mem::size_of::<DisplacementMapUniform>() == 48);
+    assert!(std::mem::size_of::<FrameEchoUniform>() == 32);
+    assert!(std::mem::size_of::<ShapeMaskFeatherUniform>() == 32);
+    assert!(std::mem::size_of::<YuvToLinearUniform>() == 80);
 };
+
+/// Uniform buffer for `fx_displacement_map.wgsl` (48 bytes, 16-byte aligned).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct DisplacementMapUniform {
+    /// `x` = channel_mode (`0=Rg, 1=Luma, 2=Polar, 3=SignedRg`),
+    /// `y` = edge_mode (`0=Clamp, 1=Mirror, 2=Wrap, 3=Transparent`), `zw` = reserved.
+    pub modes: [u32; 4],
+    /// `x` = scale_x, `y` = scale_y, `z` = neutral_level, `w` = angle_rad.
+    pub scale_bias: [f32; 4],
+    /// `x` = chromatic_split, `y` = opacity, `z` = aspect_ratio, `w` = reserved.
+    pub fx_params: [f32; 4],
+}
+
+impl DisplacementMapUniform {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        channel_mode: DisplacementMode,
+        edge_mode: DisplacementWrap,
+        scale_x: f32,
+        scale_y: f32,
+        neutral_level: f32,
+        angle_rad: f32,
+        chromatic_split: f32,
+        opacity: f32,
+        aspect_ratio: f32,
+    ) -> Self {
+        let mode_u32 = match channel_mode {
+            DisplacementMode::Rg => 0,
+            DisplacementMode::Luma => 1,
+            DisplacementMode::Polar => 2,
+            DisplacementMode::SignedRg => 3,
+        };
+        let wrap_u32 = match edge_mode {
+            DisplacementWrap::Clamp => 0,
+            DisplacementWrap::Mirror => 1,
+            DisplacementWrap::Wrap => 2,
+            DisplacementWrap::Transparent => 3,
+        };
+        Self {
+            modes: [mode_u32, wrap_u32, 0, 0],
+            scale_bias: [
+                if scale_x.is_finite() { scale_x } else { 0.0 },
+                if scale_y.is_finite() { scale_y } else { 0.0 },
+                if neutral_level.is_finite() {
+                    neutral_level
+                } else {
+                    0.5
+                },
+                if angle_rad.is_finite() { angle_rad } else { 0.0 },
+            ],
+            fx_params: [
+                if chromatic_split.is_finite() {
+                    chromatic_split.clamp(-2.0, 2.0)
+                } else {
+                    0.0
+                },
+                if opacity.is_finite() {
+                    opacity.clamp(0.0, 1.0)
+                } else {
+                    1.0
+                },
+                if aspect_ratio.is_finite() && aspect_ratio > 1e-4 {
+                    aspect_ratio
+                } else {
+                    1.0
+                },
+                0.0,
+            ],
+        }
+    }
+}
+
+/// Uniform buffer for `fx_frame_echo.wgsl` (32 bytes, 16-byte aligned).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct FrameEchoUniform {
+    /// `xyz` = linear RGB tint multiplier, `w` = intensity/decay weight.
+    pub tint_weight: [f32; 4],
+    /// `x` = operator (`0=Normal/SourceOver, 1=Add, 2=Screen, 3=Maximum`),
+    /// `y` = is_first (`0|1`), `z` = hue_rad, `w` = reserved.
+    pub params: [f32; 4],
+}
+
+impl FrameEchoUniform {
+    pub fn new(
+        tint_rgb: [f32; 3],
+        weight: f32,
+        operator: EchoOperator,
+        is_first: bool,
+        hue_deg: f32,
+    ) -> Self {
+        let op_f32 = match operator {
+            EchoOperator::CompositeUnder | EchoOperator::CompositeOver => 0.0,
+            EchoOperator::Add => 1.0,
+            EchoOperator::Screen => 2.0,
+            EchoOperator::Maximum => 3.0,
+        };
+        let hue_rad = if hue_deg.is_finite() {
+            hue_deg.to_radians()
+        } else {
+            0.0
+        };
+        Self {
+            tint_weight: [
+                if tint_rgb[0].is_finite() {
+                    tint_rgb[0].max(0.0)
+                } else {
+                    1.0
+                },
+                if tint_rgb[1].is_finite() {
+                    tint_rgb[1].max(0.0)
+                } else {
+                    1.0
+                },
+                if tint_rgb[2].is_finite() {
+                    tint_rgb[2].max(0.0)
+                } else {
+                    1.0
+                },
+                if weight.is_finite() {
+                    weight.max(0.0)
+                } else {
+                    0.0
+                },
+            ],
+            params: [op_f32, if is_first { 1.0 } else { 0.0 }, hue_rad, 0.0],
+        }
+    }
+}
+
+/// Uniform buffer for `fx_shape_mask_feather.wgsl` (32 bytes, 16-byte aligned).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct ShapeMaskFeatherUniform {
+    /// `xy` = blur direction (`(1,0)` or `(0,1)`), `z` = radius_px, `w` = apply_post (`0|1`).
+    pub dir_radius: [f32; 4],
+    /// `x` = invert (`0|1`), `y` = opacity `[0..1]`, `zw` = texel_size (`0=auto`).
+    pub post_texel: [f32; 4],
+}
+
+impl ShapeMaskFeatherUniform {
+    pub fn new(
+        dir: [f32; 2],
+        radius_px: f32,
+        apply_post: bool,
+        invert: bool,
+        opacity: f32,
+        texel_size: [f32; 2],
+    ) -> Self {
+        Self {
+            dir_radius: [
+                dir[0],
+                dir[1],
+                if radius_px.is_finite() {
+                    radius_px.max(0.0)
+                } else {
+                    0.0
+                },
+                if apply_post { 1.0 } else { 0.0 },
+            ],
+            post_texel: [
+                if invert { 1.0 } else { 0.0 },
+                if opacity.is_finite() {
+                    opacity.clamp(0.0, 1.0)
+                } else {
+                    1.0
+                },
+                texel_size[0],
+                texel_size[1],
+            ],
+        }
+    }
+}
+
+/// Uniform buffer for `yuv_to_linear.wgsl` (80 bytes, 16-byte aligned).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct YuvToLinearUniform {
+    /// `x` = matrix (`0=BT709, 1=BT601, 2=BT2020`), `y` = range (`0=Limited, 1=Full, 2=Custom`),
+    /// `z` = chroma_siting (`0=Left, 1=Center, 2=TopLeft, 3=Custom`), `w` = transfer (`0=Linear, 1=sRGB`).
+    pub color_modes: [u32; 4],
+    /// `x` = use_alpha_tex (`0|1`), `y` = src_width, `z` = src_height, `w` = reserved.
+    pub alpha_dims: [u32; 4],
+    /// `SourceFit::Contain` letterbox rectangle `[u_min, v_min, u_max, v_max]`.
+    pub content_uv_rect: [f32; 4],
+    /// Custom range/chroma siting offsets (`xy` = custom bias, `zw` = custom chroma dx/dy).
+    pub offsets_chroma: [f32; 4],
+    /// Reserved padding (zeroed).
+    pub reserved: [f32; 4],
+}
+
+impl YuvToLinearUniform {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        matrix_mode: u32,
+        range_mode: u32,
+        chroma_siting: u32,
+        transfer_mode: u32,
+        use_alpha_tex: bool,
+        src_width: u32,
+        src_height: u32,
+        content_uv_rect: [f32; 4],
+    ) -> Self {
+        let valid_rect = content_uv_rect.iter().all(|v| v.is_finite())
+            && content_uv_rect[2] > content_uv_rect[0]
+            && content_uv_rect[3] > content_uv_rect[1];
+        Self {
+            color_modes: [matrix_mode, range_mode, chroma_siting, transfer_mode],
+            alpha_dims: [u32::from(use_alpha_tex), src_width, src_height, 0],
+            content_uv_rect: if valid_rect {
+                content_uv_rect
+            } else {
+                [0.0, 0.0, 1.0, 1.0]
+            },
+            offsets_chroma: [0.0; 4],
+            reserved: [0.0; 4],
+        }
+    }
+}
+
+/// Uniform buffer for `scene3d_depth_seed.wgsl` (32 bytes, 16-byte aligned).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct Scene3DDepthSeedUniform {
+    /// `x = cam_near, y = cam_far, z = plate_near_z, w = plate_far_z`.
+    pub ranges: [f32; 4],
+    /// `x = invert (0/1), y = depth_gamma, z = disparity_mode (1=inverse-Z, 0=linear), w = decode_mode (0=luma/R, 1=RG16)`.
+    pub flags: [f32; 4],
+}
+
+impl Scene3DDepthSeedUniform {
+    pub fn new(cam_near: f32, cam_far: f32, plate_near_z: f32, plate_far_z: f32, invert: bool) -> Self {
+        Self::new_ex(
+            cam_near,
+            cam_far,
+            plate_near_z,
+            plate_far_z,
+            invert,
+            1.0,
+            true,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_ex(
+        cam_near: f32,
+        cam_far: f32,
+        plate_near_z: f32,
+        plate_far_z: f32,
+        invert: bool,
+        depth_gamma: f32,
+        disparity_mode: bool,
+        rg16_packed: bool,
+    ) -> Self {
+        Self {
+            ranges: [cam_near, cam_far, plate_near_z, plate_far_z],
+            flags: [
+                if invert { 1.0 } else { 0.0 },
+                depth_gamma.clamp(0.05, 8.0),
+                if disparity_mode { 1.0 } else { 0.0 },
+                if rg16_packed { 1.0 } else { 0.0 },
+            ],
+        }
+    }
+}

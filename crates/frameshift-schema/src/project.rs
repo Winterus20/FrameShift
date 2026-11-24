@@ -9,7 +9,7 @@ use frameshift_time::{
     SpeedKeyframe,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// Media asset kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +266,52 @@ pub enum EventOrigin {
     Detected,
 }
 
+/// Clip boundary edge referenced by [`EventTimingConstraint::RelativeToClipEdge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipTimingEdge {
+    Start,
+    End,
+}
+
+/// Declarative timing constraint for chained/relative event anchors (ADR-0003).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventTimingConstraint {
+    /// Absolute `target_output_tick` (default for legacy/manual anchors).
+    #[default]
+    Absolute,
+    /// Relative to another event: `parent.target_output_tick + offset_ticks`.
+    RelativeToEvent {
+        parent_event_id: String,
+        #[serde(default)]
+        offset_ticks: Flicks,
+    },
+    /// Exact rational fraction of a clip's timeline span (`i128 -> i64` Flicks):
+    /// `clip.timeline_start + ((clip.timeline_end - clip.timeline_start) * fraction_num) / fraction_den + offset_ticks`.
+    RelativeToClipFraction {
+        clip_id: String,
+        fraction_num: i64,
+        fraction_den: i64,
+        #[serde(default)]
+        offset_ticks: Flicks,
+    },
+    /// Relative to a clip's `Start` or `End` edge plus `offset_ticks`.
+    RelativeToClipEdge {
+        clip_id: String,
+        edge: ClipTimingEdge,
+        #[serde(default)]
+        offset_ticks: Flicks,
+    },
+}
+
+impl EventTimingConstraint {
+    #[inline]
+    pub fn is_absolute(&self) -> bool {
+        matches!(self, Self::Absolute)
+    }
+}
+
 /// Semantic event anchor linking a source moment to a target output beat/drop tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventAnchorDef {
@@ -278,6 +324,8 @@ pub struct EventAnchorDef {
     pub target_output_tick: Flicks,
     #[serde(default)]
     pub origin: EventOrigin,
+    #[serde(default, skip_serializing_if = "EventTimingConstraint::is_absolute")]
+    pub timing: EventTimingConstraint,
 }
 
 /// Named render quality profile kind.
@@ -315,6 +363,24 @@ pub struct RenderProfilesDef {
     pub final_profile: RenderProfileDef,
 }
 
+/// Single dense tick-keyed keyframe on a [`KeyframeTrackDef`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TrackKeyframe {
+    pub tick: Flicks,
+    pub value: f64,
+    #[serde(default)]
+    pub easing: AnimationEasing,
+}
+
+/// Dense keyframe track targeting a bindable node parameter (e.g., 2D/planar tracker output).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyframeTrackDef {
+    pub id: String,
+    pub target_node: NodeId,
+    pub target_param: String,
+    pub keyframes: Vec<TrackKeyframe>,
+}
+
 /// Safe expression binding driving a render graph node parameter at evaluation time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParamBindingDef {
@@ -328,7 +394,7 @@ pub struct ParamBindingDef {
 /// A binding whose name is absent here is not applied, so the node keeps its
 /// authored base value. `center_u` / `center_uv_x` (and the `v` / `y` pair) are
 /// both accepted because both spellings write the same channel.
-pub(crate) fn bindable_param_names(kind: &NodeKind) -> &'static [&'static str] {
+pub fn bindable_param_names(kind: &NodeKind) -> &'static [&'static str] {
     match kind {
         NodeKind::Transform2D { .. } => &[
             "translate_x",
@@ -348,6 +414,12 @@ pub(crate) fn bindable_param_names(kind: &NodeKind) -> &'static [&'static str] {
             "z_dist",
             "rotate_deg",
             "blur_strength",
+        ],
+        NodeKind::OpticalFlowBlur { .. } => &[
+            "shutter_amount",
+            "max_blur_px",
+            "sensitivity",
+            "flow_smoothness",
         ],
         NodeKind::DepthMatte { .. } => &["near_depth", "far_depth", "feather"],
         NodeKind::ColorBasic { .. } => &["exposure", "contrast", "saturation", "flash_amount"],
@@ -455,6 +527,7 @@ pub(crate) fn bindable_param_names(kind: &NodeKind) -> &'static [&'static str] {
             "chromatic_shift",
         ],
         NodeKind::AnimeSharpen { .. } => &["line_strength", "sharpen_amount", "anti_ringing"],
+        NodeKind::Anime4K { .. } => &["strength"],
         NodeKind::FilmOptics { .. } => &[
             "lens_k1",
             "lens_k2",
@@ -629,6 +702,9 @@ pub(crate) fn bindable_param_names(kind: &NodeKind) -> &'static [&'static str] {
             "dof_blade_roundness",
             "dof_anamorphic_ratio",
             "dof_cats_eye_strength",
+            "depth_plate_near_z",
+            "depth_plate_far_z",
+            "depth_plate_gamma",
         ],
         NodeKind::BackdropScrim { .. } => &[
             "rect_center_x",
@@ -640,6 +716,21 @@ pub(crate) fn bindable_param_names(kind: &NodeKind) -> &'static [&'static str] {
             "opacity",
             "auto_contrast",
         ],
+        NodeKind::DisplacementMap { .. } => &[
+            "scale_x",
+            "scale_y",
+            "neutral_level",
+            "angle_rad",
+            "chromatic_split",
+            "opacity",
+        ],
+        NodeKind::FrameEcho { .. } => &[
+            "starting_intensity",
+            "decay",
+            "hue_shift_deg",
+            "echo_step_ticks",
+        ],
+        NodeKind::ShapeMask { .. } => &["feather_px", "expand_px", "opacity"],
         NodeKind::SourceVideo { .. }
         | NodeKind::Solid { .. }
         | NodeKind::MotionBlurShutter { .. }
@@ -726,6 +817,8 @@ pub struct Project {
     pub render_profiles: RenderProfilesDef,
     #[serde(default)]
     pub param_bindings: Vec<ParamBindingDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyframe_tracks: Vec<KeyframeTrackDef>,
     #[serde(default)]
     pub creative_decisions: Vec<CreativeDecisionRecord>,
     #[serde(default)]
@@ -947,6 +1040,7 @@ impl Project {
                 return Err(SchemaError::MissingClip(clip_id.clone()));
             }
         }
+        validate_event_constraints(&self.events, &self.timeline.clips)?;
 
         for binding in &self.param_bindings {
             let Some(node) = find_node_in_graphs(&self.graph, &binding.node_id) else {
@@ -973,6 +1067,67 @@ impl Project {
                     param_name: binding.param_name.clone(),
                     message: err.to_string(),
                 });
+            }
+        }
+
+        let mut track_ids = HashSet::new();
+        for track in &self.keyframe_tracks {
+            if track.id.trim().is_empty() {
+                return Err(SchemaError::InvalidKeyframeTrack {
+                    track_id: track.id.clone(),
+                    message: "keyframe track id must not be empty".into(),
+                });
+            }
+            if !track_ids.insert(track.id.as_str()) {
+                return Err(SchemaError::DuplicateId {
+                    entity: "keyframe_track",
+                    id: track.id.clone(),
+                });
+            }
+            let Some(node) = find_node_in_graphs(&self.graph, &track.target_node) else {
+                return Err(SchemaError::MissingNode(track.target_node.clone()));
+            };
+            let allowed = bindable_param_names(&node.kind);
+            if !allowed.contains(&track.target_param.as_str()) {
+                let allowed_list = if allowed.is_empty() {
+                    "none".to_owned()
+                } else {
+                    allowed.join(", ")
+                };
+                return Err(SchemaError::InvalidParamBinding {
+                    node_id: track.target_node.clone(),
+                    param_name: track.target_param.clone(),
+                    message: format!(
+                        "not a bindable parameter of this node kind (allowed: {allowed_list})"
+                    ),
+                });
+            }
+            if track.keyframes.is_empty() {
+                return Err(SchemaError::InvalidKeyframeTrack {
+                    track_id: track.id.clone(),
+                    message: "keyframe track must contain at least one keyframe".into(),
+                });
+            }
+            let mut prev_tick: Option<Flicks> = None;
+            for kf in &track.keyframes {
+                if !kf.value.is_finite() {
+                    return Err(SchemaError::InvalidKeyframeTrack {
+                        track_id: track.id.clone(),
+                        message: format!("keyframe value ({}) must be finite", kf.value),
+                    });
+                }
+                if let Some(pt) = prev_tick
+                    && kf.tick < pt
+                {
+                    return Err(SchemaError::InvalidKeyframeTrack {
+                        track_id: track.id.clone(),
+                        message: format!(
+                            "keyframes must be ordered by non-decreasing tick ({} < {})",
+                            kf.tick, pt
+                        ),
+                    });
+                }
+                prev_tick = Some(kf.tick);
             }
         }
 
@@ -1289,6 +1444,7 @@ impl Project {
                 source_anchor_tick: Some(Flicks(2 * sec)),
                 target_output_tick: beat_tick,
                 origin: EventOrigin::UserMarked,
+                timing: EventTimingConstraint::Absolute,
             }],
             graph: RenderGraphDef {
                 output_node: NodeId::from("motion_blur_out"),
@@ -1495,6 +1651,7 @@ impl Project {
                 expression: "clamp(0.15 + audio_rms * 0.65 + (1.0 - beat_phase) * 0.2, 0.0, 1.5)"
                     .into(),
             }],
+            keyframe_tracks: Vec::new(),
             creative_decisions: vec![CreativeDecisionRecord {
                 decision_id: "dec_golden_impact_pacing".into(),
                 approach: "Whip-chromatic transition synced to 2.5s beat drop with cyber contrast LUT and VectorText impact title".into(),
@@ -1686,6 +1843,251 @@ impl Project {
             .expect("anime_fx_showcase_preset must always be valid");
         project
     }
+
+    /// Resolves all chained/relative [`EventTimingConstraint`]s across `self.events` in
+    /// deterministic topological order, updating each dependent event's `target_output_tick`.
+    pub fn recompute_event_constraints(&mut self) -> Result<Vec<String>, SchemaError> {
+        resolve_event_constraints(&mut self.events, &self.timeline.clips)
+    }
+}
+
+#[inline]
+fn div_round_i128(num: i128, den: i128) -> i128 {
+    let q = num / den;
+    let r = num % den;
+    if r.abs() * 2 >= den {
+        q + num.signum()
+    } else {
+        q
+    }
+}
+
+/// Validates event timing constraints via Kahn topological sort and cycle detection without
+/// mutating `events`. Verifies that every non-`Absolute` event's `target_output_tick` matches
+/// its resolved integer `Flicks` value.
+pub fn validate_event_constraints(
+    events: &[EventAnchorDef],
+    clips: &[ClipDef],
+) -> Result<Vec<String>, SchemaError> {
+    let mut copy = events.to_vec();
+    let order = resolve_event_constraints(&mut copy, clips)?;
+    for (orig, resolved) in events.iter().zip(copy.iter()) {
+        if !orig.timing.is_absolute() && orig.target_output_tick != resolved.target_output_tick {
+            return Err(SchemaError::InvalidEventConstraint {
+                event_id: orig.event_id.clone(),
+                message: format!(
+                    "target_output_tick ({}) does not match resolved constraint tick ({})",
+                    orig.target_output_tick, resolved.target_output_tick
+                ),
+            });
+        }
+    }
+    Ok(order)
+}
+
+/// Resolves chained/relative [`EventTimingConstraint`]s using Kahn's topological sort and exact
+/// `i128 -> i64` Flicks arithmetic, updating `target_output_tick` on dependent events.
+/// Returns the deterministic topological order of `event_id`s.
+pub fn resolve_event_constraints(
+    events: &mut [EventAnchorDef],
+    clips: &[ClipDef],
+) -> Result<Vec<String>, SchemaError> {
+    let mut idx_by_id: BTreeMap<String, usize> = BTreeMap::new();
+    for (idx, ev) in events.iter().enumerate() {
+        if idx_by_id.insert(ev.event_id.clone(), idx).is_some() {
+            return Err(SchemaError::DuplicateId {
+                entity: "event",
+                id: ev.event_id.clone(),
+            });
+        }
+    }
+    let clips_by_id: BTreeMap<&str, &ClipDef> =
+        clips.iter().map(|c| (c.id.as_str(), c)).collect();
+
+    let mut indegree: BTreeMap<String, usize> =
+        events.iter().map(|e| (e.event_id.clone(), 0usize)).collect();
+    let mut dependents: BTreeMap<String, Vec<String>> = events
+        .iter()
+        .map(|e| (e.event_id.clone(), Vec::new()))
+        .collect();
+    let mut parent_of: BTreeMap<String, String> = BTreeMap::new();
+
+    for ev in events.iter() {
+        match &ev.timing {
+            EventTimingConstraint::Absolute => {}
+            EventTimingConstraint::RelativeToEvent { parent_event_id, .. } => {
+                if !idx_by_id.contains_key(parent_event_id) {
+                    return Err(SchemaError::MissingEvent(parent_event_id.clone()));
+                }
+                *indegree.get_mut(&ev.event_id).unwrap() += 1;
+                dependents
+                    .get_mut(parent_event_id)
+                    .unwrap()
+                    .push(ev.event_id.clone());
+                parent_of.insert(ev.event_id.clone(), parent_event_id.clone());
+            }
+            EventTimingConstraint::RelativeToClipFraction {
+                clip_id,
+                fraction_den,
+                ..
+            } => {
+                if *fraction_den <= 0 {
+                    return Err(SchemaError::InvalidEventConstraint {
+                        event_id: ev.event_id.clone(),
+                        message: format!(
+                            "fraction_den must be > 0, found {fraction_den}"
+                        ),
+                    });
+                }
+                if !clips_by_id.contains_key(clip_id.as_str()) {
+                    return Err(SchemaError::MissingClip(clip_id.clone()));
+                }
+            }
+            EventTimingConstraint::RelativeToClipEdge { clip_id, .. } => {
+                if !clips_by_id.contains_key(clip_id.as_str()) {
+                    return Err(SchemaError::MissingClip(clip_id.clone()));
+                }
+            }
+        }
+    }
+
+    let mut ready: BTreeSet<String> = indegree
+        .iter()
+        .filter_map(|(id, &deg)| if deg == 0 { Some(id.clone()) } else { None })
+        .collect();
+
+    let mut order = Vec::with_capacity(events.len());
+    while let Some(curr) = ready.pop_first() {
+        order.push(curr.clone());
+        for dep in &dependents[&curr] {
+            let deg = indegree.get_mut(dep).unwrap();
+            *deg -= 1;
+            if *deg == 0 {
+                ready.insert(dep.clone());
+            }
+        }
+    }
+
+    if order.len() != events.len() {
+        let cycle = extract_event_cycle(&parent_of);
+        return Err(SchemaError::CyclicEventConstraint { cycle });
+    }
+
+    for ev_id in &order {
+        let idx = idx_by_id[ev_id];
+        let constraint = events[idx].timing.clone();
+        let resolved = match constraint {
+            EventTimingConstraint::Absolute => events[idx].target_output_tick,
+            EventTimingConstraint::RelativeToEvent {
+                parent_event_id,
+                offset_ticks,
+            } => {
+                let p_idx = idx_by_id[&parent_event_id];
+                let parent_tick = events[p_idx].target_output_tick;
+                parent_tick.checked_add(offset_ticks).map_err(|_| {
+                    SchemaError::EventTimingOverflow {
+                        event_id: ev_id.clone(),
+                        message: format!(
+                            "overflow adding offset {} to parent '{}' tick {}",
+                            offset_ticks, parent_event_id, parent_tick
+                        ),
+                    }
+                })?
+            }
+            EventTimingConstraint::RelativeToClipFraction {
+                clip_id,
+                fraction_num,
+                fraction_den,
+                offset_ticks,
+            } => {
+                let clip = clips_by_id[clip_id.as_str()];
+                let span = (clip.timeline_end.0 as i128) - (clip.timeline_start.0 as i128);
+                let num = span.checked_mul(fraction_num as i128).ok_or_else(|| {
+                    SchemaError::EventTimingOverflow {
+                        event_id: ev_id.clone(),
+                        message: "clip fraction numerator overflow".into(),
+                    }
+                })?;
+                let scaled = div_round_i128(num, fraction_den as i128);
+                let resolved_i128 = (clip.timeline_start.0 as i128)
+                    .checked_add(scaled)
+                    .and_then(|v| v.checked_add(offset_ticks.0 as i128))
+                    .ok_or_else(|| SchemaError::EventTimingOverflow {
+                        event_id: ev_id.clone(),
+                        message: "resolved clip fraction tick overflow".into(),
+                    })?;
+                i64::try_from(resolved_i128)
+                    .map(Flicks)
+                    .map_err(|_| SchemaError::EventTimingOverflow {
+                        event_id: ev_id.clone(),
+                        message: "resolved clip fraction exceeds i64 Flicks".into(),
+                    })?
+            }
+            EventTimingConstraint::RelativeToClipEdge {
+                clip_id,
+                edge,
+                offset_ticks,
+            } => {
+                let clip = clips_by_id[clip_id.as_str()];
+                let base = match edge {
+                    ClipTimingEdge::Start => clip.timeline_start,
+                    ClipTimingEdge::End => clip.timeline_end,
+                };
+                base.checked_add(offset_ticks).map_err(|_| {
+                    SchemaError::EventTimingOverflow {
+                        event_id: ev_id.clone(),
+                        message: format!(
+                            "overflow adding offset {} to clip '{}' edge tick {}",
+                            offset_ticks, clip_id, base
+                        ),
+                    }
+                })?
+            }
+        };
+        events[idx].target_output_tick = resolved;
+    }
+
+    Ok(order)
+}
+
+fn extract_event_cycle(parent_of: &BTreeMap<String, String>) -> Vec<String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Color {
+        White,
+        Gray,
+        Black,
+    }
+    let mut color: BTreeMap<String, Color> = parent_of
+        .keys()
+        .map(|k| (k.clone(), Color::White))
+        .collect();
+    for start in parent_of.keys() {
+        if color.get(start).copied() != Some(Color::White) {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut curr = Some(start.clone());
+        while let Some(id) = curr {
+            match color.get(&id).copied().unwrap_or(Color::White) {
+                Color::Gray => {
+                    let pos = path.iter().position(|p| p == &id).unwrap_or(0);
+                    let mut cycle = path[pos..].to_vec();
+                    cycle.push(id);
+                    return cycle;
+                }
+                Color::Black => break,
+                Color::White => {
+                    color.insert(id.clone(), Color::Gray);
+                    path.push(id.clone());
+                    curr = parent_of.get(&id).cloned();
+                }
+            }
+        }
+        for visited in path {
+            color.insert(visited, Color::Black);
+        }
+    }
+    Vec::new()
 }
 
 #[cfg(test)]

@@ -50,13 +50,15 @@ fn engine_renders_single_frame_with_cache_telemetry_and_seek_determinism() {
         .render_frame_at(&project, RenderProfileKind::Draft, drop_tick)
         .expect("first draft frame");
     let first_tel = engine.cache_telemetry();
+    let first_smart = engine.smart_cache_stats();
     assert!(first_tel.misses >= 1);
 
     let f2 = engine
         .render_frame_at(&project, RenderProfileKind::Draft, drop_tick)
         .expect("cached draft frame");
     let second_tel = engine.cache_telemetry();
-    assert!(second_tel.hits > first_tel.hits);
+    let second_smart = engine.smart_cache_stats();
+    assert!(second_tel.hits + second_smart.gpu_hits > first_tel.hits + first_smart.gpu_hits);
     assert_eq!(f1.fnv1a_hash64(), f2.fnv1a_hash64());
     assert_eq!(f1.data, f2.data);
 

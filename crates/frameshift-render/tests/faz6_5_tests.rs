@@ -458,6 +458,7 @@ fn wgsl_slug_supports_tategaki_japanese_and_animated_variable_font() {
             param_name: "var_wght".into(),
             expression: "300.0 + 400.0 * clamp(t_sec, 0.0, 1.0)".into(),
         }],
+        keyframe_tracks: vec![],
         creative_decisions: vec![],
         preferences: vec![],
         proxy_config: Default::default(),

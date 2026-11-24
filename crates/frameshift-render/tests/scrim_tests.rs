@@ -333,6 +333,7 @@ fn scrim_over_a_transparent_scene3d_backdrop_is_fill_only() {
                 kind: NodeKind::Scene3D {
                     camera: Default::default(),
                     background_rgba: [0.0, 0.0, 0.0, 0.0],
+        depth_plate: None,
                 },
                 inputs: vec![],
                 enabled: true,

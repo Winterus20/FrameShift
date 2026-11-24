@@ -1231,6 +1231,11 @@ mod tests {
             has_audio: true,
             audio_sample_rate: Some(48_000),
             audio_channels: Some(2),
+            color_space: None,
+            color_transfer: None,
+            color_primaries: None,
+            color_range: None,
+            chroma_location: None,
         };
         assert!(probe_matches_summary(&hevc_probe, &summary, 1, true, VideoCodec::Hevc));
         assert!(!probe_matches_summary(&hevc_probe, &summary, 1, true, VideoCodec::H264));

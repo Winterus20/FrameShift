@@ -3,33 +3,41 @@ use crate::error::RenderError;
 use crate::lut::CubeLut3D;
 use crate::pipelines::{ShaderPipelines, ShaderProgram};
 use crate::pool::{
-    MsaaTargetCache, PooledTexture, TexturePool, WORKING_TEXTURE_FORMAT, compute_mip_levels,
+    MsaaTargetCache, PooledTexture, SourceStagingPool, TexturePool, WORKING_TEXTURE_FORMAT,
+    compute_mip_levels,
 };
 use crate::provider::{FrameProvider, SourceFrame, SourcePixelData};
+use crate::smart_cache::{
+    NodeContentHash, PendingCpuCacheReadback, SmartCache, SmartCacheConfig, SmartCacheStats,
+    compute_node_content_hash, hash_source_video_leaf, is_heavy_node,
+};
 use crate::uniforms::{
-    AnimeImpactFrameUniform, AnimeSharpenUniform, BackdropScrimUniform, BlendUniform,
-    BloomPassUniform, BlurMoCurvesUniform, ColorBasicUniform, ColorSpaceMode, CustomWgslUniform,
-    DitherMode, DofBokehUniform, DofCocUniform, FilmHalationUniform, FilmOpticsUniform,
-    FxaaUniform, GpuMeshVertex3D, GpuSlugBand, GpuSlugCurve, GpuSlugGlyph, GpuSlugVertex,
-    HalftoneGlowUniform, Lut3DUniform, MaskMatteUniform, MotionBlurUniform,
-    MotionTileShakeUniform, OutputAlphaMode, ParticleField3DUniform, RadialShockwaveUniform,
-    RibbonTrail3DUniform, SlugUniform, Text2DFxUniform, Text2DJfaUniform, Text3DUniform,
-    TonemapMode, Transform3DUniform, TransformUniform, WhipTransitionUniform,
+    Anime4KUniform, AnimeImpactFrameUniform, AnimeSharpenUniform, BackdropScrimUniform,
+    BlendUniform, BloomPassUniform, BlurMoCurvesUniform, ColorBasicUniform, ColorSpaceMode,
+    CustomWgslUniform, DisplacementMapUniform, DitherMode, DofBokehUniform, DofCocUniform,
+    FilmHalationUniform, FilmOpticsUniform, FrameEchoUniform, FxaaUniform, GpuMeshVertex3D,
+    GpuSlugBand, GpuSlugCurve, GpuSlugGlyph, GpuSlugVertex, HalftoneGlowUniform, Lut3DUniform,
+    MaskMatteUniform, MotionBlurUniform, MotionTileShakeUniform, OpticalFlowBlurUniform,
+    OpticalFlowStepUniform, OutputAlphaMode, ParticleField3DUniform, RadialShockwaveUniform,
+    RibbonTrail3DUniform, Scene3DDepthSeedUniform, ShapeMaskFeatherUniform, SlugUniform,
+    Text2DFxUniform, Text2DJfaUniform, Text3DUniform, TonemapMode, Transform3DUniform,
+    TransformUniform, WhipTransitionUniform, YuvToLinearUniform,
 };
 use crate::warp2d::{CornerPinUniform, GridWarpUniform};
 use bytemuck::{Pod, cast_slice};
 use frameshift_schema::{
-    AnimationEasing, BevelProfile3D, BlendMode, Camera3DDef, Camera3DMode, ColorSpace,
-    DisabledPassthrough, EventBoundAnimation, ExtendedColorSpace, GraphNodeDef, HalftoneColorMode,
-    LutSourceDef, MAX_PRECOMP_DEPTH, NodeId, NodeKind, ParamBindingDef, Project, RenderGraphDef,
-    RenderProfileDef, SchemaError, Shape3DKind, ShutterPhase, SourceFit, TextAlign2D,
-    TextRangeShape, WritingMode2D,
+    AnimationEasing, Anime4KPreset, BevelProfile3D, BlendMode, Camera3DDef, Camera3DMode,
+    ColorSpace, DisabledPassthrough, EchoOperator, EventBoundAnimation, ExtendedColorSpace,
+    GraphNodeDef, HalftoneColorMode, KeyframeTrackDef, LutSourceDef, MAX_PRECOMP_DEPTH, NodeId,
+    NodeKind, ParamBindingDef, Project, RenderGraphDef, RenderProfileDef, SceneDepthPlateDef,
+    SchemaError, Shape3DKind, ShutterPhase, SourceFit, TextAlign2D, TextRangeShape,
+    WritingMode2D,
 };
 use frameshift_time::{ExprContext, FLICKS_PER_SECOND, Flicks, SafeExpr};
 use frameshift_vector::{
-    FontQuery, ProceduralShapeKind, ResolvedFont, Shape3DParams, Text3DMeshOptions,
-    TextLayoutOptions, VariationAxes, VectorError, build_slug_scene, resolve_font_chain,
-    shape_text_block,
+    FontQuery, ProceduralShapeKind, ResolvedFont, Shape3DParams, ShapeMaskConfig,
+    Text3DMeshOptions, TextLayoutOptions, VariationAxes, VectorError, build_slug_scene,
+    render_shape_mask_crisp_rgba16f, resolve_font_chain, shape_text_block,
 };
 use half::f16;
 use std::collections::{HashMap, HashSet};
@@ -128,11 +136,42 @@ struct CompiledParamBinding<'a> {
     expr: SafeExpr,
 }
 
-/// Uniformly sampled RMS audio envelope over timeline ticks (`[0.0, 1.0]`).
+/// Uniformly sampled RMS + multi-band (`sub`/`mid`/`high`) audio envelope and beat/downbeat
+/// anchor state over timeline ticks (`[0.0, 1.0]`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioRmsEnvelope {
     pub window_ticks: Flicks,
     pub samples: Vec<f32>,
+    pub sub: Vec<f32>,
+    pub mid: Vec<f32>,
+    pub high: Vec<f32>,
+    pub estimated_bpm: Option<f64>,
+    pub beat_anchor_tick: Flicks,
+    pub downbeat_anchor_tick: Flicks,
+    pub beats_per_bar: u8,
+}
+
+/// Type alias matching multi-band spectral audio envelope terminology.
+pub type AudioBandEnvelope = AudioRmsEnvelope;
+
+fn sample_envelope_curve(samples: &[f32], window_ticks: Flicks, tick: Flicks) -> f64 {
+    if samples.is_empty() || window_ticks.0 <= 0 || tick.0 < 0 {
+        return 0.0;
+    }
+    let pos = tick.0 as f64 / window_ticks.0 as f64;
+    let idx = pos.floor() as usize;
+    if idx >= samples.len() {
+        return 0.0;
+    }
+    let frac = pos - (idx as f64);
+    let s0 = f64::from(samples[idx]);
+    let s1 = samples.get(idx + 1).copied().map(f64::from).unwrap_or(s0);
+    let interp = s0 + (s1 - s0) * frac;
+    if interp.is_finite() {
+        interp.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 impl AudioRmsEnvelope {
@@ -140,6 +179,39 @@ impl AudioRmsEnvelope {
         Self {
             window_ticks,
             samples,
+            sub: Vec::new(),
+            mid: Vec::new(),
+            high: Vec::new(),
+            estimated_bpm: None,
+            beat_anchor_tick: Flicks::ZERO,
+            downbeat_anchor_tick: Flicks::ZERO,
+            beats_per_bar: 4,
+        }
+    }
+
+    /// Constructs an envelope carrying full-band RMS, 3-band spectral curves, and real tempo/downbeat anchors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_bands(
+        window_ticks: Flicks,
+        samples: Vec<f32>,
+        sub: Vec<f32>,
+        mid: Vec<f32>,
+        high: Vec<f32>,
+        estimated_bpm: Option<f64>,
+        beat_anchor_tick: Flicks,
+        downbeat_anchor_tick: Flicks,
+        beats_per_bar: u8,
+    ) -> Self {
+        Self {
+            window_ticks,
+            samples,
+            sub,
+            mid,
+            high,
+            estimated_bpm,
+            beat_anchor_tick,
+            downbeat_anchor_tick,
+            beats_per_bar: beats_per_bar.max(1),
         }
     }
 
@@ -147,28 +219,37 @@ impl AudioRmsEnvelope {
     /// clamped to `[0.0, 1.0]`. Returns `0.0` for negative ticks, non-positive `window_ticks`,
     /// or empty samples.
     pub fn sample_at(&self, tick: Flicks) -> f64 {
-        if self.samples.is_empty() || self.window_ticks.0 <= 0 || tick.0 < 0 {
-            return 0.0;
-        }
-        let pos = tick.0 as f64 / self.window_ticks.0 as f64;
-        let idx = pos.floor() as usize;
-        if idx >= self.samples.len() {
-            return 0.0;
-        }
-        let frac = pos - (idx as f64);
-        let s0 = f64::from(self.samples[idx]);
-        let s1 = self
-            .samples
-            .get(idx + 1)
-            .copied()
-            .map(f64::from)
-            .unwrap_or(s0);
-        let interp = s0 + (s1 - s0) * frac;
-        if interp.is_finite() {
-            interp.clamp(0.0, 1.0)
-        } else {
-            0.0
-        }
+        sample_envelope_curve(&self.samples, self.window_ticks, tick)
+    }
+
+    /// Samples `(audio_rms, audio_sub, audio_mid, audio_high)` at `tick`, each clamped to `[0.0, 1.0]`.
+    pub fn sample_bands_at(&self, tick: Flicks) -> (f64, f64, f64, f64) {
+        (
+            sample_envelope_curve(&self.samples, self.window_ticks, tick),
+            sample_envelope_curve(&self.sub, self.window_ticks, tick),
+            sample_envelope_curve(&self.mid, self.window_ticks, tick),
+            sample_envelope_curve(&self.high, self.window_ticks, tick),
+        )
+    }
+
+    /// Computes `(beat_phase, downbeat_phase)` in `[0.0, 1.0)` using `estimated_bpm` when valid,
+    /// falling back to `120 BPM` aligned to `fallback_beat_anchor` otherwise.
+    pub fn phases_at(&self, tick: Flicks, fallback_beat_anchor: Flicks) -> (f64, f64) {
+        let (bpm, beat_anchor, downbeat_anchor, beats_per_bar) = match self.estimated_bpm {
+            Some(bpm) if bpm.is_finite() && bpm >= 20.0 => (
+                bpm,
+                self.beat_anchor_tick,
+                self.downbeat_anchor_tick,
+                self.beats_per_bar.max(1),
+            ),
+            _ => (120.0, fallback_beat_anchor, fallback_beat_anchor, 4),
+        };
+        let beat_period_ticks = (60.0 / bpm) * (FLICKS_PER_SECOND as f64);
+        let bar_period_ticks = beat_period_ticks * f64::from(beats_per_bar);
+        let beat_phase = ((tick.0 - beat_anchor.0) as f64 / beat_period_ticks).rem_euclid(1.0);
+        let downbeat_phase =
+            ((tick.0 - downbeat_anchor.0) as f64 / bar_period_ticks).rem_euclid(1.0);
+        (beat_phase, downbeat_phase)
     }
 }
 
@@ -234,9 +315,19 @@ impl<'a> ProjectAnimator<'a> {
         let beat_anchor = nearest_event
             .map(|ev| ev.target_output_tick)
             .unwrap_or(Flicks::ZERO);
-        // 120 BPM (0.5s beat period) deterministic phase aligned to the nearest event anchor.
-        let beat_period_ticks = (FLICKS_PER_SECOND / 2) as f64;
-        let beat_phase = ((sub_tick.0 - beat_anchor.0) as f64 / beat_period_ticks).rem_euclid(1.0);
+        let (beat_phase, downbeat_phase) = match self.audio_envelope {
+            Some(env) => env.phases_at(sub_tick, beat_anchor),
+            None => {
+                // 120 BPM (0.5s beat period) deterministic phase aligned to the nearest event anchor.
+                let beat_period_ticks = (FLICKS_PER_SECOND / 2) as f64;
+                let beat_phase =
+                    ((sub_tick.0 - beat_anchor.0) as f64 / beat_period_ticks).rem_euclid(1.0);
+                let downbeat_phase = ((sub_tick.0 - beat_anchor.0) as f64
+                    / (beat_period_ticks * 4.0))
+                    .rem_euclid(1.0);
+                (beat_phase, downbeat_phase)
+            }
+        };
 
         let has_active_audio = self
             .project
@@ -244,12 +335,18 @@ impl<'a> ProjectAnimator<'a> {
             .audio_clips
             .iter()
             .any(|ac| sub_tick >= ac.timeline_start && sub_tick < ac.timeline_end);
-        let audio_rms = if has_active_audio {
-            self.audio_envelope
-                .map(|env| env.sample_at(sub_tick))
-                .unwrap_or_else(|| ((1.0 - beat_phase).powi(2) * 0.8 + 0.15).clamp(0.0, 1.0))
+        let (audio_rms, audio_sub, audio_mid, audio_high) = if has_active_audio {
+            match self.audio_envelope {
+                Some(env) => env.sample_bands_at(sub_tick),
+                None => (
+                    ((1.0 - beat_phase).powi(2) * 0.8 + 0.15).clamp(0.0, 1.0),
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
+            }
         } else {
-            0.0
+            (0.0, 0.0, 0.0, 0.0)
         };
 
         let duration = self.project.timeline.duration_ticks.0.max(1) as f64;
@@ -260,6 +357,10 @@ impl<'a> ProjectAnimator<'a> {
             output_tick: sub_tick.0,
             beat_phase,
             audio_rms,
+            audio_sub,
+            audio_mid,
+            audio_high,
+            downbeat_phase,
             event_delta_sec,
             progress,
         }
@@ -287,6 +388,15 @@ impl NodeAnimator for ProjectAnimator<'_> {
                 {
                     apply_animated_parameter(&mut kind, &anim.parameter, value as f32);
                 }
+            }
+        }
+
+        for track in &self.project.keyframe_tracks {
+            if &track.target_node != node_id {
+                continue;
+            }
+            if let Some(value) = evaluate_keyframe_track(track, sub_tick) {
+                apply_animated_parameter(&mut kind, &track.target_param, value as f32);
             }
         }
 
@@ -361,6 +471,34 @@ pub fn evaluate_event_animation(
     }
     let progress = ((sample_tick.0 - start.0) as f64 / (anim.duration.0 as f64)).clamp(0.0, 1.0);
     Some(interpolate_keyframes(&anim.keyframes, progress))
+}
+
+/// Evaluates a dense tick-keyed [`KeyframeTrackDef`] at `tick` in `O(log K)` time.
+///
+/// Holds the first/last keyframe value outside `[first.tick, last.tick]`.
+pub fn evaluate_keyframe_track(track: &KeyframeTrackDef, tick: Flicks) -> Option<f64> {
+    let kfs = &track.keyframes;
+    if kfs.is_empty() {
+        return None;
+    }
+    if kfs.len() == 1 || tick <= kfs[0].tick {
+        return Some(kfs[0].value);
+    }
+    let last = &kfs[kfs.len() - 1];
+    if tick >= last.tick {
+        return Some(last.value);
+    }
+    let next_idx = kfs.partition_point(|k| k.tick <= tick);
+    let prev_idx = next_idx.saturating_sub(1);
+    let a = &kfs[prev_idx];
+    let b = &kfs[next_idx];
+    let span = b.tick.0 - a.tick.0;
+    if span <= 0 {
+        return Some(b.value);
+    }
+    let local_t = ((tick.0 - a.tick.0) as f64 / (span as f64)).clamp(0.0, 1.0);
+    let eased = apply_easing(a.easing, local_t);
+    Some(a.value + (b.value - a.value) * eased)
 }
 
 fn interpolate_keyframes(keyframes: &[frameshift_schema::AnimationKeyframe], progress: f64) -> f64 {
@@ -464,6 +602,19 @@ fn apply_animated_parameter(kind: &mut NodeKind, param: &str, value: f32) {
             "z_dist" => *z_dist = value,
             "rotate_deg" => *rotate_deg = value,
             "blur_strength" => *blur_strength = value.max(0.0),
+            _ => {}
+        },
+        NodeKind::OpticalFlowBlur {
+            shutter_amount,
+            max_blur_px,
+            sensitivity,
+            flow_smoothness,
+            ..
+        } => match param {
+            "shutter_amount" => *shutter_amount = value.clamp(0.0, 8.0),
+            "max_blur_px" => *max_blur_px = value.clamp(0.0, 512.0),
+            "sensitivity" => *sensitivity = value.clamp(0.001, 2.0),
+            "flow_smoothness" => *flow_smoothness = value.clamp(0.0, 1.0),
             _ => {}
         },
         NodeKind::DepthMatte {
@@ -651,6 +802,11 @@ fn apply_animated_parameter(kind: &mut NodeKind, param: &str, value: f32) {
             "anti_ringing" => *anti_ringing = value,
             _ => {}
         },
+        NodeKind::Anime4K { strength, .. } => {
+            if param == "strength" {
+                *strength = value.clamp(0.0, 2.0);
+            }
+        }
         NodeKind::FilmOptics {
             lens_k1,
             lens_k2,
@@ -946,7 +1102,11 @@ fn apply_animated_parameter(kind: &mut NodeKind, param: &str, value: f32) {
             "opacity" => *opacity = value,
             _ => {}
         },
-        NodeKind::Scene3D { camera, .. } => match param {
+        NodeKind::Scene3D {
+            camera,
+            depth_plate,
+            ..
+        } => match param {
             "cam_x" => camera.pos[0] = value,
             "cam_y" => camera.pos[1] = value,
             "cam_z" => camera.pos[2] = value,
@@ -965,6 +1125,21 @@ fn apply_animated_parameter(kind: &mut NodeKind, param: &str, value: f32) {
             "dof_blade_roundness" => camera.dof_blade_roundness = value,
             "dof_anamorphic_ratio" => camera.dof_anamorphic_ratio = value,
             "dof_cats_eye_strength" => camera.dof_cats_eye_strength = value,
+            "depth_plate_near_z" => {
+                if let Some(dp) = depth_plate.as_mut() {
+                    dp.near_z = value.max(1e-4);
+                }
+            }
+            "depth_plate_far_z" => {
+                if let Some(dp) = depth_plate.as_mut() {
+                    dp.far_z = value.max(1e-3);
+                }
+            }
+            "depth_plate_gamma" => {
+                if let Some(dp) = depth_plate.as_mut() {
+                    dp.depth_gamma = value.clamp(0.05, 8.0);
+                }
+            }
             _ => {}
         },
         NodeKind::SourceImage { opacity, .. } => {
@@ -1072,6 +1247,47 @@ fn apply_animated_parameter(kind: &mut NodeKind, param: &str, value: f32) {
                 *shutter_angle_deg = value.clamp(0.0, 720.0);
             }
         }
+        NodeKind::DisplacementMap {
+            scale_x,
+            scale_y,
+            neutral_level,
+            angle_rad,
+            chromatic_split,
+            opacity,
+            ..
+        } => match param {
+            "scale_x" => *scale_x = value,
+            "scale_y" => *scale_y = value,
+            "neutral_level" => *neutral_level = value,
+            "angle_rad" => *angle_rad = value,
+            "chromatic_split" => *chromatic_split = value,
+            "opacity" => *opacity = value.clamp(0.0, 1.0),
+            _ => {}
+        },
+        NodeKind::FrameEcho {
+            echo_step_ticks,
+            starting_intensity,
+            decay,
+            hue_shift_deg,
+            ..
+        } => match param {
+            "starting_intensity" => *starting_intensity = value.max(0.0),
+            "decay" => *decay = value.clamp(0.0, 1.0),
+            "hue_shift_deg" => *hue_shift_deg = value,
+            "echo_step_ticks" => *echo_step_ticks = value.round() as i64,
+            _ => {}
+        },
+        NodeKind::ShapeMask {
+            feather_px,
+            expand_px,
+            opacity,
+            ..
+        } => match param {
+            "feather_px" => *feather_px = value.max(0.0),
+            "expand_px" => *expand_px = value,
+            "opacity" => *opacity = value.clamp(0.0, 1.0),
+            _ => {}
+        },
         NodeKind::SourceVideo { .. }
         | NodeKind::Solid { .. }
         | NodeKind::PrecompInput { .. } => {}
@@ -1277,6 +1493,8 @@ pub struct GpuCompositor {
     ctx: GpuContext,
     pipelines: ShaderPipelines,
     pool: TexturePool,
+    staging_pool: SourceStagingPool,
+    smart_cache: SmartCache,
     lut_cache: HashMap<LutCacheKey, CachedLut3D>,
     image_gpu_cache: HashMap<ImageGpuKey, CachedImageTexture>,
     font_cache: HashMap<String, Arc<Vec<u8>>>,
@@ -1292,14 +1510,28 @@ pub struct GpuCompositor {
 impl GpuCompositor {
     /// Initializes a headless [`GpuContext`], compiles all built-in WGSL pipelines, and creates a [`TexturePool`].
     pub fn new_headless() -> Result<Self, RenderError> {
+        Self::new_headless_with_cache(SmartCacheConfig::default())
+    }
+
+    /// Initializes a headless [`GpuCompositor`] with an explicit [`SmartCacheConfig`].
+    pub fn new_headless_with_cache(mut cache_config: SmartCacheConfig) -> Result<Self, RenderError> {
         let ctx = GpuContext::new_headless()?;
         let pipelines = ShaderPipelines::compile_all_with_msaa(&ctx.device, ctx.supports_msaa_4x)?;
         let (_dummy_zero_tex, dummy_zero_view) = create_dummy_zero_texture(&ctx.device, &ctx.queue);
+        let staging_pool = SourceStagingPool::new(&ctx.device, &ctx.queue);
+        if cache_config.adapter_fingerprint == 0 {
+            let info = ctx.adapter.get_info();
+            let fp_str = format!("{}:{}:{:?}", info.vendor, info.device, info.backend);
+            cache_config.adapter_fingerprint = fnv1a_64(fp_str.as_bytes());
+        }
+        let smart_cache = SmartCache::new(cache_config);
 
         Ok(Self {
             ctx,
             pipelines,
             pool: TexturePool::new(),
+            staging_pool,
+            smart_cache,
             lut_cache: HashMap::new(),
             image_gpu_cache: HashMap::new(),
             font_cache: HashMap::new(),
@@ -1333,6 +1565,124 @@ impl GpuCompositor {
         &mut self.pool
     }
 
+    /// Returns current [`SmartCacheStats`].
+    pub fn smart_cache_stats(&self) -> SmartCacheStats {
+        self.smart_cache.stats()
+    }
+
+    /// Returns the active [`SmartCacheConfig`].
+    pub fn smart_cache_config(&self) -> &SmartCacheConfig {
+        self.smart_cache.config()
+    }
+
+    /// Updates the [`SmartCacheConfig`] (resizing LRU budgets or enabling/disabling disk cache).
+    pub fn set_smart_cache_config(&mut self, config: SmartCacheConfig) {
+        self.smart_cache.set_config(config);
+    }
+
+    /// Clears all Tier 1/2/3 entries from the node [`SmartCache`].
+    pub fn clear_smart_cache(&mut self) {
+        self.smart_cache.clear();
+    }
+
+    pub(crate) fn acquire_pooled_texture(&mut self, width: u32, height: u32) -> PooledTexture {
+        self.pool.acquire(&self.ctx.device, width, height)
+    }
+
+    pub(crate) fn release_pooled_texture(&mut self, tex: PooledTexture) {
+        self.pool.release(tex);
+    }
+
+    pub(crate) fn dummy_zero_view(&self) -> &wgpu::TextureView {
+        &self.dummy_zero_view
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_optical_flow_step_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        prev_luma: &wgpu::TextureView,
+        curr_luma: &wgpu::TextureView,
+        coarse_flow: &wgpu::TextureView,
+        uniform: &OpticalFlowStepUniform,
+        target_view: &wgpu::TextureView,
+    ) {
+        self.record_three_tex_pass(
+            encoder,
+            label,
+            &self.pipelines.fx_optical_flow_step,
+            prev_luma,
+            curr_luma,
+            coarse_flow,
+            uniform,
+            target_view,
+        );
+    }
+
+    pub(crate) fn build_luma_pyramid_standalone(
+        &mut self,
+        label_prefix: &str,
+        src: &PooledTexture,
+        width: u32,
+        height: u32,
+    ) -> Vec<PooledTexture> {
+        let dims: [(u32, u32); 4] = [
+            (width.max(1), height.max(1)),
+            ((width / 2).max(1), (height / 2).max(1)),
+            ((width / 4).max(1), (height / 4).max(1)),
+            ((width / 8).max(1), (height / 8).max(1)),
+        ];
+        let mut encoder =
+            self.ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some(label_prefix),
+                });
+        let pyr = self.build_luma_pyramid(&mut encoder, label_prefix, src, &dims);
+        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+        pyr
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn evaluate_subgraph_to_pooled(
+        &mut self,
+        graph: &RenderGraphDef,
+        full_topo: &[NodeId],
+        target_id: &NodeId,
+        sub_tick: Flicks,
+        frame_ticks: Flicks,
+        width: u32,
+        height: u32,
+        provider: &dyn FrameProvider,
+        animator: &dyn NodeAnimator,
+    ) -> Result<PooledTexture, RenderError> {
+        let mut encoder =
+            self.ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("frameshift-tracker-eval"),
+                });
+        let (tex, _) = self.evaluate_subgraph(
+            graph,
+            full_topo,
+            target_id,
+            sub_tick,
+            frame_ticks,
+            width,
+            height,
+            provider,
+            animator,
+            None,
+            None,
+            None,
+            &mut encoder,
+        )?;
+        self.ctx.queue.submit(std::iter::once(encoder.finish()));
+        self.staging_pool.reclaim();
+        Ok(tex)
+    }
+
     /// Evaluates `graph` at a specific `sub_tick` into a pooled `Rgba16Float` Linear Rec.709 texture.
     #[allow(clippy::too_many_arguments)]
     pub fn evaluate_subframe(
@@ -1354,7 +1704,7 @@ impl GpuCompositor {
                 label: Some("frameshift-evaluate-subframe"),
             });
 
-        let tex = self.evaluate_subgraph(
+        let (tex, _) = self.evaluate_subgraph(
             graph,
             &full_topo,
             &graph.output_node,
@@ -1366,10 +1716,12 @@ impl GpuCompositor {
             animator,
             None,
             None,
+            None,
             &mut encoder,
         )?;
 
         self.ctx.queue.submit(std::iter::once(encoder.finish()));
+        self.staging_pool.reclaim();
         Ok(tex)
     }
 
@@ -1411,8 +1763,9 @@ impl GpuCompositor {
                 label: Some("frameshift-render-frame"),
             });
 
+        let mut pending_cpu_readbacks: Vec<PendingCpuCacheReadback> = Vec::new();
         let sample_ceiling = options.shutter_override.map(|ov| ov.sub_samples);
-        let linear_result = self.evaluate_subgraph(
+        let (linear_result, _) = self.evaluate_subgraph(
             graph,
             &full_topo,
             &graph.output_node,
@@ -1424,6 +1777,7 @@ impl GpuCompositor {
             animator,
             options.shutter_override,
             sample_ceiling,
+            Some(&mut pending_cpu_readbacks),
             &mut encoder,
         )?;
 
@@ -1484,6 +1838,9 @@ impl GpuCompositor {
         self.pool.release(final_linear);
 
         let rgba8 = self.readback_rgba8(encoder, &srgb_texture, width, height)?;
+        self.staging_pool.reclaim();
+        self.smart_cache
+            .finish_pending_readbacks(&self.ctx.device, pending_cpu_readbacks);
         let fnv1a_hash = fnv1a_64(&rgba8);
 
         Ok(RenderedFrame {
@@ -1546,8 +1903,9 @@ impl GpuCompositor {
         animator: &dyn NodeAnimator,
         root_shutter_override: Option<ShutterOverride>,
         sample_ceiling: Option<u32>,
+        pending_readbacks: Option<&mut Vec<PendingCpuCacheReadback>>,
         encoder: &mut wgpu::CommandEncoder,
-    ) -> Result<PooledTexture, RenderError> {
+    ) -> Result<(PooledTexture, NodeContentHash), RenderError> {
         self.evaluate_subgraph_inner(
             graph,
             full_topo,
@@ -1561,7 +1919,9 @@ impl GpuCompositor {
             root_shutter_override,
             sample_ceiling,
             &[],
+            &[],
             0,
+            pending_readbacks,
             encoder,
         )
     }
@@ -1581,9 +1941,11 @@ impl GpuCompositor {
         root_shutter_override: Option<ShutterOverride>,
         sample_ceiling: Option<u32>,
         precomp_inputs: &[&PooledTexture],
+        precomp_input_hashes: &[NodeContentHash],
         depth: usize,
+        mut pending_readbacks: Option<&mut Vec<PendingCpuCacheReadback>>,
         encoder: &mut wgpu::CommandEncoder,
-    ) -> Result<PooledTexture, RenderError> {
+    ) -> Result<(PooledTexture, NodeContentHash), RenderError> {
         if depth > MAX_PRECOMP_DEPTH {
             return Err(RenderError::Schema(SchemaError::PrecompDepthExceeded {
                 node_id: target_id.clone(),
@@ -1636,7 +1998,58 @@ impl GpuCompositor {
                     animator,
                     sample_ceiling,
                     precomp_inputs,
+                    precomp_input_hashes,
                     depth,
+                    pending_readbacks,
+                    encoder,
+                );
+            }
+        }
+
+        if target_node.disabled_passthrough().is_none()
+            && matches!(target_node.kind, NodeKind::FrameEcho { .. })
+        {
+            let evaluated_root =
+                animator.evaluate_node(&target_node.id, &target_node.kind, sub_tick)?;
+            if let NodeKind::FrameEcho {
+                echo_step_ticks,
+                echo_count,
+                starting_intensity,
+                decay,
+                color_decay_rgb,
+                hue_shift_deg,
+                operator,
+            } = evaluated_root
+            {
+                if target_node.inputs.len() != 1 {
+                    return Err(RenderError::MissingGraphInput {
+                        node_id: target_node.id.clone(),
+                        expected: 1,
+                        actual: target_node.inputs.len(),
+                    });
+                }
+                return self.evaluate_frame_echo(
+                    graph,
+                    full_topo,
+                    &target_node.inputs[0],
+                    sub_tick,
+                    frame_ticks,
+                    echo_step_ticks,
+                    echo_count,
+                    starting_intensity,
+                    decay,
+                    color_decay_rgb,
+                    hue_shift_deg,
+                    operator,
+                    width,
+                    height,
+                    provider,
+                    animator,
+                    sample_ceiling,
+                    precomp_inputs,
+                    precomp_input_hashes,
+                    depth,
+                    pending_readbacks,
                     encoder,
                 );
             }
@@ -1660,8 +2073,11 @@ impl GpuCompositor {
                 *remaining_uses.entry(upstream.clone()).or_insert(0) += 1;
             }
             if node.disabled_passthrough().is_none()
-                && matches!(node.kind, NodeKind::Scene3D { .. })
+                && let NodeKind::Scene3D { depth_plate, .. } = &node.kind
             {
+                if let Some(dp) = depth_plate {
+                    *remaining_uses.entry(dp.node_id.clone()).or_insert(0) += 1;
+                }
                 for child_id in &node.inputs {
                     if let Some(child) = graph.node(child_id)
                         && child.enabled
@@ -1676,12 +2092,16 @@ impl GpuCompositor {
         *remaining_uses.entry(target_id.clone()).or_insert(0) += 1;
 
         let mut textures: HashMap<NodeId, PooledTexture> = HashMap::with_capacity(sub_order.len());
+        let mut node_hashes: HashMap<NodeId, NodeContentHash> =
+            HashMap::with_capacity(sub_order.len());
 
         for node in sub_order {
             if skip_standalone.contains(&node.id) {
                 continue;
             }
-            let (out_tex, release_inputs, release_scene_xform_inputs) = if let Some(pass) =
+            let (out_tex, out_hash, release_inputs, release_scene_xform_inputs) = if let Some(
+                pass,
+            ) =
                 node.disabled_passthrough()
             {
                 let release_inputs = match pass {
@@ -1705,148 +2125,546 @@ impl GpuCompositor {
                     &textures,
                     sample_ceiling,
                     precomp_inputs,
+                    precomp_input_hashes,
                     depth,
+                    pending_readbacks.as_deref_mut(),
                     encoder,
                 )?;
-                (out_tex, release_inputs, false)
+                let passthrough_hash = match pass {
+                    DisabledPassthrough::Clear => {
+                        let mut b = crate::smart_cache::ContentHashBuilder::new();
+                        b.str("DisabledClear");
+                        b.u32(width);
+                        b.u32(height);
+                        b.finish()
+                    }
+                    DisabledPassthrough::Input(index) => node
+                        .inputs
+                        .get(index)
+                        .and_then(|id| node_hashes.get(id).copied())
+                        .unwrap_or_else(|| {
+                            let mut b = crate::smart_cache::ContentHashBuilder::new();
+                            b.str("DisabledInput");
+                            b.str(&node.id.0);
+                            b.i64(sub_tick.0);
+                            b.u32(width);
+                            b.u32(height);
+                            b.finish()
+                        }),
+                };
+                (out_tex, passthrough_hash, release_inputs, false)
             } else {
                 let evaluated_kind = animator.evaluate_node(&node.id, &node.kind, sub_tick)?;
-                let (out_tex, is_scene3d) = if let NodeKind::MotionBlurShutter {
-                    shutter_angle_deg,
-                    sub_samples,
-                    phase,
-                    ..
+                let mut is_scene3d = false;
+                let mut cache_this_node = self.smart_cache.is_enabled();
+                let computed_hash: Option<NodeContentHash>;
+
+                let out_tex = if let NodeKind::SourceVideo {
+                    ref asset_id,
+                    ref clip_id,
+                    color_space,
+                    fit,
                 } = evaluated_kind
                 {
-                    if node.inputs.len() != 1 {
-                        return Err(RenderError::MissingGraphInput {
-                            node_id: node.id.clone(),
-                            expected: 1,
-                            actual: node.inputs.len(),
-                        });
-                    }
-                    let samples = effective_blur_sub_samples(sub_samples, sample_ceiling);
-                    let tex = self.evaluate_motion_blur(
-                        graph,
-                        full_topo,
-                        &node.inputs[0],
-                        sub_tick,
-                        frame_ticks,
-                        shutter_angle_deg,
-                        samples,
-                        phase,
-                        width,
-                        height,
-                        provider,
-                        animator,
-                        sample_ceiling,
-                        precomp_inputs,
-                        depth,
-                        encoder,
-                    )?;
-                    (tex, false)
-                } else if let NodeKind::Precomp {
-                    ref sub_graph,
-                    time_offset_ticks,
-                    time_scale,
-                    opacity,
-                } = evaluated_kind
-                {
-                    let child_depth = depth + 1;
-                    if child_depth > MAX_PRECOMP_DEPTH {
-                        return Err(RenderError::Schema(SchemaError::PrecompDepthExceeded {
-                            node_id: node.id.clone(),
-                            depth: child_depth,
-                            max_depth: MAX_PRECOMP_DEPTH,
-                        }));
-                    }
-                    if opacity <= 0.001 {
-                        let out = self.pool.acquire(&self.ctx.device, width, height);
-                        clear_texture(encoder, &out.view, [0.0, 0.0, 0.0, 0.0]);
-                        (out, false)
-                    } else {
-                        let sub_topo = sub_graph.validate_graph_with_depth(child_depth)?;
-                        let mut child_inputs: Vec<&PooledTexture> =
-                            Vec::with_capacity(node.inputs.len());
-                        for idx in 0..node.inputs.len() {
-                            child_inputs.push(require_input(node, &textures, idx)?);
+                    let maybe_src_tick =
+                        animator.resolve_source_tick(asset_id, clip_id.as_deref(), sub_tick)?;
+                    match maybe_src_tick {
+                        None => {
+                            let h = hash_source_video_leaf(
+                                asset_id,
+                                None,
+                                None,
+                                color_space,
+                                fit,
+                                width,
+                                height,
+                            );
+                            computed_hash = Some(h);
+                            let out = self.pool.acquire(&self.ctx.device, width, height);
+                            if !self.smart_cache.try_restore_into(
+                                &self.ctx.device,
+                                &self.ctx.queue,
+                                encoder,
+                                h,
+                                false,
+                                width,
+                                height,
+                                &out.texture,
+                            ) {
+                                clear_texture(encoder, &out.view, [0.0, 0.0, 0.0, 0.0]);
+                                let mut dummy_pending = Vec::new();
+                                self.smart_cache.store_computed(
+                                    &self.ctx.device,
+                                    encoder,
+                                    h,
+                                    false,
+                                    width,
+                                    height,
+                                    &out.texture,
+                                    false,
+                                    &mut dummy_pending,
+                                );
+                            }
+                            out
                         }
-                        let local_tick =
-                            remap_precomp_tick(sub_tick, time_offset_ticks, time_scale);
-                        let sub_tex = self.evaluate_subgraph_inner(
-                            sub_graph,
-                            &sub_topo,
-                            &sub_graph.output_node,
-                            local_tick,
-                            frame_ticks,
+                        Some(src_tick) => {
+                            if cache_this_node
+                                && let Some(id_hash) = provider
+                                    .source_frame_hash(asset_id, src_tick, width, height, fit)
+                            {
+                                let h = hash_source_video_leaf(
+                                    asset_id,
+                                    Some(id_hash),
+                                    Some(src_tick),
+                                    color_space,
+                                    fit,
+                                    width,
+                                    height,
+                                );
+                                computed_hash = Some(h);
+                                let out = self.pool.acquire(&self.ctx.device, width, height);
+                                if !self.smart_cache.try_restore_into(
+                                    &self.ctx.device,
+                                    &self.ctx.queue,
+                                    encoder,
+                                    h,
+                                    false,
+                                    width,
+                                    height,
+                                    &out.texture,
+                                ) {
+                                    let frame = provider.provide_source_frame(
+                                        asset_id, src_tick, width, height, fit,
+                                    )?;
+                                    self.upload_source_frame(
+                                        encoder,
+                                        asset_id,
+                                        &frame,
+                                        color_space,
+                                        &out.view,
+                                    )?;
+                                    let mut dummy_pending = Vec::new();
+                                    self.smart_cache.store_computed(
+                                        &self.ctx.device,
+                                        encoder,
+                                        h,
+                                        false,
+                                        width,
+                                        height,
+                                        &out.texture,
+                                        false,
+                                        &mut dummy_pending,
+                                    );
+                                }
+                                out
+                            } else {
+                                let frame = provider.provide_source_frame(
+                                    asset_id, src_tick, width, height, fit,
+                                )?;
+                                let f_hash = source_frame_content_hash(&frame);
+                                let h = hash_source_video_leaf(
+                                    asset_id,
+                                    Some(f_hash),
+                                    Some(src_tick),
+                                    color_space,
+                                    fit,
+                                    width,
+                                    height,
+                                );
+                                computed_hash = Some(h);
+                                let out = self.pool.acquire(&self.ctx.device, width, height);
+                                if !cache_this_node
+                                    || !self.smart_cache.try_restore_into(
+                                        &self.ctx.device,
+                                        &self.ctx.queue,
+                                        encoder,
+                                        h,
+                                        false,
+                                        width,
+                                        height,
+                                        &out.texture,
+                                    )
+                                {
+                                    self.upload_source_frame(
+                                        encoder,
+                                        asset_id,
+                                        &frame,
+                                        color_space,
+                                        &out.view,
+                                    )?;
+                                    if cache_this_node {
+                                        let mut dummy_pending = Vec::new();
+                                        self.smart_cache.store_computed(
+                                            &self.ctx.device,
+                                            encoder,
+                                            h,
+                                            false,
+                                            width,
+                                            height,
+                                            &out.texture,
+                                            false,
+                                            &mut dummy_pending,
+                                        );
+                                    }
+                                }
+                                out
+                            }
+                        }
+                    }
+                } else {
+                    if matches!(
+                        evaluated_kind,
+                        NodeKind::MotionBlurShutter { .. }
+                            | NodeKind::OpticalFlowBlur { .. }
+                            | NodeKind::FrameEcho { .. }
+                            | NodeKind::Precomp { .. }
+                    ) {
+                        cache_this_node = false;
+                    }
+
+                    let candidate_hash = if cache_this_node {
+                        let upstream_hashes: Vec<NodeContentHash> = node
+                            .inputs
+                            .iter()
+                            .filter_map(|id| node_hashes.get(id).copied())
+                            .collect();
+                        let extra_seed = match &evaluated_kind {
+                            NodeKind::PrecompInput { slot } => {
+                                precomp_input_hashes.get(*slot).copied()
+                            }
+                            NodeKind::Scene3D { depth_plate, .. } => {
+                                Some(compute_scene3d_content_hash(
+                                    graph,
+                                    node,
+                                    depth_plate.as_ref(),
+                                    sub_tick,
+                                    &node_hashes,
+                                    animator,
+                                )?)
+                            }
+                            _ => None,
+                        };
+                        Some(compute_node_content_hash(
+                            &evaluated_kind,
+                            &upstream_hashes,
+                            sub_tick,
                             width,
                             height,
-                            provider,
-                            animator,
-                            None,
-                            sample_ceiling,
-                            &child_inputs,
-                            child_depth,
+                            extra_seed,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    let heavy = is_heavy_node(&evaluated_kind);
+                    let mut restored: Option<PooledTexture> = None;
+                    if let Some(h) = candidate_hash {
+                        let probe_tex = self.pool.acquire(&self.ctx.device, width, height);
+                        if self.smart_cache.try_restore_into(
+                            &self.ctx.device,
+                            &self.ctx.queue,
                             encoder,
-                        )?;
-                        let op = opacity.clamp(0.0, 1.0);
-                        let final_tex = if op < 0.999 {
-                            let scaled = self.pool.acquire(&self.ctx.device, width, height);
-                            let uniform = BlendUniform::new(BlendMode::Normal, op);
-                            self.record_two_tex_pass(
-                                encoder,
-                                &format!("{}-precomp-opacity", node.id.0),
-                                &self.pipelines.blend,
-                                &self.dummy_zero_view,
-                                &sub_tex.view,
-                                &uniform,
-                                &scaled.view,
-                            );
-                            self.pool.release(sub_tex);
-                            scaled
+                            h,
+                            heavy,
+                            width,
+                            height,
+                            &probe_tex.texture,
+                        ) {
+                            restored = Some(probe_tex);
                         } else {
-                            sub_tex
-                        };
-                        (final_tex, false)
+                            self.pool.release(probe_tex);
+                        }
                     }
-                } else if let NodeKind::Scene3D {
-                    ref camera,
-                    background_rgba,
-                } = evaluated_kind
-                {
-                    let tex = self.evaluate_scene3d(
-                        graph,
-                        node,
-                        camera,
-                        background_rgba,
-                        sub_tick,
-                        width,
-                        height,
-                        animator,
-                        &textures,
-                        encoder,
-                    )?;
-                    (tex, true)
-                } else {
-                    let tex = self.evaluate_single_node(
-                        graph,
-                        node,
-                        &evaluated_kind,
-                        sub_tick,
-                        width,
-                        height,
-                        provider,
-                        animator,
-                        &textures,
-                        precomp_inputs,
-                        encoder,
-                    )?;
-                    (tex, false)
+
+                    if let Some(cached_tex) = restored {
+                        is_scene3d = matches!(evaluated_kind, NodeKind::Scene3D { .. });
+                        computed_hash = candidate_hash;
+                        cached_tex
+                    } else {
+                        let (tex, sc3d, actual_hash) = if let NodeKind::MotionBlurShutter {
+                            shutter_angle_deg,
+                            sub_samples,
+                            phase,
+                            ..
+                        } = evaluated_kind
+                        {
+                            if node.inputs.len() != 1 {
+                                return Err(RenderError::MissingGraphInput {
+                                    node_id: node.id.clone(),
+                                    expected: 1,
+                                    actual: node.inputs.len(),
+                                });
+                            }
+                            let samples = effective_blur_sub_samples(sub_samples, sample_ceiling);
+                            let (tex, mb_hash) = self.evaluate_motion_blur(
+                                graph,
+                                full_topo,
+                                &node.inputs[0],
+                                sub_tick,
+                                frame_ticks,
+                                shutter_angle_deg,
+                                samples,
+                                phase,
+                                width,
+                                height,
+                                provider,
+                                animator,
+                                sample_ceiling,
+                                precomp_inputs,
+                                precomp_input_hashes,
+                                depth,
+                                pending_readbacks.as_deref_mut(),
+                                encoder,
+                            )?;
+                            (tex, false, Some(mb_hash))
+                        } else if let NodeKind::OpticalFlowBlur {
+                            shutter_amount,
+                            samples,
+                            max_blur_px,
+                            sensitivity,
+                            flow_smoothness,
+                            visualize_flow,
+                        } = evaluated_kind
+                        {
+                            if node.inputs.len() != 1 {
+                                return Err(RenderError::MissingGraphInput {
+                                    node_id: node.id.clone(),
+                                    expected: 1,
+                                    actual: node.inputs.len(),
+                                });
+                            }
+                            let (tex, of_hash) = self.evaluate_optical_flow_blur(
+                                graph,
+                                full_topo,
+                                &node.inputs[0],
+                                sub_tick,
+                                frame_ticks,
+                                shutter_amount,
+                                samples,
+                                max_blur_px,
+                                sensitivity,
+                                flow_smoothness,
+                                visualize_flow,
+                                width,
+                                height,
+                                provider,
+                                animator,
+                                sample_ceiling,
+                                precomp_inputs,
+                                precomp_input_hashes,
+                                depth,
+                                pending_readbacks.as_deref_mut(),
+                                encoder,
+                            )?;
+                            (tex, false, Some(of_hash))
+                        } else if let NodeKind::FrameEcho {
+                            echo_step_ticks,
+                            echo_count,
+                            starting_intensity,
+                            decay,
+                            color_decay_rgb,
+                            hue_shift_deg,
+                            operator,
+                        } = evaluated_kind
+                        {
+                            if node.inputs.len() != 1 {
+                                return Err(RenderError::MissingGraphInput {
+                                    node_id: node.id.clone(),
+                                    expected: 1,
+                                    actual: node.inputs.len(),
+                                });
+                            }
+                            let (tex, echo_hash) = self.evaluate_frame_echo(
+                                graph,
+                                full_topo,
+                                &node.inputs[0],
+                                sub_tick,
+                                frame_ticks,
+                                echo_step_ticks,
+                                echo_count,
+                                starting_intensity,
+                                decay,
+                                color_decay_rgb,
+                                hue_shift_deg,
+                                operator,
+                                width,
+                                height,
+                                provider,
+                                animator,
+                                sample_ceiling,
+                                precomp_inputs,
+                                precomp_input_hashes,
+                                depth,
+                                pending_readbacks.as_deref_mut(),
+                                encoder,
+                            )?;
+                            (tex, false, Some(echo_hash))
+                        } else if let NodeKind::Precomp {
+                            ref sub_graph,
+                            time_offset_ticks,
+                            time_scale,
+                            opacity,
+                        } = evaluated_kind
+                        {
+                            let child_depth = depth + 1;
+                            if child_depth > MAX_PRECOMP_DEPTH {
+                                return Err(RenderError::Schema(
+                                    SchemaError::PrecompDepthExceeded {
+                                        node_id: node.id.clone(),
+                                        depth: child_depth,
+                                        max_depth: MAX_PRECOMP_DEPTH,
+                                    },
+                                ));
+                            }
+                            if opacity <= 0.001 {
+                                let out = self.pool.acquire(&self.ctx.device, width, height);
+                                clear_texture(encoder, &out.view, [0.0, 0.0, 0.0, 0.0]);
+                                let mut b = crate::smart_cache::ContentHashBuilder::new();
+                                b.str("PrecompZero");
+                                b.u32(width);
+                                b.u32(height);
+                                (out, false, Some(b.finish()))
+                            } else {
+                                let sub_topo =
+                                    sub_graph.validate_graph_with_depth(child_depth)?;
+                                let mut child_inputs: Vec<&PooledTexture> =
+                                    Vec::with_capacity(node.inputs.len());
+                                let mut child_hashes: Vec<NodeContentHash> =
+                                    Vec::with_capacity(node.inputs.len());
+                                for idx in 0..node.inputs.len() {
+                                    child_inputs.push(require_input(node, &textures, idx)?);
+                                    child_hashes.push(
+                                        node_hashes
+                                            .get(&node.inputs[idx])
+                                            .copied()
+                                            .unwrap_or(NodeContentHash([0u8; 16])),
+                                    );
+                                }
+                                let local_tick =
+                                    remap_precomp_tick(sub_tick, time_offset_ticks, time_scale);
+                                let (sub_tex, sub_hash) = self.evaluate_subgraph_inner(
+                                    sub_graph,
+                                    &sub_topo,
+                                    &sub_graph.output_node,
+                                    local_tick,
+                                    frame_ticks,
+                                    width,
+                                    height,
+                                    provider,
+                                    animator,
+                                    None,
+                                    sample_ceiling,
+                                    &child_inputs,
+                                    &child_hashes,
+                                    child_depth,
+                                    pending_readbacks.as_deref_mut(),
+                                    encoder,
+                                )?;
+                                let op = opacity.clamp(0.0, 1.0);
+                                let final_tex = if op < 0.999 {
+                                    let scaled = self.pool.acquire(&self.ctx.device, width, height);
+                                    let uniform = BlendUniform::new(BlendMode::Normal, op);
+                                    self.record_two_tex_pass(
+                                        encoder,
+                                        &format!("{}-precomp-opacity", node.id.0),
+                                        &self.pipelines.blend,
+                                        &self.dummy_zero_view,
+                                        &sub_tex.view,
+                                        &uniform,
+                                        &scaled.view,
+                                    );
+                                    self.pool.release(sub_tex);
+                                    scaled
+                                } else {
+                                    sub_tex
+                                };
+                                let pre_hash = compute_node_content_hash(
+                                    &evaluated_kind,
+                                    &[sub_hash],
+                                    local_tick,
+                                    width,
+                                    height,
+                                    None,
+                                );
+                                (final_tex, false, Some(pre_hash))
+                            }
+                        } else if let NodeKind::Scene3D {
+                            ref camera,
+                            background_rgba,
+                            ref depth_plate,
+                        } = evaluated_kind
+                        {
+                            let tex = self.evaluate_scene3d(
+                                graph,
+                                node,
+                                camera,
+                                background_rgba,
+                                depth_plate.as_ref(),
+                                sub_tick,
+                                width,
+                                height,
+                                animator,
+                                &textures,
+                                encoder,
+                            )?;
+                            (tex, true, candidate_hash)
+                        } else {
+                            let tex = self.evaluate_single_node(
+                                graph,
+                                node,
+                                &evaluated_kind,
+                                sub_tick,
+                                width,
+                                height,
+                                provider,
+                                animator,
+                                &textures,
+                                precomp_inputs,
+                                encoder,
+                            )?;
+                            (tex, false, candidate_hash)
+                        };
+
+                        computed_hash = actual_hash;
+                        if let Some(h) = candidate_hash {
+                            let queue_cpu = pending_readbacks.is_some();
+                            let mut local_dummy = Vec::new();
+                            let pending_vec = pending_readbacks.as_deref_mut().unwrap_or(&mut local_dummy);
+                            self.smart_cache.store_computed(
+                                &self.ctx.device,
+                                encoder,
+                                h,
+                                heavy,
+                                width,
+                                height,
+                                &tex.texture,
+                                queue_cpu,
+                                pending_vec,
+                            );
+                        }
+                        is_scene3d = sc3d;
+                        tex
+                    }
                 };
-                let release_inputs = !matches!(evaluated_kind, NodeKind::MotionBlurShutter { .. });
-                (out_tex, release_inputs, is_scene3d)
+
+                let fallback_hash = computed_hash.unwrap_or_else(|| {
+                    let mut b = crate::smart_cache::ContentHashBuilder::new();
+                    b.str(&node.id.0);
+                    b.i64(sub_tick.0);
+                    b.u32(width);
+                    b.u32(height);
+                    b.finish()
+                });
+                let release_inputs = !matches!(
+                    evaluated_kind,
+                    NodeKind::MotionBlurShutter { .. }
+                        | NodeKind::OpticalFlowBlur { .. }
+                        | NodeKind::FrameEcho { .. }
+                );
+                (out_tex, fallback_hash, release_inputs, is_scene3d)
             };
 
+            node_hashes.insert(node.id.clone(), out_hash);
             textures.insert(node.id.clone(), out_tex);
 
             if release_inputs {
@@ -1859,6 +2677,18 @@ impl GpuCompositor {
                     );
                 }
                 if release_scene_xform_inputs {
+                    if let NodeKind::Scene3D {
+                        depth_plate: Some(dp),
+                        ..
+                    } = &node.kind
+                    {
+                        release_if_last_use(
+                            &mut self.pool,
+                            &mut remaining_uses,
+                            &mut textures,
+                            &dp.node_id,
+                        );
+                    }
                     for child_id in &node.inputs {
                         if let Some(child) = graph.node(child_id)
                             && child.enabled
@@ -1877,9 +2707,14 @@ impl GpuCompositor {
             }
         }
 
-        textures
+        let out_hash = node_hashes
+            .get(target_id)
+            .copied()
+            .unwrap_or(NodeContentHash([0u8; 16]));
+        let out_tex = textures
             .remove(target_id)
-            .ok_or_else(|| RenderError::Schema(SchemaError::MissingNode(target_id.clone())))
+            .ok_or_else(|| RenderError::Schema(SchemaError::MissingNode(target_id.clone())))?;
+        Ok((out_tex, out_hash))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1898,7 +2733,9 @@ impl GpuCompositor {
         textures: &HashMap<NodeId, PooledTexture>,
         sample_ceiling: Option<u32>,
         precomp_inputs: &[&PooledTexture],
+        precomp_input_hashes: &[NodeContentHash],
         depth: usize,
+        pending_readbacks: Option<&mut Vec<PendingCpuCacheReadback>>,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<PooledTexture, RenderError> {
         let DisabledPassthrough::Input(index) = pass else {
@@ -1920,9 +2757,14 @@ impl GpuCompositor {
             copy_texture_2d(encoder, &src.texture, &out.texture, width, height);
             return Ok(out);
         }
-        // Nested motion blur is not part of this cone; its input is rendered on its own.
-        if matches!(node.kind, NodeKind::MotionBlurShutter { .. }) {
-            return self.evaluate_subgraph_inner(
+        // Nested motion blur / optical flow blur / frame echo is not part of this cone; its input is rendered on its own.
+        if matches!(
+            node.kind,
+            NodeKind::MotionBlurShutter { .. }
+                | NodeKind::OpticalFlowBlur { .. }
+                | NodeKind::FrameEcho { .. }
+        ) {
+            let (tex, _) = self.evaluate_subgraph_inner(
                 graph,
                 full_topo,
                 input_id,
@@ -1935,9 +2777,12 @@ impl GpuCompositor {
                 None,
                 sample_ceiling,
                 precomp_inputs,
+                precomp_input_hashes,
                 depth,
+                pending_readbacks,
                 encoder,
-            );
+            )?;
+            return Ok(tex);
         }
         Err(RenderError::Schema(SchemaError::MissingNode(
             input_id.clone(),
@@ -1961,9 +2806,11 @@ impl GpuCompositor {
         animator: &dyn NodeAnimator,
         sample_ceiling: Option<u32>,
         precomp_inputs: &[&PooledTexture],
+        precomp_input_hashes: &[NodeContentHash],
         depth: usize,
+        mut pending_readbacks: Option<&mut Vec<PendingCpuCacheReadback>>,
         encoder: &mut wgpu::CommandEncoder,
-    ) -> Result<PooledTexture, RenderError> {
+    ) -> Result<(PooledTexture, NodeContentHash), RenderError> {
         let sample_ticks =
             compute_shutter_samples(tick, frame_ticks, shutter_angle_deg, sub_samples, phase)?;
 
@@ -1981,16 +2828,28 @@ impl GpuCompositor {
                 None,
                 sample_ceiling,
                 precomp_inputs,
+                precomp_input_hashes,
                 depth,
+                pending_readbacks,
                 encoder,
             );
         }
 
         let weight = 1.0 / (sample_ticks.len() as f32);
         let mut accum_tex: Option<PooledTexture> = None;
+        let mut b = crate::smart_cache::ContentHashBuilder::new();
+        b.str("MotionBlurShutter");
+        b.f32(shutter_angle_deg);
+        b.u32(sub_samples);
+        b.u8(match phase {
+            ShutterPhase::Centered => 0,
+            ShutterPhase::Trailing => 1,
+        });
+        b.u32(width);
+        b.u32(height);
 
         for t_i in sample_ticks {
-            let sample_tex = self.evaluate_subgraph_inner(
+            let (sample_tex, sample_hash) = self.evaluate_subgraph_inner(
                 graph,
                 full_topo,
                 input_id,
@@ -2003,9 +2862,12 @@ impl GpuCompositor {
                 None,
                 sample_ceiling,
                 precomp_inputs,
+                precomp_input_hashes,
                 depth,
+                pending_readbacks.as_deref_mut(),
                 encoder,
             )?;
+            b.hash(sample_hash);
 
             let next_accum = self.pool.acquire(&self.ctx.device, width, height);
             let uniform = if accum_tex.is_some() {
@@ -2034,7 +2896,358 @@ impl GpuCompositor {
             }
         }
 
-        Ok(accum_tex.expect("sample_ticks is guaranteed non-empty"))
+        Ok((
+            accum_tex.expect("sample_ticks is guaranteed non-empty"),
+            b.finish(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_optical_flow_blur(
+        &mut self,
+        graph: &RenderGraphDef,
+        full_topo: &[NodeId],
+        input_id: &NodeId,
+        tick: Flicks,
+        frame_ticks: Flicks,
+        shutter_amount: f32,
+        samples: u32,
+        max_blur_px: f32,
+        sensitivity: f32,
+        flow_smoothness: f32,
+        visualize_flow: bool,
+        width: u32,
+        height: u32,
+        provider: &dyn FrameProvider,
+        animator: &dyn NodeAnimator,
+        sample_ceiling: Option<u32>,
+        precomp_inputs: &[&PooledTexture],
+        precomp_input_hashes: &[NodeContentHash],
+        depth: usize,
+        mut pending_readbacks: Option<&mut Vec<PendingCpuCacheReadback>>,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(PooledTexture, NodeContentHash), RenderError> {
+        let (curr_tex, curr_hash) = self.evaluate_subgraph_inner(
+            graph,
+            full_topo,
+            input_id,
+            tick,
+            frame_ticks,
+            width,
+            height,
+            provider,
+            animator,
+            None,
+            sample_ceiling,
+            precomp_inputs,
+            precomp_input_hashes,
+            depth,
+            pending_readbacks.as_deref_mut(),
+            encoder,
+        )?;
+
+        if !visualize_flow && (shutter_amount <= 0.0001 || max_blur_px <= 0.01) {
+            return Ok((curr_tex, curr_hash));
+        }
+
+        let dt = if frame_ticks.0 > 0 {
+            frame_ticks
+        } else {
+            Flicks(FLICKS_PER_SECOND / 24)
+        };
+        let (prev_tick, invert_flow_sign) = if tick.0 >= dt.0 {
+            (Flicks(tick.0 - dt.0), false)
+        } else {
+            (Flicks(tick.0 + dt.0), true)
+        };
+
+        let (prev_tex, prev_hash) = self.evaluate_subgraph_inner(
+            graph,
+            full_topo,
+            input_id,
+            prev_tick,
+            frame_ticks,
+            width,
+            height,
+            provider,
+            animator,
+            None,
+            sample_ceiling,
+            precomp_inputs,
+            precomp_input_hashes,
+            depth,
+            pending_readbacks,
+            encoder,
+        )?;
+
+        let level_dims: [(u32, u32); 4] = [
+            (width.max(1), height.max(1)),
+            ((width / 2).max(1), (height / 2).max(1)),
+            ((width / 4).max(1), (height / 4).max(1)),
+            ((width / 8).max(1), (height / 8).max(1)),
+        ];
+
+        let prev_pyr = self.build_luma_pyramid(encoder, "of-prev", &prev_tex, &level_dims);
+        let curr_pyr = self.build_luma_pyramid(encoder, "of-curr", &curr_tex, &level_dims);
+
+        let max_flow_l0 = (max_blur_px * 2.0).max(32.0);
+        let mut flow_tex: Option<PooledTexture> = None;
+
+        for level_idx in (0..4usize).rev() {
+            let (lw, lh) = level_dims[level_idx];
+            let level_scale = (1u32 << level_idx) as f32;
+            let level_max_flow = (max_flow_l0 / level_scale).max(4.0);
+
+            for iter in 0..2 {
+                let next_flow = self.pool.acquire(&self.ctx.device, lw, lh);
+                let has_coarse = flow_tex.is_some();
+                let coarse_view = flow_tex
+                    .as_ref()
+                    .map(|t| &t.view)
+                    .unwrap_or(&self.dummy_zero_view);
+
+                let uniform = OpticalFlowStepUniform::new(
+                    lw,
+                    lh,
+                    flow_smoothness,
+                    sensitivity,
+                    level_max_flow,
+                    4.0,
+                    has_coarse,
+                );
+                self.record_three_tex_pass(
+                    encoder,
+                    &format!("of-step-l{level_idx}-i{iter}"),
+                    &self.pipelines.fx_optical_flow_step,
+                    &prev_pyr[level_idx].view,
+                    &curr_pyr[level_idx].view,
+                    coarse_view,
+                    &uniform,
+                    &next_flow.view,
+                );
+                if let Some(old_flow) = flow_tex.replace(next_flow) {
+                    self.pool.release(old_flow);
+                }
+            }
+        }
+
+        for tex in prev_pyr {
+            self.pool.release(tex);
+        }
+        for tex in curr_pyr {
+            self.pool.release(tex);
+        }
+
+        let final_flow = flow_tex.expect("optical flow pyramid produces level 0 flow");
+        let out_tex = self.pool.acquire(&self.ctx.device, width, height);
+        let effective_samples = match sample_ceiling {
+            Some(c) if c > 0 => samples.min(c.max(1)),
+            _ => samples,
+        };
+        let blur_uniform = OpticalFlowBlurUniform::new(
+            width,
+            height,
+            shutter_amount,
+            max_blur_px,
+            effective_samples,
+            visualize_flow,
+            invert_flow_sign,
+        );
+        self.record_two_tex_pass(
+            encoder,
+            "optical-flow-blur",
+            &self.pipelines.fx_optical_flow_blur,
+            &curr_tex.view,
+            &final_flow.view,
+            &blur_uniform,
+            &out_tex.view,
+        );
+
+        self.pool.release(final_flow);
+        self.pool.release(curr_tex);
+        self.pool.release(prev_tex);
+
+        let mut b = crate::smart_cache::ContentHashBuilder::new();
+        b.str("OpticalFlowBlur");
+        b.hash(curr_hash);
+        b.hash(prev_hash);
+        b.f32(shutter_amount);
+        b.u32(effective_samples);
+        b.f32(max_blur_px);
+        b.f32(sensitivity);
+        b.f32(flow_smoothness);
+        b.bool(visualize_flow);
+        b.bool(invert_flow_sign);
+        b.u32(width);
+        b.u32(height);
+        Ok((out_tex, b.finish()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_frame_echo(
+        &mut self,
+        graph: &RenderGraphDef,
+        full_topo: &[NodeId],
+        input_id: &NodeId,
+        tick: Flicks,
+        frame_ticks: Flicks,
+        echo_step_ticks: i64,
+        echo_count: u32,
+        starting_intensity: f32,
+        decay: f32,
+        color_decay_rgb: [f32; 3],
+        hue_shift_deg: f32,
+        operator: EchoOperator,
+        width: u32,
+        height: u32,
+        provider: &dyn FrameProvider,
+        animator: &dyn NodeAnimator,
+        sample_ceiling: Option<u32>,
+        precomp_inputs: &[&PooledTexture],
+        precomp_input_hashes: &[NodeContentHash],
+        depth: usize,
+        mut pending_readbacks: Option<&mut Vec<PendingCpuCacheReadback>>,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(PooledTexture, NodeContentHash), RenderError> {
+        const MAX_ECHO_COUNT: u32 = 24;
+        let n = echo_count.min(MAX_ECHO_COUNT);
+        if n == 0 {
+            return self.evaluate_subgraph_inner(
+                graph,
+                full_topo,
+                input_id,
+                tick,
+                frame_ticks,
+                width,
+                height,
+                provider,
+                animator,
+                None,
+                sample_ceiling,
+                precomp_inputs,
+                precomp_input_hashes,
+                depth,
+                pending_readbacks,
+                encoder,
+            );
+        }
+
+        let order: Vec<u32> = match operator {
+            EchoOperator::CompositeUnder => (0..=n).rev().collect(),
+            EchoOperator::CompositeOver
+            | EchoOperator::Add
+            | EchoOperator::Screen
+            | EchoOperator::Maximum => (0..=n).collect(),
+        };
+
+        let mut b = crate::smart_cache::ContentHashBuilder::new();
+        b.str("FrameEcho");
+        b.i64(echo_step_ticks);
+        b.u32(n);
+        b.f32(starting_intensity);
+        b.f32(decay);
+        b.f32_slice(&color_decay_rgb);
+        b.f32(hue_shift_deg);
+        b.u32(width);
+        b.u32(height);
+
+        let mut accum_tex: Option<PooledTexture> = None;
+        for i in order {
+            let t_i = Flicks(tick.0.saturating_add((i as i64).saturating_mul(echo_step_ticks)));
+            if i > 0 && t_i.0 < 0 {
+                continue;
+            }
+            let (sample_tex, sample_hash) = self.evaluate_subgraph_inner(
+                graph,
+                full_topo,
+                input_id,
+                t_i,
+                frame_ticks,
+                width,
+                height,
+                provider,
+                animator,
+                None,
+                sample_ceiling,
+                precomp_inputs,
+                precomp_input_hashes,
+                depth,
+                pending_readbacks.as_deref_mut(),
+                encoder,
+            )?;
+            b.u32(i);
+            b.hash(sample_hash);
+
+            let exp_i = i as i32;
+            let weight = starting_intensity.max(0.0) * decay.clamp(0.0, 1.0).powi(exp_i);
+            let tint = [
+                color_decay_rgb[0].max(0.0).powi(exp_i),
+                color_decay_rgb[1].max(0.0).powi(exp_i),
+                color_decay_rgb[2].max(0.0).powi(exp_i),
+            ];
+            let hue_deg = hue_shift_deg * (i as f32);
+            let is_first = accum_tex.is_none();
+            let uniform = FrameEchoUniform::new(tint, weight, operator, is_first, hue_deg);
+
+            let next_accum = self.pool.acquire(&self.ctx.device, width, height);
+            let prev_view = accum_tex
+                .as_ref()
+                .map(|t| &t.view)
+                .unwrap_or(&self.dummy_zero_view);
+
+            self.record_two_tex_pass(
+                encoder,
+                &format!("frame-echo-{i}"),
+                &self.pipelines.fx_frame_echo,
+                &sample_tex.view,
+                prev_view,
+                &uniform,
+                &next_accum.view,
+            );
+
+            self.pool.release(sample_tex);
+            if let Some(prev) = accum_tex.replace(next_accum) {
+                self.pool.release(prev);
+            }
+        }
+
+        Ok((
+            accum_tex.expect("i=0 is always evaluated in FrameEcho"),
+            b.finish(),
+        ))
+    }
+
+    fn build_luma_pyramid(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        label_prefix: &str,
+        src: &PooledTexture,
+        dims: &[(u32, u32); 4],
+    ) -> Vec<PooledTexture> {
+        let mut pyramid = Vec::with_capacity(4);
+        let (w0, h0) = dims[0];
+        let l0 = self.pool.acquire(&self.ctx.device, w0, h0);
+        self.record_one_tex_no_uniform_pass(
+            encoder,
+            &format!("{label_prefix}-luma-0"),
+            &self.pipelines.fx_optical_flow_luma,
+            &src.view,
+            &l0.view,
+        );
+        pyramid.push(l0);
+
+        for (idx, &(lw, lh)) in dims.iter().enumerate().skip(1) {
+            let next_level = self.pool.acquire(&self.ctx.device, lw, lh);
+            self.record_one_tex_no_uniform_pass(
+                encoder,
+                &format!("{label_prefix}-down-{idx}"),
+                &self.pipelines.mipmap_downsample,
+                &pyramid[idx - 1].view,
+                &next_level.view,
+            );
+            pyramid.push(next_level);
+        }
+        pyramid
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2881,6 +4094,23 @@ impl GpuCompositor {
                 );
                 Ok(out)
             }
+            NodeKind::Anime4K {
+                preset,
+                strength,
+                clamp_highlights,
+            } => {
+                let src = require_input(node, textures, 0)?;
+                self.evaluate_anime4k(
+                    encoder,
+                    &node.id.0,
+                    src,
+                    *preset,
+                    *strength,
+                    *clamp_highlights,
+                    width,
+                    height,
+                )
+            }
             NodeKind::FilmOptics {
                 lens_k1,
                 lens_k2,
@@ -3461,12 +4691,651 @@ impl GpuCompositor {
                 self.pool.release(blur_v);
                 Ok(out)
             }
+            NodeKind::DisplacementMap {
+                channel_mode,
+                edge_mode,
+                scale_x,
+                scale_y,
+                neutral_level,
+                angle_rad,
+                chromatic_split,
+                opacity,
+            } => {
+                let src = require_input(node, textures, 0)?;
+                let map = require_input(node, textures, 1)?;
+                let out = self.pool.acquire(&self.ctx.device, width, height);
+                let aspect = width as f32 / height.max(1) as f32;
+                let uniform = DisplacementMapUniform::new(
+                    *channel_mode,
+                    *edge_mode,
+                    *scale_x,
+                    *scale_y,
+                    *neutral_level,
+                    *angle_rad,
+                    *chromatic_split,
+                    *opacity,
+                    aspect,
+                );
+                self.record_two_tex_pass(
+                    encoder,
+                    &node.id.0,
+                    &self.pipelines.fx_displacement_map,
+                    &src.view,
+                    &map.view,
+                    &uniform,
+                    &out.view,
+                );
+                Ok(out)
+            }
+            NodeKind::ShapeMask {
+                vertices,
+                keyframes,
+                closed,
+                feather_px,
+                expand_px,
+                invert,
+                opacity,
+            } => {
+                let feather = feather_px.max(0.0);
+                let out = self.pool.acquire(&self.ctx.device, width, height);
+                if feather <= 1e-4 {
+                    let cfg = ShapeMaskConfig {
+                        vertices: vertices.clone(),
+                        keyframes: keyframes.clone(),
+                        closed: *closed,
+                        feather_px: 0.0,
+                        expand_px: *expand_px,
+                        invert: *invert,
+                        opacity: *opacity,
+                    };
+                    let frame = render_shape_mask_crisp_rgba16f(&cfg, sub_tick, width, height)?;
+                    let src = SourceFrame::rgba_f32_premul(width, height, frame.data);
+                    self.upload_source_frame(
+                        encoder,
+                        &node.id.0,
+                        &src,
+                        ColorSpace::LinearRec709,
+                        &out.view,
+                    )?;
+                } else {
+                    let crisp_cfg = ShapeMaskConfig {
+                        vertices: vertices.clone(),
+                        keyframes: keyframes.clone(),
+                        closed: *closed,
+                        feather_px: 0.0,
+                        expand_px: *expand_px,
+                        invert: false,
+                        opacity: 1.0,
+                    };
+                    let frame =
+                        render_shape_mask_crisp_rgba16f(&crisp_cfg, sub_tick, width, height)?;
+                    let crisp_tex = self.pool.acquire(&self.ctx.device, width, height);
+                    let src = SourceFrame::rgba_f32_premul(width, height, frame.data);
+                    self.upload_source_frame(
+                        encoder,
+                        &node.id.0,
+                        &src,
+                        ColorSpace::LinearRec709,
+                        &crisp_tex.view,
+                    )?;
+
+                    let blur_h = self.pool.acquire(&self.ctx.device, width, height);
+                    let u_h = ShapeMaskFeatherUniform::new(
+                        [1.0, 0.0],
+                        feather,
+                        false,
+                        false,
+                        1.0,
+                        [0.0, 0.0],
+                    );
+                    self.record_one_tex_pass(
+                        encoder,
+                        &format!("{}-feather-h", node.id.0),
+                        &self.pipelines.fx_shape_mask_feather,
+                        &crisp_tex.view,
+                        &u_h,
+                        &blur_h.view,
+                    );
+
+                    let u_v = ShapeMaskFeatherUniform::new(
+                        [0.0, 1.0],
+                        feather,
+                        true,
+                        *invert,
+                        *opacity,
+                        [0.0, 0.0],
+                    );
+                    self.record_one_tex_pass(
+                        encoder,
+                        &format!("{}-feather-v", node.id.0),
+                        &self.pipelines.fx_shape_mask_feather,
+                        &blur_h.view,
+                        &u_v,
+                        &out.view,
+                    );
+                    self.pool.release(crisp_tex);
+                    self.pool.release(blur_h);
+                }
+                Ok(out)
+            }
             NodeKind::MotionBlurShutter { .. }
+            | NodeKind::OpticalFlowBlur { .. }
+            | NodeKind::FrameEcho { .. }
             | NodeKind::Scene3D { .. }
             | NodeKind::Precomp { .. } => {
                 unreachable!("handled in evaluate_subgraph_inner")
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_anime4k(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        src: &PooledTexture,
+        preset: Anime4KPreset,
+        strength: f32,
+        clamp_highlights: bool,
+        width: u32,
+        height: u32,
+    ) -> Result<PooledTexture, RenderError> {
+        let strength = strength.clamp(0.0, 2.0);
+        if strength <= 1e-5 {
+            let out = self.pool.acquire(&self.ctx.device, width, height);
+            copy_texture_2d(encoder, &src.texture, &out.texture, width, height);
+            return Ok(out);
+        }
+
+        let texel = [1.0 / width.max(1) as f32, 1.0 / height.max(1) as f32];
+        let uniform = Anime4KUniform::new(texel, strength, 1.0);
+
+        let mut work = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-to-srgb"),
+            &self.pipelines.anime4k.to_srgb_straight,
+            &src.view,
+            &self.dummy_zero_view,
+            &uniform,
+            &work.view,
+        );
+
+        if clamp_highlights {
+            let stats_x = self.pool.acquire(&self.ctx.device, width, height);
+            self.record_two_tex_pass(
+                encoder,
+                &format!("{label}-clamp-x"),
+                &self.pipelines.anime4k.clamp_stats_x,
+                &work.view,
+                &self.dummy_zero_view,
+                &uniform,
+                &stats_x.view,
+            );
+            let stats_y = self.pool.acquire(&self.ctx.device, width, height);
+            self.record_two_tex_pass(
+                encoder,
+                &format!("{label}-clamp-y"),
+                &self.pipelines.anime4k.clamp_stats_y,
+                &stats_x.view,
+                &self.dummy_zero_view,
+                &uniform,
+                &stats_y.view,
+            );
+            self.pool.release(stats_x);
+
+            let clamped = self.pool.acquire(&self.ctx.device, width, height);
+            self.record_two_tex_pass(
+                encoder,
+                &format!("{label}-clamp"),
+                &self.pipelines.anime4k.clamp_apply,
+                &work.view,
+                &stats_y.view,
+                &uniform,
+                &clamped.view,
+            );
+            self.pool.release(stats_y);
+            self.pool.release(work);
+            work = clamped;
+        }
+
+        let (fx_res, upscaled_2x) = match preset {
+            Anime4KPreset::RestoreOnly => {
+                let restored = self.run_anime4k_restore_cnn(
+                    encoder, label, false, &work, width, height, &uniform,
+                );
+                self.pool.release(work);
+                (restored, false)
+            }
+            Anime4KPreset::ModeA => {
+                let restored = self.run_anime4k_restore_cnn(
+                    encoder, label, false, &work, width, height, &uniform,
+                );
+                self.pool.release(work);
+                let up = self.run_anime4k_upscale_x2(
+                    encoder, label, false, &restored, width, height, &uniform,
+                );
+                self.pool.release(restored);
+                (up, true)
+            }
+            Anime4KPreset::ModeB => {
+                let restored = self.run_anime4k_restore_cnn(
+                    encoder, label, true, &work, width, height, &uniform,
+                );
+                self.pool.release(work);
+                let up = self.run_anime4k_upscale_x2(
+                    encoder, label, false, &restored, width, height, &uniform,
+                );
+                self.pool.release(restored);
+                (up, true)
+            }
+            Anime4KPreset::ModeC => {
+                let up = self.run_anime4k_upscale_x2(
+                    encoder, label, true, &work, width, height, &uniform,
+                );
+                self.pool.release(work);
+                (up, true)
+            }
+            Anime4KPreset::LineArt => {
+                let darkened =
+                    self.run_anime4k_darken_hq(encoder, label, &work, width, height, &uniform);
+                self.pool.release(work);
+                let thinned =
+                    self.run_anime4k_thin_hq(encoder, label, &darkened, width, height, &uniform);
+                self.pool.release(darkened);
+                (thinned, false)
+            }
+        };
+
+        let out = self.pool.acquire(&self.ctx.device, width, height);
+        let bridge_strength = if matches!(preset, Anime4KPreset::LineArt) {
+            1.0
+        } else {
+            strength
+        };
+        let bridge_uniform = Anime4KUniform::new(
+            texel,
+            bridge_strength,
+            if upscaled_2x { 2.0 } else { 1.0 },
+        );
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-to-linear"),
+            &self.pipelines.anime4k.to_linear_premul,
+            &src.view,
+            &fx_res.view,
+            &bridge_uniform,
+            &out.view,
+        );
+        self.pool.release(fx_res);
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_anime4k_restore_cnn(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        soft: bool,
+        input: &PooledTexture,
+        width: u32,
+        height: u32,
+        uniform: &Anime4KUniform,
+    ) -> PooledTexture {
+        let progs = if soft {
+            &self.pipelines.anime4k.restore_soft_s
+        } else {
+            &self.pipelines.anime4k.restore_s
+        };
+        let c0 = self.pool.acquire(&self.ctx.device, width, height);
+        Self::record_two_tex_pass_ctx(
+            &self.ctx,
+            encoder,
+            &format!("{label}-restore-c0"),
+            &progs[0],
+            &input.view,
+            &self.dummy_zero_view,
+            uniform,
+            &c0.view,
+        );
+        let c1 = self.pool.acquire(&self.ctx.device, width, height);
+        Self::record_two_tex_pass_ctx(
+            &self.ctx,
+            encoder,
+            &format!("{label}-restore-c1"),
+            &progs[1],
+            &c0.view,
+            &self.dummy_zero_view,
+            uniform,
+            &c1.view,
+        );
+        self.pool.release(c0);
+
+        let c2 = self.pool.acquire(&self.ctx.device, width, height);
+        Self::record_two_tex_pass_ctx(
+            &self.ctx,
+            encoder,
+            &format!("{label}-restore-c2"),
+            &progs[2],
+            &c1.view,
+            &self.dummy_zero_view,
+            uniform,
+            &c2.view,
+        );
+        self.pool.release(c1);
+
+        let out = self.pool.acquire(&self.ctx.device, width, height);
+        Self::record_two_tex_pass_ctx(
+            &self.ctx,
+            encoder,
+            &format!("{label}-restore-c3"),
+            &progs[3],
+            &input.view,
+            &c2.view,
+            uniform,
+            &out.view,
+        );
+        self.pool.release(c2);
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_anime4k_upscale_x2(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        denoise: bool,
+        input: &PooledTexture,
+        width: u32,
+        height: u32,
+        uniform: &Anime4KUniform,
+    ) -> PooledTexture {
+        let progs = if denoise {
+            &self.pipelines.anime4k.upscale_denoise_x2_s
+        } else {
+            &self.pipelines.anime4k.upscale_x2_s
+        };
+        let c0 = self.pool.acquire(&self.ctx.device, width, height);
+        Self::record_two_tex_pass_ctx(
+            &self.ctx,
+            encoder,
+            &format!("{label}-up-c0"),
+            &progs[0],
+            &input.view,
+            &self.dummy_zero_view,
+            uniform,
+            &c0.view,
+        );
+        let c1 = self.pool.acquire(&self.ctx.device, width, height);
+        Self::record_two_tex_pass_ctx(
+            &self.ctx,
+            encoder,
+            &format!("{label}-up-c1"),
+            &progs[1],
+            &c0.view,
+            &self.dummy_zero_view,
+            uniform,
+            &c1.view,
+        );
+        self.pool.release(c0);
+
+        let c2 = self.pool.acquire(&self.ctx.device, width, height);
+        Self::record_two_tex_pass_ctx(
+            &self.ctx,
+            encoder,
+            &format!("{label}-up-c2"),
+            &progs[2],
+            &c1.view,
+            &self.dummy_zero_view,
+            uniform,
+            &c2.view,
+        );
+        self.pool.release(c1);
+
+        let c3 = self.pool.acquire(&self.ctx.device, width, height);
+        Self::record_two_tex_pass_ctx(
+            &self.ctx,
+            encoder,
+            &format!("{label}-up-c3"),
+            &progs[3],
+            &c2.view,
+            &self.dummy_zero_view,
+            uniform,
+            &c3.view,
+        );
+        self.pool.release(c2);
+
+        let out = self
+            .pool
+            .acquire(&self.ctx.device, width.saturating_mul(2), height.saturating_mul(2));
+        Self::record_two_tex_pass_ctx(
+            &self.ctx,
+            encoder,
+            &format!("{label}-up-d2s"),
+            &progs[4],
+            &input.view,
+            &c3.view,
+            uniform,
+            &out.view,
+        );
+        self.pool.release(c3);
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_two_tex_pass_ctx<U: Pod>(
+        ctx: &GpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        program: &ShaderProgram,
+        tex0: &wgpu::TextureView,
+        tex1: &wgpu::TextureView,
+        uniform: &U,
+        target_view: &wgpu::TextureView,
+    ) {
+        let uniform_buf = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::bytes_of(uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout: &program.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(tex0),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(tex1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&ctx.linear_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+            ],
+        });
+        draw_fullscreen_pass(encoder, label, &program.pipeline, &bind_group, target_view);
+    }
+
+    fn run_anime4k_darken_hq(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        input: &PooledTexture,
+        width: u32,
+        height: u32,
+        uniform: &Anime4KUniform,
+    ) -> PooledTexture {
+        let luma = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-darken-luma"),
+            &self.pipelines.anime4k.darken_luma,
+            &input.view,
+            &self.dummy_zero_view,
+            uniform,
+            &luma.view,
+        );
+        let kx = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-darken-dx"),
+            &self.pipelines.anime4k.darken_diff_x,
+            &luma.view,
+            &self.dummy_zero_view,
+            uniform,
+            &kx.view,
+        );
+        let ky = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-darken-dy"),
+            &self.pipelines.anime4k.darken_diff_y,
+            &luma.view,
+            &kx.view,
+            uniform,
+            &ky.view,
+        );
+        self.pool.release(luma);
+        self.pool.release(kx);
+
+        let gx = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-darken-gx"),
+            &self.pipelines.anime4k.darken_gauss_x,
+            &ky.view,
+            &self.dummy_zero_view,
+            uniform,
+            &gx.view,
+        );
+        self.pool.release(ky);
+
+        let out = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-darken-comp"),
+            &self.pipelines.anime4k.darken_composite,
+            &input.view,
+            &gx.view,
+            uniform,
+            &out.view,
+        );
+        self.pool.release(gx);
+        out
+    }
+
+    fn run_anime4k_thin_hq(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        input: &PooledTexture,
+        width: u32,
+        height: u32,
+        uniform: &Anime4KUniform,
+    ) -> PooledTexture {
+        let luma = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-thin-luma"),
+            &self.pipelines.anime4k.thin_luma,
+            &input.view,
+            &self.dummy_zero_view,
+            uniform,
+            &luma.view,
+        );
+        let sx = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-thin-sx"),
+            &self.pipelines.anime4k.thin_sobel_x,
+            &luma.view,
+            &self.dummy_zero_view,
+            uniform,
+            &sx.view,
+        );
+        self.pool.release(luma);
+
+        let sy = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-thin-sy"),
+            &self.pipelines.anime4k.thin_sobel_y,
+            &sx.view,
+            &self.dummy_zero_view,
+            uniform,
+            &sy.view,
+        );
+        self.pool.release(sx);
+
+        let gx = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-thin-gx"),
+            &self.pipelines.anime4k.thin_gauss_x,
+            &sy.view,
+            &self.dummy_zero_view,
+            uniform,
+            &gx.view,
+        );
+        self.pool.release(sy);
+
+        let gy = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-thin-gy"),
+            &self.pipelines.anime4k.thin_gauss_y,
+            &gx.view,
+            &self.dummy_zero_view,
+            uniform,
+            &gy.view,
+        );
+        self.pool.release(gx);
+
+        let kx = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-thin-kx"),
+            &self.pipelines.anime4k.thin_kernel_x,
+            &gy.view,
+            &self.dummy_zero_view,
+            uniform,
+            &kx.view,
+        );
+        self.pool.release(gy);
+
+        let ky = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-thin-ky"),
+            &self.pipelines.anime4k.thin_kernel_y,
+            &kx.view,
+            &self.dummy_zero_view,
+            uniform,
+            &ky.view,
+        );
+        self.pool.release(kx);
+
+        let out = self.pool.acquire(&self.ctx.device, width, height);
+        self.record_two_tex_pass(
+            encoder,
+            &format!("{label}-thin-warp"),
+            &self.pipelines.anime4k.thin_warp,
+            &input.view,
+            &ky.view,
+            uniform,
+            &out.view,
+        );
+        self.pool.release(ky);
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3476,6 +5345,7 @@ impl GpuCompositor {
         node: &GraphNodeDef,
         camera: &Camera3DDef,
         background_rgba: [f32; 4],
+        depth_plate: Option<&SceneDepthPlateDef>,
         sub_tick: Flicks,
         width: u32,
         height: u32,
@@ -3830,6 +5700,57 @@ impl GpuCompositor {
 
         let text_cache = &self.text3d_mesh_cache;
         let shape_cache = &self.shape3d_mesh_cache;
+        let depth_seed_bg = if let Some(dp) = depth_plate {
+            let dp_tex = textures.get(&dp.node_id).ok_or_else(|| {
+                RenderError::Schema(frameshift_schema::SchemaError::MissingNode(
+                    dp.node_id.clone(),
+                ))
+            })?;
+            let seed_uniform = Scene3DDepthSeedUniform::new_ex(
+                cam.near,
+                cam.far,
+                dp.near_z,
+                dp.far_z,
+                dp.invert,
+                dp.depth_gamma,
+                dp.disparity_mode,
+                dp.rg16_packed,
+            );
+            let uniform_buf =
+                self.ctx
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("scene3d-depth-seed-u"),
+                        contents: bytemuck::bytes_of(&seed_uniform),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+            let bgl = self
+                .pipelines
+                .scene3d_msaa4x
+                .as_ref()
+                .map(|m| &m.depth_seed.bind_group_layout)
+                .unwrap_or(&self.pipelines.scene3d_depth_seed.bind_group_layout);
+            Some(self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("scene3d-depth-seed-bg"),
+                layout: bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&dp_tex.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.ctx.linear_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: uniform_buf.as_entire_binding(),
+                    },
+                ],
+            }))
+        } else {
+            None
+        };
         let draw_opaque_and_echo =
             |pass: &mut wgpu::RenderPass<'_>,
              text_pipe: &wgpu::RenderPipeline,
@@ -3960,6 +5881,11 @@ impl GpuCompositor {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
+                    if let Some(ref bg) = depth_seed_bg {
+                        pass.set_pipeline(&msaa_pipes.depth_seed.pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
                     draw_opaque_and_echo(
                         &mut pass,
                         &msaa_pipes.text3d_mesh.pipeline,
@@ -4037,6 +5963,11 @@ impl GpuCompositor {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
+                    if let Some(ref bg) = depth_seed_bg {
+                        pass.set_pipeline(&self.pipelines.scene3d_depth_seed.pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
                     draw_opaque_and_echo(
                         &mut pass,
                         &self.pipelines.text3d_mesh.pipeline,
@@ -5116,7 +7047,7 @@ impl GpuCompositor {
     }
 
     fn upload_source_frame(
-        &self,
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         asset_id: &str,
         frame: &crate::provider::SourceFrame,
@@ -5130,7 +7061,7 @@ impl GpuCompositor {
             ColorSpace::LinearRec709 => ColorSpaceMode::LinearToLinear,
         };
 
-        let staging_tex = match &frame.pixels {
+        match &frame.pixels {
             SourcePixelData::Rgba8 {
                 data,
                 premultiplied,
@@ -5144,21 +7075,6 @@ impl GpuCompositor {
                     });
                 }
 
-                let tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("frameshift-src-rgba8"),
-                    size: wgpu::Extent3d {
-                        width: frame.width,
-                        height: frame.height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                });
-
                 let upload_buf;
                 let upload_slice: &[u8] = if *premultiplied {
                     data.as_slice()
@@ -5167,9 +7083,12 @@ impl GpuCompositor {
                     upload_buf.as_slice()
                 };
 
+                let (tex, view) =
+                    self.staging_pool
+                        .acquire_rgba8(&self.ctx.device, frame.width, frame.height);
                 self.ctx.queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
-                        texture: &tex,
+                        texture: tex,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
@@ -5186,7 +7105,16 @@ impl GpuCompositor {
                         depth_or_array_layers: 1,
                     },
                 );
-                tex
+                let uniform = ColorBasicUniform::identity(space_mode);
+                record_one_tex_pass_with(
+                    &self.ctx,
+                    encoder,
+                    "source-upload-convert",
+                    &self.pipelines.color_basic,
+                    view,
+                    &uniform,
+                    dst_view,
+                );
             }
             SourcePixelData::RgbaF32 {
                 data,
@@ -5215,24 +7143,14 @@ impl GpuCompositor {
                     ]);
                 }
 
-                let tex = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("frameshift-src-rgba16f"),
-                    size: wgpu::Extent3d {
-                        width: frame.width,
-                        height: frame.height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: WORKING_TEXTURE_FORMAT,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                });
-
+                let (tex, view) = self.staging_pool.acquire_rgba16f(
+                    &self.ctx.device,
+                    frame.width,
+                    frame.height,
+                );
                 self.ctx.queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
-                        texture: &tex,
+                        texture: tex,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
@@ -5249,20 +7167,95 @@ impl GpuCompositor {
                         depth_or_array_layers: 1,
                     },
                 );
-                tex
+                let uniform = ColorBasicUniform::identity(space_mode);
+                record_one_tex_pass_with(
+                    &self.ctx,
+                    encoder,
+                    "source-upload-convert",
+                    &self.pipelines.color_basic,
+                    view,
+                    &uniform,
+                    dst_view,
+                );
             }
-        };
+            SourcePixelData::Nv12 {
+                y_plane,
+                uv_plane,
+                alpha_plane,
+                color_info,
+                content_uv_rect,
+            } => {
+                if frame.width < 2
+                    || frame.height < 2
+                    || !frame.width.is_multiple_of(2)
+                    || !frame.height.is_multiple_of(2)
+                {
+                    return Err(RenderError::InvalidDimensions {
+                        width: frame.width,
+                        height: frame.height,
+                    });
+                }
+                if y_plane.len() != pixel_count {
+                    return Err(RenderError::InvalidFrameBuffer {
+                        asset_id: asset_id.to_owned(),
+                        expected: pixel_count,
+                        actual: y_plane.len(),
+                    });
+                }
+                let expected_uv = ((frame.width / 2) as usize) * ((frame.height / 2) as usize) * 2;
+                if uv_plane.len() != expected_uv {
+                    return Err(RenderError::InvalidFrameBuffer {
+                        asset_id: asset_id.to_owned(),
+                        expected: expected_uv,
+                        actual: uv_plane.len(),
+                    });
+                }
+                if let Some(a) = alpha_plane
+                    && a.len() != pixel_count
+                {
+                    return Err(RenderError::InvalidFrameBuffer {
+                        asset_id: asset_id.to_owned(),
+                        expected: pixel_count,
+                        actual: a.len(),
+                    });
+                }
 
-        let staging_view = staging_tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let uniform = ColorBasicUniform::identity(space_mode);
-        self.record_one_tex_pass(
-            encoder,
-            "source-upload-convert",
-            &self.pipelines.color_basic,
-            &staging_view,
-            &uniform,
-            dst_view,
-        );
+                let transfer_mode = match color_space {
+                    ColorSpace::LinearRec709 => 0,
+                    ColorSpace::DisplaySrgb => color_info.transfer.shader_mode(),
+                };
+                let uniform = YuvToLinearUniform::new(
+                    color_info.matrix.shader_mode(),
+                    color_info.range.shader_mode(),
+                    color_info.chroma_location.shader_mode(),
+                    transfer_mode,
+                    alpha_plane.is_some(),
+                    frame.width,
+                    frame.height,
+                    *content_uv_rect,
+                );
+                let (y_view, uv_view, alpha_view) = self.staging_pool.upload_nv12_planes(
+                    &self.ctx.device,
+                    &self.ctx.queue,
+                    frame.width,
+                    frame.height,
+                    y_plane,
+                    uv_plane,
+                    alpha_plane.as_deref(),
+                );
+                record_three_tex_pass_with(
+                    &self.ctx,
+                    encoder,
+                    "source-upload-nv12",
+                    &self.pipelines.yuv_to_linear,
+                    y_view,
+                    uv_view,
+                    alpha_view,
+                    &uniform,
+                    dst_view,
+                );
+            }
+        }
         Ok(())
     }
 
@@ -5486,24 +7479,14 @@ impl GpuCompositor {
         draw_fullscreen_pass(encoder, label, &program.pipeline, &bind_group, target_view);
     }
 
-    fn record_one_tex_pass<U: Pod>(
+    fn record_one_tex_no_uniform_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         label: &str,
         program: &ShaderProgram,
         tex0: &wgpu::TextureView,
-        uniform: &U,
         target_view: &wgpu::TextureView,
     ) {
-        let uniform_buf = self
-            .ctx
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::bytes_of(uniform),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-
         let bind_group = self
             .ctx
             .device
@@ -5519,14 +7502,30 @@ impl GpuCompositor {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(&self.ctx.linear_sampler),
                     },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: uniform_buf.as_entire_binding(),
-                    },
                 ],
             });
 
         draw_fullscreen_pass(encoder, label, &program.pipeline, &bind_group, target_view);
+    }
+
+    fn record_one_tex_pass<U: Pod>(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        program: &ShaderProgram,
+        tex0: &wgpu::TextureView,
+        uniform: &U,
+        target_view: &wgpu::TextureView,
+    ) {
+        record_one_tex_pass_with(
+            &self.ctx,
+            encoder,
+            label,
+            program,
+            tex0,
+            uniform,
+            target_view,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5576,6 +7575,31 @@ impl GpuCompositor {
             });
 
         draw_fullscreen_pass(encoder, label, &program.pipeline, &bind_group, target_view);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_three_tex_pass<U: Pod>(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        label: &str,
+        program: &ShaderProgram,
+        tex0: &wgpu::TextureView,
+        tex1: &wgpu::TextureView,
+        tex2: &wgpu::TextureView,
+        uniform: &U,
+        target_view: &wgpu::TextureView,
+    ) {
+        record_three_tex_pass_with(
+            &self.ctx,
+            encoder,
+            label,
+            program,
+            tex0,
+            tex1,
+            tex2,
+            uniform,
+            target_view,
+        );
     }
 
     fn readback_rgba8(
@@ -6377,6 +8401,111 @@ fn is_vector_override_absent_message(msg: &str) -> bool {
         || lower == "not found"
 }
 
+fn source_frame_content_hash(frame: &SourceFrame) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mix = |acc: &mut u64, bytes: &[u8]| {
+        const FNV_PRIME: u64 = 0x0100_0000_01b3;
+        for &b in bytes {
+            *acc ^= b as u64;
+            *acc = acc.wrapping_mul(FNV_PRIME);
+        }
+    };
+    mix(&mut h, &frame.width.to_le_bytes());
+    mix(&mut h, &frame.height.to_le_bytes());
+    match &frame.pixels {
+        SourcePixelData::Rgba8 {
+            data,
+            premultiplied,
+        } => {
+            mix(&mut h, &[0, u8::from(*premultiplied)]);
+            mix(&mut h, data);
+        }
+        SourcePixelData::RgbaF32 {
+            data,
+            premultiplied,
+        } => {
+            mix(&mut h, &[1, u8::from(*premultiplied)]);
+            mix(&mut h, cast_slice(data));
+        }
+        SourcePixelData::Nv12 {
+            y_plane,
+            uv_plane,
+            alpha_plane,
+            color_info,
+            content_uv_rect,
+        } => {
+            mix(
+                &mut h,
+                &[
+                    2,
+                    color_info.matrix.shader_mode() as u8,
+                    color_info.range.shader_mode() as u8,
+                    color_info.chroma_location.shader_mode() as u8,
+                    color_info.transfer.shader_mode() as u8,
+                ],
+            );
+            mix(&mut h, cast_slice(content_uv_rect));
+            mix(&mut h, y_plane);
+            mix(&mut h, uv_plane);
+            if let Some(a) = alpha_plane {
+                mix(&mut h, &[1]);
+                mix(&mut h, a);
+            } else {
+                mix(&mut h, &[0]);
+            }
+        }
+    }
+    h
+}
+
+fn compute_scene3d_content_hash(
+    graph: &RenderGraphDef,
+    scene_node: &GraphNodeDef,
+    depth_plate: Option<&SceneDepthPlateDef>,
+    sub_tick: Flicks,
+    node_hashes: &HashMap<NodeId, NodeContentHash>,
+    animator: &dyn NodeAnimator,
+) -> Result<NodeContentHash, RenderError> {
+    let mut b = crate::smart_cache::ContentHashBuilder::new();
+    b.str("Scene3DChildren");
+    if let Some(dp) = depth_plate {
+        b.u8(1);
+        b.hash(
+            node_hashes
+                .get(&dp.node_id)
+                .copied()
+                .unwrap_or(NodeContentHash([0u8; 16])),
+        );
+    } else {
+        b.u8(0);
+    }
+    b.u32(scene_node.inputs.len() as u32);
+    for child_id in &scene_node.inputs {
+        if let Some(child) = graph.node(child_id) {
+            b.str(&child.id.0);
+            b.bool(child.enabled);
+            if child.enabled {
+                let eval_child = animator.evaluate_node(&child.id, &child.kind, sub_tick)?;
+                let child_in_hashes: Vec<NodeContentHash> = child
+                    .inputs
+                    .iter()
+                    .filter_map(|id| node_hashes.get(id).copied())
+                    .collect();
+                let ch = compute_node_content_hash(
+                    &eval_child,
+                    &child_in_hashes,
+                    sub_tick,
+                    1,
+                    1,
+                    None,
+                );
+                b.hash(ch);
+            }
+        }
+    }
+    Ok(b.finish())
+}
+
 fn collect_direct_cone(
     graph: &RenderGraphDef,
     target_id: &NodeId,
@@ -6390,11 +8519,25 @@ fn collect_direct_cone(
         let node = graph
             .node(&id)
             .ok_or_else(|| frameshift_schema::SchemaError::MissingNode(id.clone()))?;
-        if &id != target_id && matches!(node.kind, NodeKind::MotionBlurShutter { .. }) {
+        if &id != target_id
+            && matches!(
+                node.kind,
+                NodeKind::MotionBlurShutter { .. }
+                    | NodeKind::OpticalFlowBlur { .. }
+                    | NodeKind::FrameEcho { .. }
+            )
+        {
             continue;
         }
         for upstream in &node.inputs {
             stack.push(upstream.clone());
+        }
+        if let NodeKind::Scene3D {
+            depth_plate: Some(dp),
+            ..
+        } = &node.kind
+        {
+            stack.push(dp.node_id.clone());
         }
     }
     Ok(visited)
@@ -6442,6 +8585,95 @@ fn clear_texture(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, r
         occlusion_query_set: None,
         multiview_mask: None,
     });
+}
+
+fn record_one_tex_pass_with<U: Pod>(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    program: &ShaderProgram,
+    tex0: &wgpu::TextureView,
+    uniform: &U,
+    target_view: &wgpu::TextureView,
+) {
+    let uniform_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::bytes_of(uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: &program.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(tex0),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&ctx.linear_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: uniform_buf.as_entire_binding(),
+            },
+        ],
+    });
+
+    draw_fullscreen_pass(encoder, label, &program.pipeline, &bind_group, target_view);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_three_tex_pass_with<U: Pod>(
+    ctx: &GpuContext,
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    program: &ShaderProgram,
+    tex0: &wgpu::TextureView,
+    tex1: &wgpu::TextureView,
+    tex2: &wgpu::TextureView,
+    uniform: &U,
+    target_view: &wgpu::TextureView,
+) {
+    let uniform_buf = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::bytes_of(uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: &program.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(tex0),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(tex1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(tex2),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&ctx.linear_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: uniform_buf.as_entire_binding(),
+            },
+        ],
+    });
+
+    draw_fullscreen_pass(encoder, label, &program.pipeline, &bind_group, target_view);
 }
 
 fn draw_fullscreen_pass(
@@ -6726,6 +8958,35 @@ mod tests {
 
         assert!((real_flash - 0.12).abs() < 1e-4);
         assert!((synth_flash - real_flash).abs() > 0.1);
+
+        let band_env = AudioRmsEnvelope::with_bands(
+            Flicks(FLICKS_PER_SECOND),
+            vec![0.3, 0.3, 0.3],
+            vec![0.9, 0.9, 0.9],
+            vec![0.4, 0.4, 0.4],
+            vec![0.2, 0.2, 0.2],
+            Some(150.0),
+            Flicks::ZERO,
+            Flicks::ZERO,
+            4,
+        );
+        project.param_bindings = vec![ParamBindingDef {
+            node_id: NodeId::from("grade_flash"),
+            param_name: "flash_amount".into(),
+            expression: "audio_sub * 0.5 + audio_mid * 0.25 + audio_high + downbeat_phase * 0.0".into(),
+        }];
+        let band_anim =
+            ProjectAnimator::with_audio_envelope(&project, Some(&band_env)).expect("band bindings");
+        let NodeKind::ColorBasic {
+            flash_amount: band_flash,
+            ..
+        } = band_anim
+            .evaluate_node(&NodeId::from("grade_flash"), &base, tick)
+            .expect("band eval")
+        else {
+            panic!("expected ColorBasic");
+        };
+        assert!((band_flash - (0.9 * 0.5 + 0.4 * 0.25 + 0.2)).abs() < 1e-4);
     }
 
     fn blend_opacity(kind: &NodeKind) -> f32 {

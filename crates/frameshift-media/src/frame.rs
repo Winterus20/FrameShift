@@ -1,6 +1,7 @@
 use crate::error::MediaError;
 use crate::ffmpeg::SourceFit;
 use frameshift_time::Flicks;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor};
 use std::path::Path;
@@ -583,6 +584,205 @@ impl Rgba16fFrame {
         }
         h.finish()
     }
+
+    /// Decodes an RG16-packed `Rgba8Frame` (`R = hi byte, G = lo byte`) into linear `[d, d, d, 1.0]`.
+    pub fn from_rg16_packed(frame: &Rgba8Frame) -> Result<Self, MediaError> {
+        let pixel_count = validated_pixel_len(frame.width, frame.height)?;
+        let expected_bytes = pixel_count
+            .checked_mul(4)
+            .ok_or(MediaError::InvalidDimensions {
+                width: frame.width,
+                height: frame.height,
+            })?;
+        if frame.data.len() != expected_bytes {
+            return Err(MediaError::BufferLengthMismatch {
+                expected: expected_bytes,
+                actual: frame.data.len(),
+            });
+        }
+        let mut data = Vec::with_capacity(pixel_count);
+        for px in frame.data.as_chunks::<4>().0 {
+            let d16 = ((px[0] as u16) << 8) | (px[1] as u16);
+            let d = (d16 as f32) / 65535.0;
+            data.push([d, d, d, 1.0]);
+        }
+        Ok(Self {
+            width: frame.width,
+            height: frame.height,
+            pts: frame.pts,
+            alpha_mode: AlphaMode::Premultiplied,
+            data,
+        })
+    }
+
+    /// Encodes channel 0 (or depth scalar) as a 16-bit grayscale PNG byte stream.
+    pub fn encode_grayscale_png16_bytes(&self) -> Result<Vec<u8>, MediaError> {
+        let pixel_count = validated_pixel_len(self.width, self.height)?;
+        if self.data.len() != pixel_count {
+            return Err(MediaError::BufferLengthMismatch {
+                expected: pixel_count,
+                actual: self.data.len(),
+            });
+        }
+        let mut raw = Vec::with_capacity(pixel_count * 2);
+        for px in &self.data {
+            let v16 = (sanitize_unit(px[0]) * 65535.0).round().clamp(0.0, 65535.0) as u16;
+            raw.extend_from_slice(&v16.to_be_bytes());
+        }
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, self.width, self.height);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Sixteen);
+            let mut writer = encoder
+                .write_header()
+                .map_err(|e| MediaError::PngEncode(e.to_string()))?;
+            writer
+                .write_image_data(&raw)
+                .map_err(|e| MediaError::PngEncode(e.to_string()))?;
+        }
+        Ok(out)
+    }
+
+    /// Saves channel 0 as a 16-bit grayscale PNG file on disk.
+    pub fn save_grayscale_png16(&self, path: &Path) -> Result<(), MediaError> {
+        let bytes = self.encode_grayscale_png16_bytes()?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    /// Decodes an 8-bit or 16-bit PNG byte slice into linear float32 `Rgba16fFrame`
+    /// without truncating 16-bit grayscale/RGB depth values to 8-bit.
+    pub fn decode_png_linear_f32_bytes(bytes: &[u8], pts: Flicks) -> Result<Self, MediaError> {
+        decode_png_linear_f32_reader(Cursor::new(bytes), pts)
+    }
+
+    /// Loads an 8-bit or 16-bit PNG file into linear float32 `Rgba16fFrame`
+    /// preserving full 16-bit grayscale/RGB precision.
+    pub fn load_png_linear_f32(path: &Path, pts: Flicks) -> Result<Self, MediaError> {
+        let file = File::open(path)?;
+        decode_png_linear_f32_reader(BufReader::new(file), pts)
+    }
+}
+
+fn decode_png_linear_f32_reader<R: std::io::BufRead + std::io::Seek>(
+    reader: R,
+    pts: Flicks,
+) -> Result<Rgba16fFrame, MediaError> {
+    let mut decoder = png::Decoder::new(reader);
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut png_reader = decoder
+        .read_info()
+        .map_err(|e| MediaError::PngDecode(e.to_string()))?;
+    let buf_size = png_reader
+        .output_buffer_size()
+        .ok_or_else(|| MediaError::PngDecode("PNG output buffer size overflow".into()))?;
+    let mut buf = vec![0u8; buf_size];
+    let info = png_reader
+        .next_frame(&mut buf)
+        .map_err(|e| MediaError::PngDecode(e.to_string()))?;
+    let raw = &buf[..info.buffer_size()];
+    let pixel_count = validated_pixel_len(info.width, info.height)?;
+    let mut data = Vec::with_capacity(pixel_count);
+
+    match info.bit_depth {
+        png::BitDepth::Sixteen => {
+            let read_u16 = |b: &[u8]| -> f32 { u16::from_be_bytes([b[0], b[1]]) as f32 / 65535.0 };
+            match info.color_type {
+                png::ColorType::Grayscale => {
+                    for ch in raw.as_chunks::<2>().0 {
+                        let v = read_u16(ch);
+                        data.push([v, v, v, 1.0]);
+                    }
+                }
+                png::ColorType::GrayscaleAlpha => {
+                    for px in raw.as_chunks::<4>().0 {
+                        let v = read_u16(&px[0..2]);
+                        let a = read_u16(&px[2..4]);
+                        data.push([v * a, v * a, v * a, a]);
+                    }
+                }
+                png::ColorType::Rgb => {
+                    for px in raw.as_chunks::<6>().0 {
+                        data.push([
+                            read_u16(&px[0..2]),
+                            read_u16(&px[2..4]),
+                            read_u16(&px[4..6]),
+                            1.0,
+                        ]);
+                    }
+                }
+                png::ColorType::Rgba => {
+                    for px in raw.as_chunks::<8>().0 {
+                        let a = read_u16(&px[6..8]);
+                        data.push([
+                            read_u16(&px[0..2]) * a,
+                            read_u16(&px[2..4]) * a,
+                            read_u16(&px[4..6]) * a,
+                            a,
+                        ]);
+                    }
+                }
+                other => {
+                    return Err(MediaError::PngDecode(format!(
+                        "unsupported 16-bit PNG color type: {other:?}"
+                    )));
+                }
+            }
+        }
+        png::BitDepth::Eight => {
+            let read_u8 = |b: u8| -> f32 { b as f32 / 255.0 };
+            match info.color_type {
+                png::ColorType::Grayscale => {
+                    for &g in raw {
+                        let v = read_u8(g);
+                        data.push([v, v, v, 1.0]);
+                    }
+                }
+                png::ColorType::GrayscaleAlpha => {
+                    for px in raw.as_chunks::<2>().0 {
+                        let v = read_u8(px[0]);
+                        let a = read_u8(px[1]);
+                        data.push([v * a, v * a, v * a, a]);
+                    }
+                }
+                png::ColorType::Rgb => {
+                    for px in raw.as_chunks::<3>().0 {
+                        data.push([read_u8(px[0]), read_u8(px[1]), read_u8(px[2]), 1.0]);
+                    }
+                }
+                png::ColorType::Rgba => {
+                    for px in raw.as_chunks::<4>().0 {
+                        let a = read_u8(px[3]);
+                        data.push([
+                            read_u8(px[0]) * a,
+                            read_u8(px[1]) * a,
+                            read_u8(px[2]) * a,
+                            a,
+                        ]);
+                    }
+                }
+                other => {
+                    return Err(MediaError::PngDecode(format!(
+                        "unsupported 8-bit PNG color type: {other:?}"
+                    )));
+                }
+            }
+        }
+        other => {
+            return Err(MediaError::PngDecode(format!(
+                "unsupported PNG bit depth: {other:?}"
+            )));
+        }
+    }
+
+    Rgba16fFrame::new(
+        info.width,
+        info.height,
+        pts,
+        AlphaMode::Premultiplied,
+        data,
+    )
 }
 
 /// IEC 61966-2-1 piecewise sRGB EOTF (`sRGB [0,1] -> Linear Rec.709 [0,1]`).
@@ -614,6 +814,411 @@ fn sanitize_unit(v: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+
+/// YUV color matrix standard for NV12/YUV420p GPU conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum YuvColorMatrix {
+    #[default]
+    Bt709,
+    Bt601,
+    Bt2020Ncl,
+}
+
+impl YuvColorMatrix {
+    /// Returns the uniform `matrix_mode` discriminant expected by `yuv_to_linear.wgsl`.
+    #[inline]
+    pub const fn shader_mode(self) -> u32 {
+        match self {
+            Self::Bt709 => 0,
+            Self::Bt601 => 1,
+            Self::Bt2020Ncl => 2,
+        }
+    }
+}
+
+/// YUV signal quantization range (`tv`/limited vs `pc`/full).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum YuvColorRange {
+    #[default]
+    Limited,
+    Full,
+}
+
+impl YuvColorRange {
+    /// Returns the uniform `range_mode` discriminant expected by `yuv_to_linear.wgsl`.
+    #[inline]
+    pub const fn shader_mode(self) -> u32 {
+        match self {
+            Self::Limited => 0,
+            Self::Full => 1,
+        }
+    }
+}
+
+/// Chroma sample siting convention for 4:2:0 subsampled video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromaLocation {
+    #[default]
+    Left,
+    Center,
+    TopLeft,
+}
+
+impl ChromaLocation {
+    /// Returns the uniform `chroma_siting` discriminant expected by `yuv_to_linear.wgsl`.
+    #[inline]
+    pub const fn shader_mode(self) -> u32 {
+        match self {
+            Self::Left => 0,
+            Self::Center => 1,
+            Self::TopLeft => 2,
+        }
+    }
+}
+
+/// Transfer function applied after YUV->RGB conversion in `yuv_to_linear.wgsl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum YuvTransfer {
+    Linear,
+    #[default]
+    Srgb,
+}
+
+impl YuvTransfer {
+    /// Returns the uniform `transfer_mode` discriminant expected by `yuv_to_linear.wgsl`.
+    #[inline]
+    pub const fn shader_mode(self) -> u32 {
+        match self {
+            Self::Linear => 0,
+            Self::Srgb => 1,
+        }
+    }
+}
+
+/// Complete YUV colorimetry metadata for GPU NV12 -> Linear Rec.709 conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub struct YuvColorInfo {
+    pub matrix: YuvColorMatrix,
+    pub range: YuvColorRange,
+    pub chroma_location: ChromaLocation,
+    pub transfer: YuvTransfer,
+}
+
+impl YuvColorInfo {
+    /// Infers [`YuvColorInfo`] from `ffprobe` stream tags with safe defaults for untagged media.
+    ///
+    /// Untagged HD (`width >= 1280 || height >= 720`) defaults to `Bt709`; SD defaults to `Bt601`.
+    /// Missing `color_range` defaults to `Limited`; missing `chroma_location` defaults to `Left`.
+    pub fn from_probe_tags(
+        width: u32,
+        height: u32,
+        color_space: Option<&str>,
+        color_transfer: Option<&str>,
+        color_range: Option<&str>,
+        chroma_location: Option<&str>,
+    ) -> Self {
+        let matrix = match color_space
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("bt709") => YuvColorMatrix::Bt709,
+            Some("bt470bg" | "smpte170m" | "fcc" | "bt470m") => YuvColorMatrix::Bt601,
+            Some("bt2020nc" | "bt2020ncl" | "bt2020c") => YuvColorMatrix::Bt2020Ncl,
+            _ => {
+                if height >= 720 || width >= 1280 {
+                    YuvColorMatrix::Bt709
+                } else {
+                    YuvColorMatrix::Bt601
+                }
+            }
+        };
+
+        let range = match color_range
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("pc" | "jpeg" | "full") => YuvColorRange::Full,
+            _ => YuvColorRange::Limited,
+        };
+
+        let chroma_location = match chroma_location
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("center") => ChromaLocation::Center,
+            Some("topleft" | "top_left") => ChromaLocation::TopLeft,
+            _ => ChromaLocation::Left,
+        };
+
+        let transfer = match color_transfer
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("linear") => YuvTransfer::Linear,
+            _ => YuvTransfer::Srgb,
+        };
+
+        Self {
+            matrix,
+            range,
+            chroma_location,
+            transfer,
+        }
+    }
+
+    /// Returns `true` when NV12 4:2:0 decoding cannot be used safely and callers must
+    /// fall back to `rgba` decoding (odd dimensions or source pixel formats carrying alpha).
+    pub fn should_fallback_to_rgba(width: u32, height: u32, pixel_format: Option<&str>) -> bool {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            return true;
+        }
+        let Some(fmt) = pixel_format else {
+            return false;
+        };
+        let lower = fmt.trim().to_ascii_lowercase();
+        lower.starts_with("yuva")
+            || lower.starts_with("rgba")
+            || lower.starts_with("argb")
+            || lower.starts_with("bgra")
+            || lower.starts_with("abgr")
+            || lower.starts_with("gbrap")
+            || lower.starts_with("ayuv")
+            || lower == "pal8"
+    }
+}
+
+/// 8-bit 4:2:0 NV12 planar video frame (`Y` plane + interleaved `UV` plane) ready for GPU upload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Nv12Frame {
+    pub width: u32,
+    pub height: u32,
+    pub pts: Flicks,
+    pub y_plane: Vec<u8>,
+    pub uv_plane: Vec<u8>,
+    pub color_info: YuvColorInfo,
+    /// GPU `SourceFit::Contain` active content rectangle `[u_min, v_min, u_max, v_max]`.
+    pub content_uv_rect: [f32; 4],
+}
+
+impl Nv12Frame {
+    /// Constructs a validated `Nv12Frame` from separate `Y` and interleaved `UV` planes.
+    pub fn new(
+        width: u32,
+        height: u32,
+        pts: Flicks,
+        y_plane: Vec<u8>,
+        uv_plane: Vec<u8>,
+        color_info: YuvColorInfo,
+        content_uv_rect: [f32; 4],
+    ) -> Result<Self, MediaError> {
+        let (y_len, uv_len) = validated_nv12_plane_lens(width, height)?;
+        if y_plane.len() != y_len {
+            return Err(MediaError::BufferLengthMismatch {
+                expected: y_len,
+                actual: y_plane.len(),
+            });
+        }
+        if uv_plane.len() != uv_len {
+            return Err(MediaError::BufferLengthMismatch {
+                expected: uv_len,
+                actual: uv_plane.len(),
+            });
+        }
+        if !content_uv_rect.iter().all(|v| v.is_finite()) {
+            return Err(MediaError::InvalidEncodingSettings(
+                "content_uv_rect contains non-finite value".into(),
+            ));
+        }
+        Ok(Self {
+            width,
+            height,
+            pts,
+            y_plane,
+            uv_plane,
+            color_info,
+            content_uv_rect,
+        })
+    }
+
+    /// Constructs an `Nv12Frame` by splitting a contiguous `Y || UV` raw pipe buffer.
+    pub fn from_contiguous(
+        width: u32,
+        height: u32,
+        pts: Flicks,
+        data: &[u8],
+        color_info: YuvColorInfo,
+        content_uv_rect: [f32; 4],
+    ) -> Result<Self, MediaError> {
+        let (y_len, uv_len) = validated_nv12_plane_lens(width, height)?;
+        let expected = y_len + uv_len;
+        if data.len() != expected {
+            return Err(MediaError::BufferLengthMismatch {
+                expected,
+                actual: data.len(),
+            });
+        }
+        Self::new(
+            width,
+            height,
+            pts,
+            data[..y_len].to_vec(),
+            data[y_len..].to_vec(),
+            color_info,
+            content_uv_rect,
+        )
+    }
+
+    /// Total pixel payload byte count (`y_plane.len() + uv_plane.len()`).
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.y_plane.len() + self.uv_plane.len()
+    }
+
+    /// Converts this NV12 frame on CPU to an sRGB `Rgba8Frame` (useful for tests/diagnostics).
+    pub fn to_rgba8_approx(&self) -> Result<Rgba8Frame, MediaError> {
+        let (y_len, uv_len) = validated_nv12_plane_lens(self.width, self.height)?;
+        if self.y_plane.len() != y_len {
+            return Err(MediaError::BufferLengthMismatch {
+                expected: y_len,
+                actual: self.y_plane.len(),
+            });
+        }
+        if self.uv_plane.len() != uv_len {
+            return Err(MediaError::BufferLengthMismatch {
+                expected: uv_len,
+                actual: self.uv_plane.len(),
+            });
+        }
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let uv_w = w / 2;
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for py in 0..h {
+            let cy = py / 2;
+            for px in 0..w {
+                let cx = px / 2;
+                let y_raw = self.y_plane[py * w + px] as f32 / 255.0;
+                let uv_idx = (cy * uv_w + cx) * 2;
+                let u_raw = self.uv_plane[uv_idx] as f32 / 255.0;
+                let v_raw = self.uv_plane[uv_idx + 1] as f32 / 255.0;
+                let (y, u, v) = match self.color_info.range {
+                    YuvColorRange::Limited => (
+                        (y_raw - 16.0 / 255.0) * (255.0 / 219.0),
+                        (u_raw - 128.0 / 255.0) * (255.0 / 224.0),
+                        (v_raw - 128.0 / 255.0) * (255.0 / 224.0),
+                    ),
+                    YuvColorRange::Full => (y_raw, u_raw - 128.0 / 255.0, v_raw - 128.0 / 255.0),
+                };
+                let (r, g, b) = match self.color_info.matrix {
+                    YuvColorMatrix::Bt601 => (
+                        y + 1.402 * v,
+                        y - 0.344_136_3 * u - 0.714_136_3 * v,
+                        y + 1.772 * u,
+                    ),
+                    YuvColorMatrix::Bt2020Ncl => (
+                        y + 1.4746 * v,
+                        y - 0.16455313 * u - 0.57135313 * v,
+                        y + 1.8814 * u,
+                    ),
+                    YuvColorMatrix::Bt709 => (
+                        y + 1.5748 * v,
+                        y - 0.18732427 * u - 0.46812427 * v,
+                        y + 1.8556 * u,
+                    ),
+                };
+                rgba.push((r.clamp(0.0, 1.0) * 255.0).round() as u8);
+                rgba.push((g.clamp(0.0, 1.0) * 255.0).round() as u8);
+                rgba.push((b.clamp(0.0, 1.0) * 255.0).round() as u8);
+                rgba.push(255);
+            }
+        }
+        Rgba8Frame::new(self.width, self.height, self.pts, AlphaMode::Straight, rgba)
+    }
+}
+
+/// Decoded video frame payload emitted by [`crate::FfmpegBridge`] and [`crate::DecoderPool`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecodedVideoFrame {
+    Rgba8(Rgba8Frame),
+    Nv12(Nv12Frame),
+}
+
+impl DecodedVideoFrame {
+    #[inline]
+    pub fn width(&self) -> u32 {
+        match self {
+            Self::Rgba8(f) => f.width,
+            Self::Nv12(f) => f.width,
+        }
+    }
+
+    #[inline]
+    pub fn height(&self) -> u32 {
+        match self {
+            Self::Rgba8(f) => f.height,
+            Self::Nv12(f) => f.height,
+        }
+    }
+
+    #[inline]
+    pub fn pts(&self) -> Flicks {
+        match self {
+            Self::Rgba8(f) => f.pts,
+            Self::Nv12(f) => f.pts,
+        }
+    }
+
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Self::Rgba8(f) => f.data.len(),
+            Self::Nv12(f) => f.byte_len(),
+        }
+    }
+
+    #[inline]
+    pub fn as_rgba8(&self) -> Option<&Rgba8Frame> {
+        match self {
+            Self::Rgba8(f) => Some(f),
+            Self::Nv12(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_nv12(&self) -> Option<&Nv12Frame> {
+        match self {
+            Self::Nv12(f) => Some(f),
+            Self::Rgba8(_) => None,
+        }
+    }
+
+    /// Returns an `Rgba8Frame`, converting `Nv12` on CPU if needed.
+    pub fn into_rgba8(self) -> Result<Rgba8Frame, MediaError> {
+        match self {
+            Self::Rgba8(f) => Ok(f),
+            Self::Nv12(f) => f.to_rgba8_approx(),
+        }
+    }
+}
+
+pub(crate) fn validated_nv12_plane_lens(
+    width: u32,
+    height: u32,
+) -> Result<(usize, usize), MediaError> {
+    if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err(MediaError::InvalidDimensions { width, height });
+    }
+    let y_len = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(MediaError::InvalidDimensions { width, height })?;
+    let uv_len = y_len / 2;
+    Ok((y_len, uv_len))
 }
 
 fn validated_pixel_len(width: u32, height: u32) -> Result<usize, MediaError> {

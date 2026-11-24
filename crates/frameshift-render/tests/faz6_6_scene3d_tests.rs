@@ -174,7 +174,8 @@ fn text3d_pbr_camera_relative_ibl_90deg_turn_and_zecho_depth_separation() {
                         ..Default::default()
                     },
                     background_rgba: [0.0; 4],
-                },
+ depth_plate: None,
+},
                 inputs: vec![NodeId::from("txt")],
                 enabled: true,
             },
@@ -300,7 +301,8 @@ fn text3d_pbr_camera_relative_ibl_90deg_turn_and_zecho_depth_separation() {
                         ..Default::default()
                     },
                     background_rgba: [0.0; 4],
-                },
+ depth_plate: None,
+},
                 inputs: vec![NodeId::from("shape"), NodeId::from("ribbon")],
                 enabled: true,
             },
@@ -437,7 +439,8 @@ fn scene3d_ribbon_and_particle_isolated_from_fx_dof_coc_void_corruption() {
                     ..Default::default()
                 },
                 background_rgba: [0.0; 4],
-            },
+ depth_plate: None,
+},
             inputs,
             enabled: true,
         });
@@ -570,7 +573,8 @@ fn dof_2pass_separable_coc_dilation_and_polygonal_anamorphic_catseye_bokeh() {
                                 ..Default::default()
                             },
                             background_rgba: [0.0; 4],
-                        },
+ depth_plate: None,
+},
                         inputs: vec![NodeId::from("bg_card"), NodeId::from("thin_fg")],
                         enabled: true,
                     },

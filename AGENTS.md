@@ -2,7 +2,7 @@
 
 Bu dosya, FrameShift projesinde çalışan tüm ajanlar için tek bağlayıcı kural kaynağıdır. Uzun vadeli hafıza ve ayrıntılar `brain/` altında yaşar; aynı bilgi burada tekrarlanmaz.
 
-**Proje Aşaması:** **Faz 0–5 (M1–M5) + Anime FX & Geçiş Kütüphanesi** tamamlandı ve doğrulandı. 5 çekirdek spec (`timebase.md`, `project-schema.md`, `render-graph.md`, `effect-shader-api.md`, `inspection-contract.md`) `locked` durumundadır; 9 Rust workspace crate'i (`frameshift-time`, `frameshift-schema`, `frameshift-media`, `frameshift-vector`, `frameshift-render`, `frameshift-core`, `frameshift-mcp`, `frameshift-app`, `frameshift-cli`) ve **15 WGSL shader'ı** **58/58 test** ve `verify-all` + `fx_showcase_pack.png` kapısıyla doğrulanmıştır.
+**Proje Aşaması:** Faz 0–6.6 + Headless P0–P2 + Anime İş Akışı P0 + Native GPU Optik Akış/ONNX + 5 Temel Yetenek + Rakip Güç Yol Haritası (**P1, P2, P3, P5** tamamlandı; **P4** canlı masaüstü GUI sonraki faza bırakıldı). 5 çekirdek spec (`timebase.md`, `project-schema.md`, `render-graph.md`, `effect-shader-api.md`, `inspection-contract.md`) `locked` durumundadır; **9 Rust workspace crate'i**, **60 WGSL shader** (`40 NodeKind`, `schema_version: 0.2.0`), **50 CLI alt komutu** ve **32 MCP aracı** `clippy` **0 uyarı** ve **452/453 workspace testi** (1 önceden mevcut `HEAD` testi) ile doğrulanmıştır.
 
 ---
 
@@ -21,13 +21,13 @@ Her oturumun ilk adımında şu sırayla oku:
 
 - **Hedef Ürün:** Agent-first video editörü ve bağımsız native GPU kompozisyon motoru (ilk görsel odak: anime editleri, AMV, motion graphics).
 - **Süreç ve Çekirdek Ayrımı:** Bağımsız çekirdek kütüphane + tek masaüstü uygulaması + headless CLI/API desteği. Tüm edit durumu ortak proje tanımı ve motor sözleşmesinde yaşar.
-- **Başlangıç Stack Adayı:** Rust (çekirdek) + wgpu/WGSL (native GPU compositor) + FFmpeg kütüphaneleri (medya I/O) + OpenColorIO (renk yönetimi) + Skia veya uygun alternatif (text/vector, kesin değil) + sürümlenmiş okunabilir proje formatı.
-- **Zaman Tabanı:** Kalıcı proje zamanlamasında `f64` saniye yerine tam sayı tick / rasyonel zaman (güçlü aday: Flicks, `1 sn = 705,600,000 tick`) — ilk koddan önce `brain/specs/` ve `0002` ADR'siyle kilitlenecek.
-- **İlk Doğrulama Hedefi:** Dışarıdan klip + müzik ile `hız eğrisi + hareketli maske + shader geçişi + temporal motion blur` içeren kısa sahneyi doğrudan proje tanımından render etmek.
+- **Uygulanan Stack:** Rust (9 çekirdek crate) + `wgpu`/WGSL (native GPU compositor, `Rgba16Float` Linear Rec.709, 60 WGSL) + `ffmpeg`/`ffprobe` (`nv12`→Linear GPU decode + opsiyonel `onnxruntime`/`rife-ncnn-vulkan`/`realesrgan-ncnn-vulkan`/`audio-separator`/`stable-ts` sidecar'ları) + saf Rust `.cube`/OCIO renk hattı + `frameshift-vector` (`harfrust`/`skrifa`/`ttf-parser`/`lyon_tessellation`/WGSL Slug tipografi) + JSON `schema_version: 0.2.0` + `Motion.md` deklaratif DSL.
+- **Zaman Tabanı:** Kalıcı proje zamanlamasında `f64` saniye yerine `Flicks(i64)` (`1 sn = 705,600,000 tick`) + `Rational32` — [ADR-0002](brain/decisions/0002-rational-timebase-flicks.md) ve [timebase.md](brain/specs/timebase.md) ile kilitli.
+- **Doğrulanmış Yetenek:** Dışarıdan klip + müzikle hız eğrisi, hareketli/Bézier maske, shader geçişi, temporal/optik-akış motion blur, `SafeExpr` (`spring`/`wiggle`), 2D/Planar Tracker, `.otio`/FCPXML köprüsü ve `lint`/`diff-frame` doğrulaması doğrudan proje tanımından çalışır.
 
 ---
 
-## Komutlar (9-Crate Workspace, M1–M5)
+## Komutlar (9-Crate Workspace)
 
 ```powershell
 cargo check --workspace
@@ -36,8 +36,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run --release -p frameshift-cli -- verify-all --out-dir target/full_verify
 ```
 
-- CLI alt komutları: `init-golden`, `render`, `frame`, `inspect`, `ui-snapshot`, `mcp-stdio`, `verify-m1`, `verify-all`.
-- Önemli: Yeni büyük harici bağımlılık (C++ OCIO SDK, pencereleme framework'ü vb.) eklemeden önce kullanıcıya danış.
+- CLI alt komutları (**50 komut**, tam liste için `cargo run -p frameshift-cli -- --help`): Çekirdek (`init-golden`, `render`, `frame`, `inspect`, `ui-snapshot`, `materials`, `peaks`, `waveform`, `autocut`, `mcp-stdio`, `verify-m1`, `verify-all`), Ajan/DSL/NLE/Tracker (`lint`, `diff-frame`, `compile-dsl`, `template-metadata`, `template-instantiate`, `track-point`, `track-planar`, `export-nle`, `import-nle`, `ai-models`, `ai-run`) ve Workbench/AI (`init-impact`, `preflight`, `effect-*`, `proxy*`, `timeline`, `speed-graph`, `snap`, `edit-run`, `template-*`, `media-*`, `retarget`, `export*`, `ai-status`, `ai-stems`, `ai-lyrics`, `upscale`, `interpolate`, `ai-matte`).
+- MCP sunucusu (`frameshift-mcp`): `mcp-stdio` üzerinden **32 araç** sunar.
+- Önemli: Yeni harici bağımlılık (yeni crate, C++ SDK, `egui`/`winit` pencereleme vb.) eklemeden önce kullanıcıya danış.
 
 ---
 
@@ -51,8 +52,8 @@ cargo run --release -p frameshift-cli -- verify-all --out-dir target/full_verify
 - Yeni referans edit videosu incelendiğinde `brain/style-cards/` altına stil kartı (`SC-NNNN`) kaydet; referanssız edit istendiğinde önce `brain/style-cards/README.md` matrisinden uygun stil kartlarını oku.
 
 ### Ask first (Önce kullanıcıya sor)
-- İlk kodlama / `Cargo.toml` / crate scaffold'u başlatma.
-- Herhangi bir harici dependency, crate, FFmpeg build seçeneği veya UI framework seçimi ekleme.
+- Yeni Cargo crate'i (ör. `crates/frameshift-gui`) veya workspace'e yeni harici bağımlılık ekleme.
+- Herhangi bir harici dependency, FFmpeg build seçeneği veya UI framework seçimi ekleme.
 - `brain/decisions/` altına `status: accepted` yeni bir ADR yazma (veya mevcut bir `accepted` kararı supersede etme).
 - `AGENTS.md` içeriğini değiştirme veya kapsamı genişletme.
 
@@ -77,7 +78,7 @@ cargo run --release -p frameshift-cli -- verify-all --out-dir target/full_verify
 ## Definition of Done (Teslim Kriteri)
 
 - [ ] İstenen değişiklik kapsam sınırları içinde tamamlandı ve tasarım/kod gerçekliği çarpıtılmadı.
-- [ ] Varsa teknik doğrulamalar çalıştırıldı (şu an: markdown/link/tutarlılık ve `git status` kontrolü).
+- [ ] İlgili teknik doğrulamalar çalıştırıldı (`cargo clippy --workspace --all-targets -- -D warnings`, hedefli/workspace `cargo test`, dokümantasyonda link/`git status` kontrolü).
 - [ ] `brain/state.md` güncel durumu yansıtıyor.
 - [ ] `brain/log/YYYY-MM-DD-<konu>.md` oturum günlüğü eklendi ve `brain/index.md` güncellendi.
 

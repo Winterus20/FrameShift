@@ -15,12 +15,13 @@ use crate::resolver::{
 };
 use frameshift_media::{
     AlphaMode, AudioBuffer, DEFAULT_AUDIO_SAMPLE_RATE, DecoderPoolTelemetry, EncodeBackend,
-    ExportEncodingProfile, FfmpegBridge, LruFrameCache, Mp4FrameEncoder, ProxyManager, ProxySpec,
-    Rgba8Frame, SyntheticMediaGenerator, VideoEncodingSettings, downscale_frame_nearest_or_box,
+    ExportEncodingProfile, FfmpegBridge, LruFrameCache, Mp4FrameEncoder, MultibandFluxConfig,
+    ProxyManager, ProxySpec, Rgba8Frame, SyntheticMediaGenerator, VideoEncodingSettings,
+    downscale_frame_nearest_or_box,
 };
 use frameshift_render::{
     AudioRmsEnvelope, GpuCompositor, OutputAlphaMode, RenderOptions, ShutterOverride,
-    effective_blur_sub_samples,
+    SmartCacheConfig, SmartCacheStats, effective_blur_sub_samples,
 };
 use frameshift_schema::{
     NodeKind, Project, ProxyConfigDef, RenderProfileDef, RenderProfileKind, Resolution,
@@ -34,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const DEFAULT_CACHE_CAPACITY: usize = 128;
-const DEFAULT_CACHE_MAX_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_CACHE_MAX_BYTES: usize = frameshift_media::DEFAULT_CACHE_MAX_BYTES;
 
 pub(crate) struct VideoRenderSettings<'a> {
     pub(crate) options: &'a RenderOptions,
@@ -61,10 +62,25 @@ impl Engine {
         Self::with_cache_capacity(DEFAULT_CACHE_CAPACITY)
     }
 
-    /// Initializes the engine with an explicit LRU frame capacity and a 1 GiB byte cap.
+    /// Initializes the engine with an explicit LRU frame capacity and default byte cap.
     pub fn with_cache_capacity(capacity: usize) -> Result<Self, CoreError> {
+        Self::with_cache_and_smart_cache(capacity, SmartCacheConfig::default())
+    }
+
+    /// Initializes a headless engine with an explicit [`SmartCacheConfig`].
+    pub fn new_headless_with_smart_cache(
+        smart_cache_config: SmartCacheConfig,
+    ) -> Result<Self, CoreError> {
+        Self::with_cache_and_smart_cache(DEFAULT_CACHE_CAPACITY, smart_cache_config)
+    }
+
+    /// Initializes the engine with explicit LRU frame capacity and [`SmartCacheConfig`].
+    pub fn with_cache_and_smart_cache(
+        capacity: usize,
+        smart_cache_config: SmartCacheConfig,
+    ) -> Result<Self, CoreError> {
         Ok(Self {
-            compositor: GpuCompositor::new_headless()?,
+            compositor: GpuCompositor::new_headless_with_cache(smart_cache_config)?,
             cache: LruFrameCache::with_max_bytes(capacity, DEFAULT_CACHE_MAX_BYTES),
             resolver: MediaResolver::new(),
             audio_envelope_cache: None,
@@ -81,9 +97,46 @@ impl Engine {
         &mut self.compositor
     }
 
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn split_parts_mut(
+        &mut self,
+    ) -> (
+        &mut GpuCompositor,
+        &mut MediaResolver,
+        &mut LruFrameCache,
+        &mut Option<(String, AudioRmsEnvelope)>,
+    ) {
+        (
+            &mut self.compositor,
+            &mut self.resolver,
+            &mut self.cache,
+            &mut self.audio_envelope_cache,
+        )
+    }
+
     /// Returns current LRU frame cache telemetry.
     pub fn cache_telemetry(&self) -> frameshift_media::CacheTelemetry {
         self.cache.telemetry()
+    }
+
+    /// Returns current GPU/CPU/Disk [`SmartCacheStats`] from the compositor.
+    pub fn smart_cache_stats(&self) -> SmartCacheStats {
+        self.compositor.smart_cache_stats()
+    }
+
+    /// Returns the active [`SmartCacheConfig`] on the compositor.
+    pub fn smart_cache_config(&self) -> &SmartCacheConfig {
+        self.compositor.smart_cache_config()
+    }
+
+    /// Replaces the compositor [`SmartCacheConfig`] at runtime.
+    pub fn set_smart_cache_config(&mut self, config: SmartCacheConfig) {
+        self.compositor.set_smart_cache_config(config);
+    }
+
+    /// Clears the compositor's GPU/CPU/Disk SmartCache without clearing decoded source frames.
+    pub fn clear_smart_cache(&mut self) {
+        self.compositor.clear_smart_cache();
     }
 
     /// Returns current streaming video decoder pool telemetry.
@@ -91,10 +144,11 @@ impl Engine {
         self.resolver.decoder_telemetry()
     }
 
-    /// Clears cached decoded/synthesized frames, probed container metadata, open video decoder
-    /// streams, and audio envelope cache.
+    /// Clears cached decoded/synthesized frames, SmartCache entries, probed container metadata,
+    /// open video decoder streams, and audio envelope cache.
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        self.compositor.clear_smart_cache();
         self.resolver.clear_probe_cache();
         self.audio_envelope_cache = None;
     }
@@ -854,7 +908,7 @@ impl Engine {
     }
 }
 
-fn select_profile(project: &Project, profile: RenderProfileKind) -> &RenderProfileDef {
+pub(crate) fn select_profile(project: &Project, profile: RenderProfileKind) -> &RenderProfileDef {
     match profile {
         RenderProfileKind::Draft => &project.render_profiles.draft,
         RenderProfileKind::Final => &project.render_profiles.final_profile,
@@ -1096,11 +1150,27 @@ pub(crate) fn resolve_disk_audio_envelope<'a>(
         .is_some_and(|(cached_key, _)| cached_key == &key);
     if !cache_hit {
         let window_ticks = Flicks(FLICKS_PER_SECOND / 100);
-        let samples = match resolver.mix_project_audio(project)? {
-            Some(buf) => buf.compute_rms_envelope(window_ticks)?,
-            None => Vec::new(),
+        let env = match resolver.mix_project_audio(project)? {
+            Some(buf) if buf.frame_count() > 0 => {
+                let (band_env, _) = buf.analyze_band_envelope(MultibandFluxConfig {
+                    window_ticks,
+                    ..MultibandFluxConfig::default()
+                })?;
+                AudioRmsEnvelope::with_bands(
+                    band_env.window_ticks,
+                    band_env.rms,
+                    band_env.sub,
+                    band_env.mid,
+                    band_env.high,
+                    Some(band_env.estimated_bpm),
+                    band_env.beat_anchor_tick,
+                    band_env.downbeat_anchor_tick,
+                    band_env.beats_per_bar,
+                )
+            }
+            _ => AudioRmsEnvelope::new(window_ticks, Vec::new()),
         };
-        *cache_slot = Some((key, AudioRmsEnvelope::new(window_ticks, samples)));
+        *cache_slot = Some((key, env));
     }
     Ok(cache_slot.as_ref().map(|(_, env)| env))
 }
@@ -1176,6 +1246,10 @@ mod tests {
         assert!(!key.is_empty());
         assert_eq!(env.window_ticks, Flicks(FLICKS_PER_SECOND / 100));
         assert!(!env.samples.is_empty());
+        assert_eq!(env.sub.len(), env.samples.len());
+        assert_eq!(env.mid.len(), env.samples.len());
+        assert_eq!(env.high.len(), env.samples.len());
+        assert!(env.estimated_bpm.is_some());
 
         engine.clear_cache();
         assert!(engine.audio_envelope_cache.is_none());
@@ -1299,7 +1373,7 @@ mod tests {
         assert_ne!(stretch.data, cover.data);
         assert!(engine.cache_telemetry().current_entries > after_stretch);
 
-        let hits_before = engine.cache_telemetry().hits;
+        let hits_before = engine.cache_telemetry().hits + engine.smart_cache_stats().gpu_hits;
         project.graph.output_node = NodeId::from("src_stretch");
         let stretch_cached = engine
             .render_frame_at(&project, RenderProfileKind::Draft, Flicks::ZERO)
@@ -1310,7 +1384,10 @@ mod tests {
             .expect("cached cover node");
         assert_eq!(stretch_cached.data, stretch.data);
         assert_eq!(cover_cached.data, cover.data);
-        assert_eq!(engine.cache_telemetry().hits, hits_before + 2);
+        assert_eq!(
+            engine.cache_telemetry().hits + engine.smart_cache_stats().gpu_hits,
+            hits_before + 2
+        );
 
         engine.clear_cache();
         assert_eq!(engine.decoder_telemetry().active_streams, 0);

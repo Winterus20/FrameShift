@@ -80,6 +80,7 @@ fn project_with(graph: RenderGraphDef) -> Project {
             },
         },
         param_bindings: vec![],
+        keyframe_tracks: vec![],
         creative_decisions: vec![],
         preferences: vec![],
         proxy_config: Default::default(),

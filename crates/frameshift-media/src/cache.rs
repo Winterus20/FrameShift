@@ -1,6 +1,10 @@
-use crate::frame::Rgba8Frame;
+use crate::frame::{DecodedVideoFrame, Nv12Frame, Rgba8Frame};
+use frameshift_time::Flicks;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+
+/// Default byte budget for [`LruFrameCache`] (`256 MiB`).
+pub const DEFAULT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Asset identifier matching `AssetDef.id`.
 pub type AssetId = String;
@@ -31,6 +35,72 @@ impl From<(AssetId, u64)> for FrameCacheKey {
     }
 }
 
+/// Shared cached video frame payload (`Rgba8` or `Nv12`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CachedVideoFrame {
+    Rgba8(Arc<Rgba8Frame>),
+    Nv12(Arc<Nv12Frame>),
+}
+
+impl CachedVideoFrame {
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Self::Rgba8(f) => f.data.len(),
+            Self::Nv12(f) => f.byte_len(),
+        }
+    }
+
+    #[inline]
+    pub fn width(&self) -> u32 {
+        match self {
+            Self::Rgba8(f) => f.width,
+            Self::Nv12(f) => f.width,
+        }
+    }
+
+    #[inline]
+    pub fn height(&self) -> u32 {
+        match self {
+            Self::Rgba8(f) => f.height,
+            Self::Nv12(f) => f.height,
+        }
+    }
+
+    #[inline]
+    pub fn pts(&self) -> Flicks {
+        match self {
+            Self::Rgba8(f) => f.pts,
+            Self::Nv12(f) => f.pts,
+        }
+    }
+
+    #[inline]
+    pub fn as_rgba8(&self) -> Option<&Arc<Rgba8Frame>> {
+        match self {
+            Self::Rgba8(f) => Some(f),
+            Self::Nv12(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_nv12(&self) -> Option<&Arc<Nv12Frame>> {
+        match self {
+            Self::Nv12(f) => Some(f),
+            Self::Rgba8(_) => None,
+        }
+    }
+}
+
+impl From<DecodedVideoFrame> for CachedVideoFrame {
+    fn from(frame: DecodedVideoFrame) -> Self {
+        match frame {
+            DecodedVideoFrame::Rgba8(f) => Self::Rgba8(Arc::new(f)),
+            DecodedVideoFrame::Nv12(f) => Self::Nv12(Arc::new(f)),
+        }
+    }
+}
+
 /// Telemetry counters reported by `LruFrameCache`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CacheTelemetry {
@@ -44,7 +114,7 @@ pub struct CacheTelemetry {
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    frame: Arc<Rgba8Frame>,
+    frame: CachedVideoFrame,
     byte_size: usize,
     last_used_seq: u64,
 }
@@ -64,11 +134,17 @@ pub struct LruFrameCache {
 }
 
 impl LruFrameCache {
-    /// Creates a new LRU frame cache holding at most `capacity` frames.
+    /// Creates a new LRU frame cache holding at most `capacity` frames and bounded
+    /// by [`DEFAULT_CACHE_MAX_BYTES`] (`256 MiB`).
     pub fn new(capacity: usize) -> Self {
+        Self::with_max_bytes(capacity, DEFAULT_CACHE_MAX_BYTES)
+    }
+
+    /// Creates a new LRU frame cache bounded by both `capacity` frames and `max_bytes` pixel bytes.
+    pub fn with_max_bytes(capacity: usize, max_bytes: usize) -> Self {
         Self {
             capacity,
-            max_bytes: None,
+            max_bytes: Some(max_bytes),
             current_bytes: 0,
             access_seq: 0,
             entries: HashMap::with_capacity(capacity),
@@ -79,15 +155,36 @@ impl LruFrameCache {
         }
     }
 
-    /// Creates a new LRU frame cache bounded by both `capacity` frames and `max_bytes` pixel bytes.
-    pub fn with_max_bytes(capacity: usize, max_bytes: usize) -> Self {
-        let mut cache = Self::new(capacity);
-        cache.max_bytes = Some(max_bytes);
-        cache
+    /// Returns the configured byte budget ceiling, if any.
+    #[inline]
+    pub fn max_bytes(&self) -> Option<usize> {
+        self.max_bytes
     }
 
-    /// Looks up a frame by `(asset_id, frame_key)` and updates LRU recency + hit/miss telemetry.
+    /// Looks up an `Rgba8Frame` by `(asset_id, frame_key)` and updates LRU recency + telemetry.
     pub fn get(&mut self, asset_id: &str, frame_key: u64) -> Option<Arc<Rgba8Frame>> {
+        let key = FrameCacheKey::new(asset_id, frame_key);
+        let Some(entry) = self.entries.get_mut(&key) else {
+            self.misses += 1;
+            return None;
+        };
+        let CachedVideoFrame::Rgba8(ref rgba) = entry.frame else {
+            self.misses += 1;
+            return None;
+        };
+        let rgba = Arc::clone(rgba);
+        let old_seq = entry.last_used_seq;
+        self.order.remove(&old_seq);
+        self.access_seq += 1;
+        let new_seq = self.access_seq;
+        entry.last_used_seq = new_seq;
+        self.order.insert(new_seq, key);
+        self.hits += 1;
+        Some(rgba)
+    }
+
+    /// Looks up either an `Rgba8` or `Nv12` frame by `(asset_id, frame_key)` and updates LRU recency.
+    pub fn get_decoded(&mut self, asset_id: &str, frame_key: u64) -> Option<CachedVideoFrame> {
         let key = FrameCacheKey::new(asset_id, frame_key);
         let Some(entry) = self.entries.get_mut(&key) else {
             self.misses += 1;
@@ -100,16 +197,24 @@ impl LruFrameCache {
         entry.last_used_seq = new_seq;
         self.order.insert(new_seq, key);
         self.hits += 1;
-        Some(Arc::clone(&entry.frame))
+        Some(entry.frame.clone())
     }
 
-    /// Inspects whether `(asset_id, frame_key)` is cached without mutating LRU order or telemetry.
+    /// Inspects whether `(asset_id, frame_key)` is cached as `Rgba8Frame` without mutating LRU order.
     pub fn peek(&self, asset_id: &str, frame_key: u64) -> Option<Arc<Rgba8Frame>> {
         let key = FrameCacheKey::new(asset_id, frame_key);
-        self.entries.get(&key).map(|e| Arc::clone(&e.frame))
+        self.entries
+            .get(&key)
+            .and_then(|e| e.frame.as_rgba8().map(Arc::clone))
     }
 
-    /// Inserts or updates a cached frame, evicting least-recently-used entries deterministically
+    /// Inspects whether `(asset_id, frame_key)` is cached (`Rgba8` or `Nv12`) without mutating LRU order.
+    pub fn peek_decoded(&self, asset_id: &str, frame_key: u64) -> Option<CachedVideoFrame> {
+        let key = FrameCacheKey::new(asset_id, frame_key);
+        self.entries.get(&key).map(|e| e.frame.clone())
+    }
+
+    /// Inserts or updates a cached `Rgba8Frame`, evicting least-recently-used entries deterministically
     /// until capacity and byte bounds are satisfied.
     pub fn insert(&mut self, asset_id: impl Into<AssetId>, frame_key: u64, frame: Rgba8Frame) {
         self.insert_arc(asset_id, frame_key, Arc::new(frame));
@@ -122,10 +227,35 @@ impl LruFrameCache {
         frame_key: u64,
         frame: Arc<Rgba8Frame>,
     ) {
+        self.insert_cached(asset_id, frame_key, CachedVideoFrame::Rgba8(frame));
+    }
+
+    /// Inserts or updates a cached `Nv12Frame`.
+    pub fn insert_nv12(&mut self, asset_id: impl Into<AssetId>, frame_key: u64, frame: Nv12Frame) {
+        self.insert_cached(asset_id, frame_key, CachedVideoFrame::Nv12(Arc::new(frame)));
+    }
+
+    /// Inserts or updates a cached [`DecodedVideoFrame`] (`Rgba8` or `Nv12`).
+    pub fn insert_decoded(
+        &mut self,
+        asset_id: impl Into<AssetId>,
+        frame_key: u64,
+        frame: DecodedVideoFrame,
+    ) {
+        self.insert_cached(asset_id, frame_key, CachedVideoFrame::from(frame));
+    }
+
+    /// Inserts or updates a [`CachedVideoFrame`] (`Rgba8` or `Nv12`).
+    pub fn insert_cached(
+        &mut self,
+        asset_id: impl Into<AssetId>,
+        frame_key: u64,
+        frame: CachedVideoFrame,
+    ) {
         if self.capacity == 0 {
             return;
         }
-        let byte_size = frame.data.len();
+        let byte_size = frame.byte_len();
         if let Some(max_bytes) = self.max_bytes
             && byte_size > max_bytes
         {

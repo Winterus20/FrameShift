@@ -120,6 +120,39 @@ pub enum SchemaError {
     #[error("invalid depth_matte node '{node_id}': {message}")]
     InvalidDepthMatte { node_id: NodeId, message: String },
 
+    #[error("invalid optical_flow_blur node '{node_id}': {message}")]
+    InvalidOpticalFlowBlur { node_id: NodeId, message: String },
+
+    #[error("invalid anime4k node '{node_id}': {message}")]
+    InvalidAnime4K { node_id: NodeId, message: String },
+
+    #[error("invalid displacement_map node '{node_id}': {message}")]
+    InvalidDisplacementMap { node_id: NodeId, message: String },
+
+    #[error("invalid frame_echo node '{node_id}': {message}")]
+    InvalidFrameEcho { node_id: NodeId, message: String },
+
+    #[error("invalid shape_mask node '{node_id}': {message}")]
+    InvalidShapeMask { node_id: NodeId, message: String },
+
+    #[error("invalid event constraint for '{event_id}': {message}")]
+    InvalidEventConstraint { event_id: String, message: String },
+
+    #[error("cyclic event constraint detected: {cycle:?}")]
+    CyclicEventConstraint { cycle: Vec<String> },
+
+    #[error("event timing overflow for '{event_id}': {message}")]
+    EventTimingOverflow { event_id: String, message: String },
+
+    #[error("invalid keyframe track '{track_id}': {message}")]
+    InvalidKeyframeTrack { track_id: String, message: String },
+
+    #[error("motion DSL syntax error at line {line}: {message}")]
+    InvalidMotionDsl { line: usize, message: String },
+
+    #[error("invalid NLE document: {0}")]
+    InvalidNleDocument(String),
+
     #[error("render graph contains a cycle involving nodes: {cycle:?}")]
     CycleDetected { cycle: Vec<NodeId> },
 
@@ -147,4 +180,7 @@ pub enum SchemaError {
 
     #[error("JSON serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("timebase error: {0}")]
+    Time(#[from] frameshift_time::TimeError),
 }

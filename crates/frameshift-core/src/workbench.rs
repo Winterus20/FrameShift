@@ -720,6 +720,50 @@ pub fn builtin_effect_chain_presets() -> Vec<EffectChainPreset> {
                 note: None,
             },
         },
+        EffectChainPreset {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            id: "rsmb_anime_motion".into(),
+            name: "RSMB Anime Optical Flow Blur".into(),
+            category: "motion".into(),
+            nodes: vec![
+                GraphNodeDef {
+                    id: NodeId::from("in_0"),
+                    kind: NodeKind::PrecompInput { slot: 0 },
+                    inputs: Vec::new(),
+                    enabled: true,
+                },
+                GraphNodeDef {
+                    id: NodeId::from("of_blur"),
+                    kind: NodeKind::OpticalFlowBlur {
+                        shutter_amount: 1.25,
+                        samples: 12,
+                        max_blur_px: 48.0,
+                        sensitivity: 0.35,
+                        flow_smoothness: 0.25,
+                        visualize_flow: false,
+                    },
+                    inputs: vec![NodeId::from("in_0")],
+                    enabled: true,
+                },
+            ],
+            param_bindings: Vec::new(),
+            slots: vec![TemplateSlot {
+                id: "shutter_amount".into(),
+                label: "Shutter Amount".into(),
+                kind: TemplateSlotKind::Number,
+                target: TemplateSlotTarget::ParameterBinding {
+                    node_id: NodeId::from("of_blur"),
+                    param_name: "shutter_amount".into(),
+                },
+                required: false,
+                default: None,
+            }],
+            review: TemplateReview {
+                reviewed: true,
+                reviewer: Some("FrameShift built-in".into()),
+                note: Some("Pyramidal GPU optical flow motion blur".into()),
+            },
+        },
     ]
 }
 

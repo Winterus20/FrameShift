@@ -2,13 +2,15 @@ use crate::compositor::fnv1a_64;
 use crate::error::RenderError;
 use crate::pool::WORKING_TEXTURE_FORMAT;
 use crate::uniforms::{
-    AnimeImpactFrameUniform, AnimeSharpenUniform, BackdropScrimUniform, BlendUniform,
-    BloomPassUniform, BlurMoCurvesUniform, ColorBasicUniform, CustomWgslUniform, DofBokehUniform,
-    DofCocUniform, FilmHalationUniform, FilmOpticsUniform, FxaaUniform, GpuMeshVertex3D,
-    GpuSlugVertex, HalftoneGlowUniform, Lut3DUniform, MaskMatteUniform, MotionBlurUniform,
-    MotionTileShakeUniform, ParticleField3DUniform, RadialShockwaveUniform, RibbonTrail3DUniform,
-    SlugUniform, Text2DFxUniform, Text2DJfaUniform, Text3DUniform, Transform3DUniform,
-    TransformUniform, WhipTransitionUniform,
+    Anime4KUniform, AnimeImpactFrameUniform, AnimeSharpenUniform, BackdropScrimUniform,
+    BlendUniform, BloomPassUniform, BlurMoCurvesUniform, ColorBasicUniform, CustomWgslUniform,
+    DisplacementMapUniform, DofBokehUniform, DofCocUniform, FilmHalationUniform,
+    FilmOpticsUniform, FrameEchoUniform, FxaaUniform, GpuMeshVertex3D, GpuSlugVertex,
+    HalftoneGlowUniform, Lut3DUniform, MaskMatteUniform, MotionBlurUniform,
+    MotionTileShakeUniform, OpticalFlowBlurUniform, OpticalFlowStepUniform, ParticleField3DUniform,
+    RadialShockwaveUniform, RibbonTrail3DUniform, Scene3DDepthSeedUniform,
+    ShapeMaskFeatherUniform, SlugUniform, Text2DFxUniform, Text2DJfaUniform, Text3DUniform,
+    Transform3DUniform, TransformUniform, WhipTransitionUniform, YuvToLinearUniform,
 };
 use crate::warp2d::{CornerPinUniform, GridWarpUniform};
 use std::collections::HashMap;
@@ -35,12 +37,28 @@ const SHADER_TRANSITION_KALEIDOSCOPE: &str =
     include_str!("../shaders/transition_kaleidoscope.wgsl");
 const SHADER_FX_MOTION_TILE_SHAKE: &str = include_str!("../shaders/fx_motion_tile_shake.wgsl");
 const SHADER_FX_BLUR_MOCURVES: &str = include_str!("../shaders/fx_blur_mocurves.wgsl");
+const SHADER_FX_OPTICAL_FLOW_LUMA: &str = include_str!("../shaders/fx_optical_flow_luma.wgsl");
+const SHADER_FX_OPTICAL_FLOW_STEP: &str = include_str!("../shaders/fx_optical_flow_step.wgsl");
+const SHADER_FX_OPTICAL_FLOW_BLUR: &str = include_str!("../shaders/fx_optical_flow_blur.wgsl");
 const SHADER_FX_ANIME_IMPACT_FRAME: &str = include_str!("../shaders/fx_anime_impact_frame.wgsl");
 const SHADER_FX_RADIAL_SHOCKWAVE: &str = include_str!("../shaders/fx_radial_shockwave.wgsl");
 const SHADER_FX_HALFTONE_GLOW: &str = include_str!("../shaders/fx_halftone_glow.wgsl");
 const SHADER_FX_BLOOM_DOWNSAMPLE: &str = include_str!("../shaders/fx_bloom_downsample.wgsl");
 const SHADER_FX_BLOOM_UPSAMPLE: &str = include_str!("../shaders/fx_bloom_upsample.wgsl");
 const SHADER_FX_ANIME_SHARPEN: &str = include_str!("../shaders/fx_anime_sharpen.wgsl");
+const SHADER_FX_ANIME4K_BRIDGE: &str = include_str!("../shaders/fx_anime4k_bridge.wgsl");
+const SHADER_FX_ANIME4K_CLAMP: &str =
+    include_str!("../shaders/fx_anime4k_clamp_highlights.wgsl");
+const SHADER_FX_ANIME4K_RESTORE_S: &str =
+    include_str!("../shaders/fx_anime4k_restore_cnn_s.wgsl");
+const SHADER_FX_ANIME4K_RESTORE_SOFT_S: &str =
+    include_str!("../shaders/fx_anime4k_restore_cnn_soft_s.wgsl");
+const SHADER_FX_ANIME4K_UPSCALE_X2_S: &str =
+    include_str!("../shaders/fx_anime4k_upscale_cnn_x2_s.wgsl");
+const SHADER_FX_ANIME4K_UPSCALE_DENOISE_X2_S: &str =
+    include_str!("../shaders/fx_anime4k_upscale_denoise_cnn_x2_s.wgsl");
+const SHADER_FX_ANIME4K_DARKEN_HQ: &str = include_str!("../shaders/fx_anime4k_darken_hq.wgsl");
+const SHADER_FX_ANIME4K_THIN_HQ: &str = include_str!("../shaders/fx_anime4k_thin_hq.wgsl");
 const SHADER_FX_FILM_OPTICS: &str = include_str!("../shaders/fx_film_optics.wgsl");
 const SHADER_FX_FILM_HALATION: &str = include_str!("../shaders/fx_film_halation.wgsl");
 const SHADER_FX_AA: &str = include_str!("../shaders/fx_aa.wgsl");
@@ -63,6 +81,11 @@ const SHADER_TEXT2D_FX: &str = include_str!("../shaders/text2d_fx.wgsl");
 const SHADER_BACKDROP_SCRIM_BLUR: &str = include_str!("../shaders/backdrop_scrim_blur.wgsl");
 const SHADER_BACKDROP_SCRIM_COMPOSITE: &str =
     include_str!("../shaders/backdrop_scrim_composite.wgsl");
+const SHADER_SCENE3D_DEPTH_SEED: &str = include_str!("../shaders/scene3d_depth_seed.wgsl");
+const SHADER_FX_DISPLACEMENT_MAP: &str = include_str!("../shaders/fx_displacement_map.wgsl");
+const SHADER_FX_FRAME_ECHO: &str = include_str!("../shaders/fx_frame_echo.wgsl");
+const SHADER_FX_SHAPE_MASK_FEATHER: &str = include_str!("../shaders/fx_shape_mask_feather.wgsl");
+const SHADER_YUV_TO_LINEAR: &str = include_str!("../shaders/yuv_to_linear.wgsl");
 
 /// Compiled render pipeline paired with its `@group(0)` bind group layout.
 pub struct ShaderProgram {
@@ -72,6 +95,7 @@ pub struct ShaderProgram {
 
 /// Compiled 4x MSAA `Scene3D` pipelines (available when `GpuContext::supports_msaa_4x == true`).
 pub struct Scene3DMsaaPipelines {
+    pub depth_seed: ShaderProgram,
     pub transform3d_scene: ShaderProgram,
     pub text3d_mesh: ShaderProgram,
     pub text3d_mesh_echo: ShaderProgram,
@@ -80,6 +104,32 @@ pub struct Scene3DMsaaPipelines {
     /// Opt-in premultiplied-alpha variant of `ribbon_trail3d_scene` (`normal_blend = true`).
     pub ribbon_trail3d_scene_normal: ShaderProgram,
     pub fx_dof_coc_msaa_h: ShaderProgram,
+}
+
+/// Compiled Anime4K v4.x FastS multi-pass WGSL pipelines.
+pub struct Anime4KPipelines {
+    pub to_srgb_straight: ShaderProgram,
+    pub to_linear_premul: ShaderProgram,
+    pub clamp_stats_x: ShaderProgram,
+    pub clamp_stats_y: ShaderProgram,
+    pub clamp_apply: ShaderProgram,
+    pub restore_s: [ShaderProgram; 4],
+    pub restore_soft_s: [ShaderProgram; 4],
+    pub upscale_x2_s: [ShaderProgram; 5],
+    pub upscale_denoise_x2_s: [ShaderProgram; 5],
+    pub darken_luma: ShaderProgram,
+    pub darken_diff_x: ShaderProgram,
+    pub darken_diff_y: ShaderProgram,
+    pub darken_gauss_x: ShaderProgram,
+    pub darken_composite: ShaderProgram,
+    pub thin_luma: ShaderProgram,
+    pub thin_sobel_x: ShaderProgram,
+    pub thin_sobel_y: ShaderProgram,
+    pub thin_gauss_x: ShaderProgram,
+    pub thin_gauss_y: ShaderProgram,
+    pub thin_kernel_x: ShaderProgram,
+    pub thin_kernel_y: ShaderProgram,
+    pub thin_warp: ShaderProgram,
 }
 
 /// All built-in FrameShift WGSL pipelines compiled for the active `wgpu::Device`,
@@ -102,12 +152,16 @@ pub struct ShaderPipelines {
     pub transition_kaleidoscope: ShaderProgram,
     pub fx_motion_tile_shake: ShaderProgram,
     pub fx_blur_mocurves: ShaderProgram,
+    pub fx_optical_flow_luma: ShaderProgram,
+    pub fx_optical_flow_step: ShaderProgram,
+    pub fx_optical_flow_blur: ShaderProgram,
     pub fx_anime_impact_frame: ShaderProgram,
     pub fx_radial_shockwave: ShaderProgram,
     pub fx_halftone_glow: ShaderProgram,
     pub fx_bloom_downsample: ShaderProgram,
     pub fx_bloom_upsample: ShaderProgram,
     pub fx_anime_sharpen: ShaderProgram,
+    pub anime4k: Anime4KPipelines,
     pub fx_film_optics: ShaderProgram,
     pub fx_film_optics_lens: ShaderProgram,
     pub fx_film_optics_composite: ShaderProgram,
@@ -117,6 +171,7 @@ pub struct ShaderPipelines {
     pub motion_blur_accumulate: ShaderProgram,
     pub motion_blur_tonemap_srgb: ShaderProgram,
     pub lut3d: ShaderProgram,
+    pub scene3d_depth_seed: ShaderProgram,
     pub transform3d: ShaderProgram,
     pub transform3d_scene: ShaderProgram,
     pub text3d_mesh: ShaderProgram,
@@ -140,6 +195,10 @@ pub struct ShaderPipelines {
     pub text2d_fx: ShaderProgram,
     pub backdrop_scrim_blur: ShaderProgram,
     pub backdrop_scrim_composite: ShaderProgram,
+    pub fx_displacement_map: ShaderProgram,
+    pub fx_frame_echo: ShaderProgram,
+    pub fx_shape_mask_feather: ShaderProgram,
+    pub yuv_to_linear: ShaderProgram,
     custom_wgsl_cache: HashMap<(u64, u8), Arc<ShaderProgram>>,
 }
 
@@ -325,6 +384,36 @@ impl ShaderPipelines {
             WORKING_TEXTURE_FORMAT,
         )?;
 
+        let fx_optical_flow_luma = build_program(
+            device,
+            "fx_optical_flow_luma",
+            SHADER_FX_OPTICAL_FLOW_LUMA,
+            "fs_main",
+            1,
+            None,
+            WORKING_TEXTURE_FORMAT,
+        )?;
+
+        let fx_optical_flow_step = build_program(
+            device,
+            "fx_optical_flow_step",
+            SHADER_FX_OPTICAL_FLOW_STEP,
+            "fs_main",
+            3,
+            Some(size_non_zero::<OpticalFlowStepUniform>()),
+            WORKING_TEXTURE_FORMAT,
+        )?;
+
+        let fx_optical_flow_blur = build_program(
+            device,
+            "fx_optical_flow_blur",
+            SHADER_FX_OPTICAL_FLOW_BLUR,
+            "fs_main",
+            2,
+            Some(size_non_zero::<OpticalFlowBlurUniform>()),
+            WORKING_TEXTURE_FORMAT,
+        )?;
+
         let fx_anime_impact_frame = build_program(
             device,
             "fx_anime_impact_frame",
@@ -384,6 +473,7 @@ impl ShaderPipelines {
             Some(size_non_zero::<AnimeSharpenUniform>()),
             WORKING_TEXTURE_FORMAT,
         )?;
+        let anime4k = build_anime4k_pipelines(device)?;
 
         let fx_film_optics = build_program(
             device,
@@ -674,8 +764,11 @@ impl ShaderPipelines {
             WORKING_TEXTURE_FORMAT,
         )?;
 
+        let scene3d_depth_seed = build_depth_seed_program(device, "scene3d_depth_seed", 1)?;
+
         let scene3d_msaa4x = if supports_msaa_4x {
             Some(Scene3DMsaaPipelines {
+                depth_seed: build_depth_seed_program(device, "scene3d_depth_seed_msaa4x", 4)?,
                 transform3d_scene: build_3d_program(
                     device,
                     "transform3d_scene_msaa4x",
@@ -823,6 +916,46 @@ impl ShaderPipelines {
             WORKING_TEXTURE_FORMAT,
         )?;
 
+        let fx_displacement_map = build_program(
+            device,
+            "fx_displacement_map",
+            SHADER_FX_DISPLACEMENT_MAP,
+            "fs_main",
+            2,
+            Some(size_non_zero::<DisplacementMapUniform>()),
+            WORKING_TEXTURE_FORMAT,
+        )?;
+
+        let fx_frame_echo = build_program(
+            device,
+            "fx_frame_echo",
+            SHADER_FX_FRAME_ECHO,
+            "fs_main",
+            2,
+            Some(size_non_zero::<FrameEchoUniform>()),
+            WORKING_TEXTURE_FORMAT,
+        )?;
+
+        let fx_shape_mask_feather = build_program(
+            device,
+            "fx_shape_mask_feather",
+            SHADER_FX_SHAPE_MASK_FEATHER,
+            "fs_main",
+            1,
+            Some(size_non_zero::<ShapeMaskFeatherUniform>()),
+            WORKING_TEXTURE_FORMAT,
+        )?;
+
+        let yuv_to_linear = build_program(
+            device,
+            "yuv_to_linear",
+            SHADER_YUV_TO_LINEAR,
+            "fs_main",
+            3,
+            Some(size_non_zero::<YuvToLinearUniform>()),
+            WORKING_TEXTURE_FORMAT,
+        )?;
+
         Ok(Self {
             common_fullscreen,
             transform,
@@ -841,12 +974,16 @@ impl ShaderPipelines {
             transition_kaleidoscope,
             fx_motion_tile_shake,
             fx_blur_mocurves,
+            fx_optical_flow_luma,
+            fx_optical_flow_step,
+            fx_optical_flow_blur,
             fx_anime_impact_frame,
             fx_radial_shockwave,
             fx_halftone_glow,
             fx_bloom_downsample,
             fx_bloom_upsample,
             fx_anime_sharpen,
+            anime4k,
             fx_film_optics,
             fx_film_optics_lens,
             fx_film_optics_composite,
@@ -862,6 +999,7 @@ impl ShaderPipelines {
                 pipeline: mb_tonemap_pipeline,
             },
             lut3d,
+            scene3d_depth_seed,
             transform3d,
             transform3d_scene,
             text3d_mesh,
@@ -884,6 +1022,10 @@ impl ShaderPipelines {
             text2d_fx,
             backdrop_scrim_blur,
             backdrop_scrim_composite,
+            fx_displacement_map,
+            fx_frame_echo,
+            fx_shape_mask_feather,
+            yuv_to_linear,
             custom_wgsl_cache: HashMap::new(),
         })
     }
@@ -1372,6 +1514,79 @@ fn build_3d_program(
     })
 }
 
+fn build_depth_seed_program(
+    device: &wgpu::Device,
+    name: &str,
+    sample_count: u32,
+) -> Result<ShaderProgram, RenderError> {
+    let module = compile_wgsl_module(device, name, SHADER_SCENE3D_DEPTH_SEED)?;
+    let bind_group_layout = create_bind_group_layout(
+        device,
+        name,
+        1,
+        Some(size_non_zero::<Scene3DDepthSeedUniform>()),
+    );
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&format!("{name}-pipeline-layout")),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(&format!("{name}-pipeline")),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: sample_count.max(1),
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: WORKING_TEXTURE_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::empty(),
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    if let Some(err) = pollster::block_on(scope.pop()) {
+        return Err(RenderError::ShaderCompilation {
+            shader: format!("{name}::fs_main"),
+            message: err.to_string(),
+        });
+    }
+    Ok(ShaderProgram {
+        bind_group_layout,
+        pipeline,
+    })
+}
+
 fn build_dof_coc_programs(device: &wgpu::Device) -> Result<(ShaderProgram, ShaderProgram), RenderError> {
     let module = compile_wgsl_module(device, "fx_dof_coc", SHADER_FX_DOF_COC)?;
     let bind_group_layout_h = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1617,5 +1832,138 @@ fn build_text_slug_program(device: &wgpu::Device) -> Result<ShaderProgram, Rende
     Ok(ShaderProgram {
         bind_group_layout,
         pipeline,
+    })
+}
+
+fn build_anime4k_pipelines(device: &wgpu::Device) -> Result<Anime4KPipelines, RenderError> {
+    let bgl = create_bind_group_layout(
+        device,
+        "anime4k-2tex",
+        2,
+        Some(size_non_zero::<Anime4KUniform>()),
+    );
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("anime4k-2tex-pipeline-layout"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+
+    let build_entry = |module: &wgpu::ShaderModule, name: &str, entry: &str| -> Result<ShaderProgram, RenderError> {
+        let pipeline = create_fullscreen_pipeline(
+            device,
+            name,
+            module,
+            entry,
+            &pipeline_layout,
+            WORKING_TEXTURE_FORMAT,
+        )?;
+        Ok(ShaderProgram {
+            bind_group_layout: bgl.clone(),
+            pipeline,
+        })
+    };
+
+    let m_bridge = compile_wgsl_module(device, "fx_anime4k_bridge", SHADER_FX_ANIME4K_BRIDGE)?;
+    let m_clamp = compile_wgsl_module(
+        device,
+        "fx_anime4k_clamp_highlights",
+        SHADER_FX_ANIME4K_CLAMP,
+    )?;
+    let m_restore_s = compile_wgsl_module(
+        device,
+        "fx_anime4k_restore_cnn_s",
+        SHADER_FX_ANIME4K_RESTORE_S,
+    )?;
+    let m_restore_soft_s = compile_wgsl_module(
+        device,
+        "fx_anime4k_restore_cnn_soft_s",
+        SHADER_FX_ANIME4K_RESTORE_SOFT_S,
+    )?;
+    let m_upscale_s = compile_wgsl_module(
+        device,
+        "fx_anime4k_upscale_cnn_x2_s",
+        SHADER_FX_ANIME4K_UPSCALE_X2_S,
+    )?;
+    let m_upscale_denoise_s = compile_wgsl_module(
+        device,
+        "fx_anime4k_upscale_denoise_cnn_x2_s",
+        SHADER_FX_ANIME4K_UPSCALE_DENOISE_X2_S,
+    )?;
+    let m_darken = compile_wgsl_module(
+        device,
+        "fx_anime4k_darken_hq",
+        SHADER_FX_ANIME4K_DARKEN_HQ,
+    )?;
+    let m_thin = compile_wgsl_module(device, "fx_anime4k_thin_hq", SHADER_FX_ANIME4K_THIN_HQ)?;
+
+    Ok(Anime4KPipelines {
+        to_srgb_straight: build_entry(&m_bridge, "anime4k_to_srgb_straight", "fs_to_srgb_straight")?,
+        to_linear_premul: build_entry(&m_bridge, "anime4k_to_linear_premul", "fs_to_linear_premul")?,
+        clamp_stats_x: build_entry(&m_clamp, "anime4k_clamp_stats_x", "fs_stats_x")?,
+        clamp_stats_y: build_entry(&m_clamp, "anime4k_clamp_stats_y", "fs_stats_y")?,
+        clamp_apply: build_entry(&m_clamp, "anime4k_clamp_apply", "fs_clamp")?,
+        restore_s: [
+            build_entry(&m_restore_s, "anime4k_restore_s_conv0", "fs_conv0")?,
+            build_entry(&m_restore_s, "anime4k_restore_s_conv1", "fs_conv1")?,
+            build_entry(&m_restore_s, "anime4k_restore_s_conv2", "fs_conv2")?,
+            build_entry(&m_restore_s, "anime4k_restore_s_conv3", "fs_conv3_residual")?,
+        ],
+        restore_soft_s: [
+            build_entry(&m_restore_soft_s, "anime4k_restore_soft_s_conv0", "fs_conv0")?,
+            build_entry(&m_restore_soft_s, "anime4k_restore_soft_s_conv1", "fs_conv1")?,
+            build_entry(&m_restore_soft_s, "anime4k_restore_soft_s_conv2", "fs_conv2")?,
+            build_entry(
+                &m_restore_soft_s,
+                "anime4k_restore_soft_s_conv3",
+                "fs_conv3_residual",
+            )?,
+        ],
+        upscale_x2_s: [
+            build_entry(&m_upscale_s, "anime4k_upscale_x2_s_conv0", "fs_conv0")?,
+            build_entry(&m_upscale_s, "anime4k_upscale_x2_s_conv1", "fs_conv1")?,
+            build_entry(&m_upscale_s, "anime4k_upscale_x2_s_conv2", "fs_conv2")?,
+            build_entry(&m_upscale_s, "anime4k_upscale_x2_s_conv3", "fs_conv3_last")?,
+            build_entry(&m_upscale_s, "anime4k_upscale_x2_s_d2s", "fs_depth_to_space")?,
+        ],
+        upscale_denoise_x2_s: [
+            build_entry(
+                &m_upscale_denoise_s,
+                "anime4k_upscale_denoise_x2_s_conv0",
+                "fs_conv0",
+            )?,
+            build_entry(
+                &m_upscale_denoise_s,
+                "anime4k_upscale_denoise_x2_s_conv1",
+                "fs_conv1",
+            )?,
+            build_entry(
+                &m_upscale_denoise_s,
+                "anime4k_upscale_denoise_x2_s_conv2",
+                "fs_conv2",
+            )?,
+            build_entry(
+                &m_upscale_denoise_s,
+                "anime4k_upscale_denoise_x2_s_conv3",
+                "fs_conv3_last",
+            )?,
+            build_entry(
+                &m_upscale_denoise_s,
+                "anime4k_upscale_denoise_x2_s_d2s",
+                "fs_depth_to_space",
+            )?,
+        ],
+        darken_luma: build_entry(&m_darken, "anime4k_darken_luma", "fs_luma")?,
+        darken_diff_x: build_entry(&m_darken, "anime4k_darken_diff_x", "fs_diff_x")?,
+        darken_diff_y: build_entry(&m_darken, "anime4k_darken_diff_y", "fs_diff_y")?,
+        darken_gauss_x: build_entry(&m_darken, "anime4k_darken_gauss_x", "fs_gauss_x")?,
+        darken_composite: build_entry(&m_darken, "anime4k_darken_composite", "fs_composite")?,
+        thin_luma: build_entry(&m_thin, "anime4k_thin_luma", "fs_luma")?,
+        thin_sobel_x: build_entry(&m_thin, "anime4k_thin_sobel_x", "fs_sobel_x")?,
+        thin_sobel_y: build_entry(&m_thin, "anime4k_thin_sobel_y", "fs_sobel_y")?,
+        thin_gauss_x: build_entry(&m_thin, "anime4k_thin_gauss_x", "fs_gauss_x")?,
+        thin_gauss_y: build_entry(&m_thin, "anime4k_thin_gauss_y", "fs_gauss_y")?,
+        thin_kernel_x: build_entry(&m_thin, "anime4k_thin_kernel_x", "fs_kernel_x")?,
+        thin_kernel_y: build_entry(&m_thin, "anime4k_thin_kernel_y", "fs_kernel_y")?,
+        thin_warp: build_entry(&m_thin, "anime4k_thin_warp", "fs_warp")?,
     })
 }
