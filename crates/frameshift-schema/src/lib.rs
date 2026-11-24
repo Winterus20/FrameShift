@@ -16,7 +16,7 @@ pub use graph::{
     DisabledPassthrough, ExtendedColorSpace, GraphNodeDef, HalftoneColorMode, LutSourceDef,
     MAX_GRID_WARP_DIM, MAX_PRECOMP_DEPTH, MAX_PRECOMP_INPUTS, MatteMode, NodeId, NodeKind,
     RenderGraphDef, SampleFilter, Shape3DKind, ShutterPhase, SourceFit, TextAlign2D,
-    TextAnimatorDef, TextSelectorUnit, WritingMode2D,
+    TextAnimatorDef, TextRangeShape, TextSelectorUnit, WritingMode2D,
 };
 pub use portable::{
     AmbiguousMediaRelink, MediaRelinkReport, PROJECT_MEDIA_MANIFEST_VERSION, ProjectMediaManifest,
@@ -25,16 +25,16 @@ pub use portable::{
 };
 pub use precomp::{precompose, unprecompose};
 pub use project::{
-    AnimationEasing, AnimationKeyframe, AssetDef, AssetKind, AudioClipDef, AudioFadeCurve,
-    AudioFadeDef, ClipDef, CreativeDecisionRecord, EventAnchorDef, EventBoundAnimation,
-    EventOrigin, HwAccelPolicy, ParamBindingDef, PreferenceEntry, PreferenceScope, Project,
-    ProxyConfigDef, RenderProfileDef, RenderProfileKind, RenderProfilesDef, Resolution,
-    TimelineDef, WorkingPixelFormat,
+    AnimationEasing, AnimationKeyframe, AssetDef, AssetKind, AudioBus, AudioClipDef,
+    AudioDuckingRuleDef, AudioFadeCurve, AudioFadeDef, ClipDef, CreativeDecisionRecord,
+    EventAnchorDef, EventBoundAnimation, EventOrigin, HwAccelPolicy, MicroSilenceDef,
+    ParamBindingDef, PreferenceEntry, PreferenceScope, Project, ProxyConfigDef, RenderProfileDef,
+    RenderProfileKind, RenderProfilesDef, Resolution, TimelineDef, WorkingPixelFormat,
 };
 pub use session::{HardCut, ProjectCommand, ProjectSession};
 pub use template::{
-    RedistributionStatus, TEMPLATE_PACKAGE_VERSION, TemplateFileRole, TemplatePackage,
-    TemplatePackageFile, TemplatePackageManifest, TemplateReview, TemplateSlot, TemplateSlotKind,
-    TemplateSlotTarget, TemplateSlotValue,
+    EffectChainPreset, RedistributionStatus, TEMPLATE_PACKAGE_VERSION, TemplateFileRole,
+    TemplatePackage, TemplatePackageFile, TemplatePackageManifest, TemplateReview, TemplateSlot,
+    TemplateSlotKind, TemplateSlotTarget, TemplateSlotValue, validate_effect_chain_preset,
 };
 pub use version::{CURRENT_SCHEMA_VERSION, SchemaVersion};

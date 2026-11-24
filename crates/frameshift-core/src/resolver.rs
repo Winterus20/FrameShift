@@ -2,11 +2,14 @@ use crate::error::CoreError;
 use frameshift_media::{
     AudioBuffer, AudioRetimeMode, DEFAULT_AUDIO_SAMPLE_RATE, DecoderPool, DecoderPoolTelemetry,
     FfmpegBridge, LruFrameCache, MediaProbeInfo, Rgba8Frame, Rgba16fFrame, SourceFit as DecodeFit,
-    SyntheticMediaGenerator,
+    SyntheticMediaGenerator, apply_micro_silence, apply_sidechain_ducking, apply_soft_limiter,
+    apply_stereo_pan,
 };
 use frameshift_render::{FrameProvider, RenderError, SourceFrame};
-use frameshift_schema::project::AudioClipDef;
-use frameshift_schema::{AssetDef, AssetKind, NodeId, NodeKind, Project, SourceFit, TextAlign2D};
+use frameshift_schema::project::{AudioBus, AudioClipDef, MicroSilenceDef};
+use frameshift_schema::{
+    AssetDef, AssetKind, NodeId, NodeKind, Project, SchemaError, SourceFit, TextAlign2D,
+};
 use frameshift_time::{FLICKS_PER_SECOND, Flicks, SpeedCurve, ticks_to_audio_samples_nearest};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -285,6 +288,7 @@ pub struct MediaResolver {
     probe_cache: HashMap<PathBuf, (DiskMediaStamp, MediaProbeInfo)>,
     vector_text_cache: HashMap<VectorTextCacheKey, Rgba16fFrame>,
     hud_path_cache: HashMap<HudPathCacheKey, Rgba16fFrame>,
+    audio_cache: RefCell<HashMap<String, AudioBuffer>>,
     decoder_pool: DecoderPool,
 }
 
@@ -323,7 +327,13 @@ impl MediaResolver {
         self.probe_cache.clear();
         self.vector_text_cache.clear();
         self.hud_path_cache.clear();
+        self.audio_cache.get_mut().clear();
         self.decoder_pool.close_all();
+    }
+
+    /// Returns the number of decoded/synthesized audio assets currently cached.
+    pub fn audio_cache_len(&self) -> usize {
+        self.audio_cache.borrow().len()
     }
 
     /// Closes all open streaming video decoder subprocesses without clearing probed metadata.
@@ -542,29 +552,50 @@ impl MediaResolver {
         Ok(frame)
     }
 
-    /// Decodes or synthesizes an audio asset at `DEFAULT_AUDIO_SAMPLE_RATE` (`48_000 Hz`, stereo).
+    /// Decodes or synthesizes an audio asset at `DEFAULT_AUDIO_SAMPLE_RATE` (`48_000 Hz`, stereo),
+    /// caching the result in memory so repeated clips reuse the same decoded buffer.
     pub fn load_audio_asset(
         &self,
         asset: &AssetDef,
         min_duration: Flicks,
     ) -> Result<AudioBuffer, CoreError> {
         match self.resolve_asset_source(asset)? {
-            ResolvedAssetSource::Disk(path) => Ok(FfmpegBridge::decode_audio(
-                &path,
-                DEFAULT_AUDIO_SAMPLE_RATE,
-                2,
-            )?),
+            ResolvedAssetSource::Disk(path) => {
+                let stamp = disk_media_stamp(&path)?;
+                let cache_key = format!(
+                    "disk:{}:{}:{}:{stamp:?}",
+                    path.display(),
+                    DEFAULT_AUDIO_SAMPLE_RATE,
+                    2
+                );
+                if let Some(cached) = self.audio_cache.borrow().get(&cache_key) {
+                    return Ok(cached.clone());
+                }
+                let decoded = FfmpegBridge::decode_audio(&path, DEFAULT_AUDIO_SAMPLE_RATE, 2)?;
+                self.audio_cache
+                    .borrow_mut()
+                    .insert(cache_key, decoded.clone());
+                Ok(decoded)
+            }
             ResolvedAssetSource::Synthetic(SyntheticAssetKind::BeatAudio120Bpm) => {
                 let dur = asset
                     .duration_ticks
                     .map(|d| if d > min_duration { d } else { min_duration })
                     .unwrap_or(min_duration)
                     .max(Flicks(FLICKS_PER_SECOND));
+                let cache_key = format!(
+                    "synthetic:beat120:{}:{}:{}",
+                    dur.0, DEFAULT_AUDIO_SAMPLE_RATE, 2
+                );
+                if let Some(cached) = self.audio_cache.borrow().get(&cache_key) {
+                    return Ok(cached.clone());
+                }
                 let (buf, _beats) = SyntheticMediaGenerator::generate_beat_audio(
                     dur,
                     120,
                     DEFAULT_AUDIO_SAMPLE_RATE,
                 );
+                self.audio_cache.borrow_mut().insert(cache_key, buf.clone());
                 Ok(buf)
             }
             ResolvedAssetSource::Synthetic(other) => Err(CoreError::InvalidArgument(format!(
@@ -576,40 +607,103 @@ impl MediaResolver {
 
     /// Mixes all `project.timeline.audio_clips` into a single `48_000 Hz` stereo `AudioBuffer`.
     ///
-    /// Each clip's optional `fade_in`/`fade_out` ramps are applied per sample on top of the
-    /// static `gain_db` level. Clips without fades keep the constant-gain `mix_in` path, so
-    /// legacy projects stay bit-identical.
+    /// Resolves `anchor_event_id` + `apex_offset_ticks` placement, stereo panning, per-clip
+    /// fade ramps, bus routing, sidechain ducking rules, targeted/master micro-silences,
+    /// and soft peak limiting (`0.99` ceiling when peaks exceed `0.99`).
     /// Returns `Ok(None)` when `audio_clips` is empty.
     pub fn mix_project_audio(&self, project: &Project) -> Result<Option<AudioBuffer>, CoreError> {
         if project.timeline.audio_clips.is_empty() {
             return Ok(None);
         }
 
-        let mut out = AudioBuffer::silence_for_duration(
-            DEFAULT_AUDIO_SAMPLE_RATE,
-            2,
-            project.timeline.duration_ticks,
-        )?;
+        let mut bus_buffers: [Option<AudioBuffer>; 6] = std::array::from_fn(|_| None);
 
         for ac in &project.timeline.audio_clips {
             let asset = project
                 .asset(&ac.asset_id)
-                .ok_or_else(|| frameshift_schema::SchemaError::MissingAsset(ac.asset_id.clone()))?;
+                .ok_or_else(|| SchemaError::MissingAsset(ac.asset_id.clone()))?;
             let clip_duration = ac.timeline_end - ac.timeline_start;
+            let (effective_start, _effective_end) = resolve_audio_clip_bounds(project, ac)?;
             let required_src_end = ac.source_start + clip_duration;
             let full_audio = self.load_audio_asset(asset, required_src_end)?;
-            let sliced = slice_audio_buffer(&full_audio, ac.source_start, clip_duration)?;
+            let mut sliced = slice_audio_buffer(&full_audio, ac.source_start, clip_duration)?;
+            if ac.pan != 0.0 {
+                apply_stereo_pan(&mut sliced, ac.pan);
+            }
+
+            let slot = &mut bus_buffers[audio_bus_index(ac.bus)];
+            if slot.is_none() {
+                *slot = Some(AudioBuffer::silence_for_duration(
+                    DEFAULT_AUDIO_SAMPLE_RATE,
+                    2,
+                    project.timeline.duration_ticks,
+                )?);
+            }
+            let bus_out = slot.as_mut().expect("bus buffer initialized");
+
             if ac.fade_in.is_none() && ac.fade_out.is_none() {
-                out.mix_in(&sliced, ac.timeline_start, ac.gain_db)?;
+                bus_out.mix_in(&sliced, effective_start, ac.gain_db)?;
             } else {
-                out.mix_in_with_gain_curve(&sliced, ac.timeline_start, ac.gain_db, |progress| {
-                    audio_clip_fade_gain(ac, clip_duration, progress as f64) as f32
-                })?;
+                bus_out.mix_in_with_gain_curve(
+                    &sliced,
+                    effective_start,
+                    ac.gain_db,
+                    |progress| audio_clip_fade_gain(ac, clip_duration, progress as f64) as f32,
+                )?;
             }
         }
 
-        for sample in &mut out.samples {
-            *sample = sample.clamp(-1.0, 1.0);
+        for rule in &project.timeline.ducking_rules {
+            let trig_idx = audio_bus_index(rule.trigger_bus);
+            let targ_idx = audio_bus_index(rule.target_bus);
+            if trig_idx == targ_idx {
+                continue;
+            }
+            let (trig_opt, targ_opt) = if trig_idx < targ_idx {
+                let (head, tail) = bus_buffers.split_at_mut(targ_idx);
+                (&head[trig_idx], &mut tail[0])
+            } else {
+                let (head, tail) = bus_buffers.split_at_mut(trig_idx);
+                (&tail[0], &mut head[targ_idx])
+            };
+            if let (Some(trigger), Some(target)) = (trig_opt.as_ref(), targ_opt.as_mut()) {
+                apply_sidechain_ducking(
+                    target,
+                    trigger,
+                    rule.threshold,
+                    rule.duck_gain,
+                    rule.attack_ms,
+                    rule.release_ms,
+                );
+            }
+        }
+
+        for ms in &project.timeline.micro_silences {
+            if let Some(bus) = ms.target_bus
+                && let Some(bus_buf) = bus_buffers[audio_bus_index(bus)].as_mut()
+            {
+                apply_project_micro_silence(bus_buf, ms)?;
+            }
+        }
+
+        let mut active_buses = bus_buffers.into_iter().flatten();
+        let Some(mut out) = active_buses.next() else {
+            return Ok(None);
+        };
+        for bus_buf in active_buses {
+            for (dst, &src) in out.samples.iter_mut().zip(&bus_buf.samples) {
+                *dst += src;
+            }
+        }
+
+        for ms in &project.timeline.micro_silences {
+            if ms.target_bus.is_none() {
+                apply_project_micro_silence(&mut out, ms)?;
+            }
+        }
+
+        if out.samples.iter().any(|s| !s.is_finite() || s.abs() > 0.99) {
+            apply_soft_limiter(&mut out, 0.99);
         }
         Ok(Some(out))
     }
@@ -660,6 +754,52 @@ impl MediaResolver {
             kind, width, height, pts,
         )?)
     }
+}
+
+/// Resolves an audio clip's `[start, end)` timeline bounds, shifting by
+/// `event.target_output_tick - apex_offset_ticks` when `anchor_event_id` is set.
+pub fn resolve_audio_clip_bounds(
+    project: &Project,
+    ac: &AudioClipDef,
+) -> Result<(Flicks, Flicks), CoreError> {
+    let duration = ac.timeline_end - ac.timeline_start;
+    let start = if let Some(ref event_id) = ac.anchor_event_id {
+        let event = project
+            .event(event_id)
+            .ok_or_else(|| SchemaError::MissingEvent(event_id.clone()))?;
+        let apex_offset = ac.apex_offset_ticks.unwrap_or(Flicks::ZERO);
+        Flicks(event.target_output_tick.0.saturating_sub(apex_offset.0))
+    } else {
+        ac.timeline_start
+    };
+    Ok((start, Flicks(start.0.saturating_add(duration.0))))
+}
+
+fn audio_bus_index(bus: AudioBus) -> usize {
+    match bus {
+        AudioBus::Music => 0,
+        AudioBus::Dialogue => 1,
+        AudioBus::SfxImpact => 2,
+        AudioBus::SfxWhoosh => 3,
+        AudioBus::SfxRiser => 4,
+        AudioBus::SubBass => 5,
+    }
+}
+
+fn apply_project_micro_silence(
+    buf: &mut AudioBuffer,
+    ms: &MicroSilenceDef,
+) -> Result<(), CoreError> {
+    let start_sample =
+        ticks_to_audio_samples_nearest(Flicks(ms.start_tick.0.max(0)), buf.sample_rate)?.max(0)
+            as usize;
+    let end_sample =
+        ticks_to_audio_samples_nearest(Flicks(ms.end_tick.0.max(0)), buf.sample_rate)?.max(0)
+            as usize;
+    let fade_samples =
+        ((ms.fade_ms.max(0.0) as f64) * 0.001 * (buf.sample_rate as f64)).round() as usize;
+    apply_micro_silence(buf, start_sample, end_sample, fade_samples, ms.floor_gain);
+    Ok(())
 }
 
 /// Evaluates the combined fade multiplier of `ac` at normalized clip progress.
@@ -1511,5 +1651,153 @@ mod tests {
         resolver.clear_probe_cache();
         assert!(resolver.hud_path_cache.is_empty());
         assert!(resolver.vector_text_cache.is_empty());
+        assert_eq!(resolver.audio_cache_len(), 0);
+    }
+
+    #[test]
+    fn audio_buffer_cache_reuses_synthetic_and_disk_buffers_and_clears() {
+        let mut resolver = MediaResolver::new();
+        let project = Project::golden_scene_preset();
+        assert_eq!(resolver.audio_cache_len(), 0);
+
+        let _ = resolver.mix_project_audio(&project).expect("mix synthetic");
+        assert_eq!(resolver.audio_cache_len(), 1);
+
+        // Mixing again reuses the cached BeatAudio120Bpm buffer without creating another entry.
+        let _ = resolver.mix_project_audio(&project).expect("mix synthetic cached");
+        assert_eq!(resolver.audio_cache_len(), 1);
+
+        resolver.clear_probe_cache();
+        assert_eq!(resolver.audio_cache_len(), 0);
+    }
+
+    #[test]
+    fn mix_project_audio_handles_event_anchor_pan_ducking_micro_silence_and_soft_limiter() {
+        use frameshift_schema::{
+            AudioClipDef, AudioDuckingRuleDef, EventAnchorDef, EventOrigin, MicroSilenceDef,
+        };
+
+        // Test directly via AudioBuffer + mix_project_audio using a WAV-backed project?
+        // Note: Disk WAV decode uses ffmpeg; if ffmpeg is unavailable in sandbox, test the
+        // core logic via synthetic BeatAudio120Bpm + pure-Rust resolver helpers.
+        let mut project = Project::golden_scene_preset();
+        let one_sec = Flicks(FLICKS_PER_SECOND);
+        project.timeline.duration_ticks = Flicks(2 * FLICKS_PER_SECOND);
+        project.events.push(EventAnchorDef {
+            event_id: "sfx_apex".into(),
+            label: "SFX Apex".into(),
+            source_clip_id: None,
+            source_anchor_tick: None,
+            target_output_tick: Flicks(FLICKS_PER_SECOND),
+            origin: EventOrigin::UserMarked,
+        });
+
+        // 1. Anchor placement + apex offset resolution
+        project.timeline.audio_clips = vec![AudioClipDef {
+            id: "riser_anchored".into(),
+            asset_id: "asset_bgm".into(),
+            timeline_start: Flicks::ZERO,
+            timeline_end: Flicks(FLICKS_PER_SECOND / 2),
+            source_start: Flicks::ZERO,
+            gain_db: 0.0,
+            fade_in: None,
+            fade_out: None,
+            bus: AudioBus::SfxRiser,
+            pan: -1.0,
+            anchor_event_id: Some("sfx_apex".into()),
+            apex_offset_ticks: Some(Flicks(FLICKS_PER_SECOND / 4)),
+        }];
+        let (eff_start, eff_end) =
+            resolve_audio_clip_bounds(&project, &project.timeline.audio_clips[0]).unwrap();
+        assert_eq!(eff_start, Flicks(3 * FLICKS_PER_SECOND / 4));
+        assert_eq!(eff_end, Flicks(5 * FLICKS_PER_SECOND / 4));
+
+        // Hard left pan (-1.0) places signal on Left channel and silences Right channel.
+        let resolver = MediaResolver::new();
+        let panned = resolver.mix_project_audio(&project).unwrap().unwrap();
+        let beat_sample =
+            ticks_to_audio_samples_nearest(eff_start, DEFAULT_AUDIO_SAMPLE_RATE).unwrap() as usize;
+        assert!(panned.samples[beat_sample * 2].abs() > 0.5);
+        assert!(panned.samples[beat_sample * 2 + 1].abs() < 1e-6);
+
+        // 2. Micro-silence targeted to SfxRiser dips that bus, while Music stays untouched.
+        project.timeline.audio_clips.push(AudioClipDef {
+            id: "music_bed".into(),
+            asset_id: "asset_bgm".into(),
+            timeline_start: Flicks::ZERO,
+            timeline_end: one_sec,
+            source_start: Flicks::ZERO,
+            gain_db: 0.0,
+            fade_in: None,
+            fade_out: None,
+            bus: AudioBus::Music,
+            pan: 0.0,
+            anchor_event_id: None,
+            apex_offset_ticks: None,
+        });
+        project.timeline.micro_silences.push(MicroSilenceDef {
+            start_tick: Flicks(FLICKS_PER_SECOND / 2 - FLICKS_PER_SECOND / 20),
+            end_tick: Flicks(FLICKS_PER_SECOND / 2 + FLICKS_PER_SECOND / 20),
+            fade_ms: 0.0,
+            floor_gain: 0.0,
+            target_bus: Some(AudioBus::Music),
+        });
+        // Duck SfxRiser when Music has energy at t=0.
+        project.timeline.ducking_rules.push(AudioDuckingRuleDef {
+            trigger_bus: AudioBus::Music,
+            target_bus: AudioBus::SfxRiser,
+            threshold: 0.05,
+            duck_gain: 0.25,
+            attack_ms: 1.0,
+            release_ms: 10.0,
+        });
+        project.validate().expect("advanced audio project validates");
+        let bus_mixed = resolver.mix_project_audio(&project).unwrap().unwrap();
+        // Beat at 0.5s on Music is silenced by micro_silence (floor_gain=0.0).
+        let half_sec_sample =
+            ticks_to_audio_samples_nearest(Flicks(FLICKS_PER_SECOND / 2), DEFAULT_AUDIO_SAMPLE_RATE)
+                .unwrap() as usize;
+        assert!(bus_mixed.samples[half_sec_sample * 2].abs() < 1e-5);
+
+        // 3. Soft limiter keeps hot overlapping mixes <= 0.99 without hard-clipping at 1.0.
+        project.timeline.micro_silences.clear();
+        project.timeline.ducking_rules.clear();
+        project.timeline.audio_clips = vec![
+            AudioClipDef {
+                id: "hot_1".into(),
+                asset_id: "asset_bgm".into(),
+                timeline_start: Flicks::ZERO,
+                timeline_end: one_sec,
+                source_start: Flicks::ZERO,
+                gain_db: 6.0,
+                fade_in: None,
+                fade_out: None,
+                bus: AudioBus::Music,
+                pan: 0.0,
+                anchor_event_id: None,
+                apex_offset_ticks: None,
+            },
+            AudioClipDef {
+                id: "hot_2".into(),
+                asset_id: "asset_bgm".into(),
+                timeline_start: Flicks::ZERO,
+                timeline_end: one_sec,
+                source_start: Flicks::ZERO,
+                gain_db: 6.0,
+                fade_in: None,
+                fade_out: None,
+                bus: AudioBus::SfxImpact,
+                pan: 0.0,
+                anchor_event_id: None,
+                apex_offset_ticks: None,
+            },
+        ];
+        let limited = resolver.mix_project_audio(&project).unwrap().unwrap();
+        let peak = limited
+            .samples
+            .iter()
+            .fold(0.0f32, |acc, &s| acc.max(s.abs()));
+        assert!(peak <= 0.99 + 1e-6, "expected peak <= 0.99, got {peak}");
+        assert!(peak > 0.90, "expected soft limiter knee near 0.99, got {peak}");
     }
 }

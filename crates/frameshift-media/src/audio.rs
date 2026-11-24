@@ -454,7 +454,10 @@ impl AudioBuffer {
                 stretched.samples.resize(out_frames * ch_count, 0.0);
                 Ok(stretched)
             }
-            SpeedCurveSpec::PiecewiseLinear { .. } | SpeedCurveSpec::CubicHermite { .. } => {
+            SpeedCurveSpec::PiecewiseLinear { .. }
+            | SpeedCurveSpec::CubicHermite { .. }
+            | SpeedCurveSpec::CubicBezierValue { .. }
+            | SpeedCurveSpec::CubicBezierSpeed { .. } => {
                 let in_frames = self.frame_count();
                 if in_frames < 32 {
                     return self.retime(
@@ -896,6 +899,286 @@ impl AudioBuffer {
     }
 }
 
+/// Filter response kind for [`apply_biquad_filter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BiquadFilterKind {
+    LowPass,
+    HighPass,
+}
+
+/// Applies soft `tanh` saturation above a smooth knee so peaks never exceed `ceiling`.
+///
+/// Signals below `0.75 * ceiling` pass through unmodified (`C^1` smooth transition into `tanh`).
+pub fn apply_soft_limiter(buf: &mut AudioBuffer, ceiling: f32) {
+    if !ceiling.is_finite() {
+        return;
+    }
+    if ceiling <= 0.0 {
+        buf.samples.fill(0.0);
+        return;
+    }
+    let c = ceiling;
+    let knee = 0.75 * c;
+    let headroom = c - knee;
+    for s in &mut buf.samples {
+        let x = *s;
+        if !x.is_finite() {
+            *s = if x.is_nan() {
+                0.0
+            } else if x.is_sign_positive() {
+                c
+            } else {
+                -c
+            };
+            continue;
+        }
+        let abs_x = x.abs();
+        if abs_x <= knee {
+            continue;
+        }
+        let limited = if headroom > 1e-7 {
+            knee + headroom * ((abs_x - knee) / headroom).tanh()
+        } else {
+            c
+        };
+        *s = x.signum() * limited.clamp(0.0, c);
+    }
+}
+
+/// Applies a 2nd-order Robert Bristow-Johnson (RBJ) biquad filter in-place per channel.
+pub fn apply_biquad_filter(
+    buf: &mut AudioBuffer,
+    kind: BiquadFilterKind,
+    cutoff_hz: f32,
+    q: f32,
+) {
+    let frames = buf.frame_count();
+    if frames == 0 || !cutoff_hz.is_finite() || !q.is_finite() {
+        return;
+    }
+
+    let fs = buf.sample_rate as f64;
+    let f0 = (cutoff_hz as f64).clamp(1.0, fs * 0.49);
+    let q_clamped = (q as f64).max(0.05);
+
+    let omega0 = 2.0 * std::f64::consts::PI * f0 / fs;
+    let cos_w0 = omega0.cos();
+    let sin_w0 = omega0.sin();
+    let alpha = sin_w0 / (2.0 * q_clamped);
+
+    let (b0, b1, b2, a0, a1, a2) = match kind {
+        BiquadFilterKind::LowPass => {
+            let b1 = 1.0 - cos_w0;
+            let b0 = b1 * 0.5;
+            (b0, b1, b0, 1.0 + alpha, -2.0 * cos_w0, 1.0 - alpha)
+        }
+        BiquadFilterKind::HighPass => {
+            let one_plus = 1.0 + cos_w0;
+            let b0 = one_plus * 0.5;
+            (b0, -one_plus, b0, 1.0 + alpha, -2.0 * cos_w0, 1.0 - alpha)
+        }
+    };
+
+    let b0 = b0 / a0;
+    let b1 = b1 / a0;
+    let b2 = b2 / a0;
+    let a1 = a1 / a0;
+    let a2 = a2 / a0;
+
+    let ch_count = buf.channels as usize;
+    for ch in 0..ch_count {
+        let mut z1 = 0.0f64;
+        let mut z2 = 0.0f64;
+        for f in 0..frames {
+            let idx = f * ch_count + ch;
+            let x = buf.samples[idx] as f64;
+            let x = if x.is_finite() { x } else { 0.0 };
+            let y = b0 * x + z1;
+            z1 = b1 * x - a1 * y + z2;
+            z2 = b2 * x - a2 * y;
+            buf.samples[idx] = y as f32;
+        }
+    }
+}
+
+/// Applies a smooth micro-silence dip across frame range `[start_sample, end_sample)`.
+///
+/// Ramps smoothly from `1.0` down to `floor_gain` over `fade_samples` at entry and back to
+/// `1.0` over `fade_samples` at exit using raised-cosine ramps so adjacent audio stays click-free.
+pub fn apply_micro_silence(
+    buf: &mut AudioBuffer,
+    start_sample: usize,
+    end_sample: usize,
+    fade_samples: usize,
+    floor_gain: f32,
+) {
+    let frames = buf.frame_count();
+    let start = start_sample.min(frames);
+    let end = end_sample.min(frames);
+    if frames == 0 || start >= end {
+        return;
+    }
+
+    let floor = if floor_gain.is_finite() {
+        floor_gain.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let len = end - start;
+    let eff_fade = fade_samples.min(len / 2);
+    let ch_count = buf.channels as usize;
+
+    for f in start..end {
+        let gain = if eff_fade == 0 {
+            floor
+        } else if f - start < eff_fade {
+            let t = (f - start) as f32 / eff_fade as f32;
+            let alpha = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+            1.0 + (floor - 1.0) * alpha
+        } else if end - f <= eff_fade {
+            let t = (end - f) as f32 / eff_fade as f32;
+            let alpha = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+            1.0 + (floor - 1.0) * alpha
+        } else {
+            floor
+        };
+        let base = f * ch_count;
+        for ch in 0..ch_count {
+            buf.samples[base + ch] *= gain;
+        }
+    }
+}
+
+/// Ducks `target` smoothly to `duck_gain` whenever `trigger` exceeds `threshold`.
+pub fn apply_sidechain_ducking(
+    target: &mut AudioBuffer,
+    trigger: &AudioBuffer,
+    threshold: f32,
+    duck_gain: f32,
+    attack_ms: f32,
+    release_ms: f32,
+) {
+    let target_frames = target.frame_count();
+    if target_frames == 0
+        || trigger.frame_count() == 0
+        || !threshold.is_finite()
+        || !duck_gain.is_finite()
+        || !attack_ms.is_finite()
+        || !release_ms.is_finite()
+    {
+        return;
+    }
+
+    let resampled_trigger;
+    let trig = if trigger.sample_rate == target.sample_rate {
+        trigger
+    } else if let Ok(r) = trigger.resample_to(target.sample_rate) {
+        resampled_trigger = r;
+        &resampled_trigger
+    } else {
+        return;
+    };
+
+    let thresh = threshold.max(0.0) as f64;
+    let duck = duck_gain.clamp(0.0, 1.0) as f64;
+    let fs = target.sample_rate as f64;
+
+    let attack_sec = (attack_ms.max(0.0) as f64) * 0.001;
+    let release_sec = (release_ms.max(0.0) as f64) * 0.001;
+    let attack_coeff = if attack_sec <= 0.0 {
+        0.0
+    } else {
+        (-1.0 / (attack_sec * fs)).exp()
+    };
+    let release_coeff = if release_sec <= 0.0 {
+        0.0
+    } else {
+        (-1.0 / (release_sec * fs)).exp()
+    };
+    // Short peak-hold decay prevents zero-crossings in tonal triggers from chattering the ducker.
+    let trig_hold_sec = (release_sec * 0.25).clamp(0.0005, 0.005);
+    let trig_decay = if release_sec <= 0.0 {
+        0.0
+    } else {
+        (-1.0 / (trig_hold_sec * fs)).exp()
+    };
+
+    let target_ch = target.channels as usize;
+    let trig_ch = trig.channels as usize;
+    let trig_frames = trig.frame_count();
+
+    let mut trig_env = 0.0f64;
+    let mut gain = 1.0f64;
+
+    for f in 0..target_frames {
+        let det = if f < trig_frames {
+            let base = f * trig_ch;
+            let mut peak = 0.0f64;
+            for ch in 0..trig_ch {
+                let v = trig.samples[base + ch].abs() as f64;
+                if v.is_finite() && v > peak {
+                    peak = v;
+                }
+            }
+            peak
+        } else {
+            0.0
+        };
+
+        if det > trig_env {
+            trig_env = det;
+        } else {
+            trig_env = trig_decay * trig_env + (1.0 - trig_decay) * det;
+        }
+
+        let desired_gain = if trig_env > thresh { duck } else { 1.0 };
+        if desired_gain < gain {
+            gain = attack_coeff * gain + (1.0 - attack_coeff) * desired_gain;
+        } else {
+            gain = release_coeff * gain + (1.0 - release_coeff) * desired_gain;
+        }
+
+        let g = gain as f32;
+        let base = f * target_ch;
+        for ch in 0..target_ch {
+            target.samples[base + ch] *= g;
+        }
+    }
+}
+
+/// Applies constant-power (equal-power) stereo panning across `pan` in `-1.0..=1.0`.
+///
+/// Mono buffers are promoted in-place to 2-channel stereo (`L^2 + R^2 = mono^2`); stereo and
+/// multi-channel buffers scale channels `0` (left) and `1` (right) by `(cos(theta), sin(theta))`.
+pub fn apply_stereo_pan(buf: &mut AudioBuffer, pan: f32) {
+    if !pan.is_finite() || buf.frame_count() == 0 {
+        return;
+    }
+    let clamped = pan.clamp(-1.0, 1.0) as f64;
+    let theta = (clamped + 1.0) * 0.25 * std::f64::consts::PI;
+    let gain_l = theta.cos() as f32;
+    let gain_r = theta.sin() as f32;
+
+    if buf.channels == 1 {
+        let mut stereo = Vec::with_capacity(buf.samples.len() * 2);
+        for &s in &buf.samples {
+            stereo.push(s * gain_l);
+            stereo.push(s * gain_r);
+        }
+        buf.channels = 2;
+        buf.samples = stereo;
+        return;
+    }
+
+    let ch_count = buf.channels as usize;
+    let frames = buf.frame_count();
+    for f in 0..frames {
+        let base = f * ch_count;
+        buf.samples[base] *= gain_l;
+        buf.samples[base + 1] *= gain_r;
+    }
+}
+
 fn wsola_window_len(sample_rate: u32, in_frames: usize) -> usize {
     let nominal = ((sample_rate as f64) * 0.040).round() as usize;
     let rounded = (nominal / 4).max(4) * 4;
@@ -1301,5 +1584,137 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, MediaError::InvalidAudioFormat(_)));
         assert!(out.samples.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn soft_limiter_caps_peaks_smoothly_and_preserves_quiet_signal() {
+        let ceiling = 0.90f32;
+        let mut buf =
+            AudioBuffer::new(48_000, 1, vec![0.0, 0.25, -0.5, 0.9, 1.5, -3.0, 10.0]).unwrap();
+        apply_soft_limiter(&mut buf, ceiling);
+
+        // Quiet samples below the knee (0.75 * 0.9 = 0.675) are untouched.
+        assert_eq!(buf.samples[0], 0.0);
+        assert!((buf.samples[1] - 0.25).abs() < 1e-6);
+        assert!((buf.samples[2] + 0.5).abs() < 1e-6);
+
+        // All samples strictly bounded by ceiling, monotonically preserving hot peaks.
+        assert!(buf.samples.iter().all(|&s| s.abs() <= ceiling));
+        assert!(buf.samples[4] > buf.samples[3]);
+        assert!(buf.samples[6] > buf.samples[4]);
+        assert!(buf.samples[5] < -0.675 && buf.samples[5] >= -ceiling);
+    }
+
+    #[test]
+    fn biquad_lowpass_and_highpass_attenuate_expected_bands() {
+        let fs = 48_000u32;
+        let frames = 4800usize; // 100 ms
+        let mut low_sine = Vec::with_capacity(frames * 2);
+        let mut high_sine = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let t = i as f64 / fs as f64;
+            let lo = (2.0 * std::f64::consts::PI * 100.0 * t).sin() as f32;
+            let hi = (2.0 * std::f64::consts::PI * 6000.0 * t).sin() as f32;
+            low_sine.extend_from_slice(&[lo, lo]);
+            high_sine.extend_from_slice(&[hi, hi]);
+        }
+
+        let rms_steady = |b: &AudioBuffer| -> f32 {
+            let start = b.frame_count() / 2;
+            let slice = &b.samples[start * 2..];
+            (slice.iter().map(|&x| x * x).sum::<f32>() / slice.len() as f32).sqrt()
+        };
+
+        // Low-pass at 500 Hz passes 100 Hz and strongly attenuates 6 kHz.
+        let mut lp_lo = AudioBuffer::new(fs, 2, low_sine.clone()).unwrap();
+        let mut lp_hi = AudioBuffer::new(fs, 2, high_sine.clone()).unwrap();
+        let butterworth_q = std::f32::consts::FRAC_1_SQRT_2;
+        apply_biquad_filter(&mut lp_lo, BiquadFilterKind::LowPass, 500.0, butterworth_q);
+        apply_biquad_filter(&mut lp_hi, BiquadFilterKind::LowPass, 500.0, butterworth_q);
+        assert!(rms_steady(&lp_lo) > 0.65);
+        assert!(rms_steady(&lp_hi) < 0.02);
+
+        // High-pass at 1000 Hz passes 6 kHz and strongly attenuates 100 Hz.
+        let mut hp_lo = AudioBuffer::new(fs, 2, low_sine).unwrap();
+        let mut hp_hi = AudioBuffer::new(fs, 2, high_sine).unwrap();
+        apply_biquad_filter(&mut hp_lo, BiquadFilterKind::HighPass, 1000.0, butterworth_q);
+        apply_biquad_filter(&mut hp_hi, BiquadFilterKind::HighPass, 1000.0, butterworth_q);
+        assert!(rms_steady(&hp_lo) < 0.02);
+        assert!(rms_steady(&hp_hi) > 0.65);
+    }
+
+    #[test]
+    fn micro_silence_dips_target_window_without_touching_surroundings() {
+        let mut buf = AudioBuffer::new(48_000, 2, vec![1.0; 100 * 2]).unwrap();
+        apply_micro_silence(&mut buf, 20, 60, 10, 0.05);
+
+        // Samples outside [20, 60) remain untouched.
+        assert!(buf.samples[..20 * 2].iter().all(|&s| s == 1.0));
+        assert!(buf.samples[60 * 2..].iter().all(|&s| s == 1.0));
+
+        // Midpoint inside [30, 50) hits floor_gain.
+        assert!((buf.samples[40 * 2] - 0.05).abs() < 1e-6);
+        assert!((buf.samples[40 * 2 + 1] - 0.05).abs() < 1e-6);
+
+        // Entry ramp decreases monotonically; exit ramp increases monotonically.
+        assert!(buf.samples[20 * 2] > buf.samples[25 * 2]);
+        assert!(buf.samples[25 * 2] > buf.samples[30 * 2]);
+        assert!(buf.samples[50 * 2] < buf.samples[55 * 2]);
+        assert!(buf.samples[55 * 2] < buf.samples[59 * 2]);
+    }
+
+    #[test]
+    fn sidechain_ducking_attenuates_during_trigger_and_recovers_after() {
+        let fs = 48_000u32;
+        let frames = 24_000usize; // 500 ms
+        let mut target = AudioBuffer::new(fs, 2, vec![1.0; frames * 2]).unwrap();
+
+        // Trigger active in [4800, 12000) -> 100 ms .. 250 ms.
+        let mut trig_samples = vec![0.0f32; frames];
+        for (i, s) in trig_samples.iter_mut().enumerate() {
+            if (4_800..12_000).contains(&i) {
+                let t = i as f64 / fs as f64;
+                *s = (2.0 * std::f64::consts::PI * 200.0 * t).sin() as f32 * 0.9;
+            }
+        }
+        let trigger = AudioBuffer::new(fs, 1, trig_samples).unwrap();
+
+        apply_sidechain_ducking(&mut target, &trigger, 0.3, 0.2, 5.0, 40.0);
+
+        // Before trigger: untouched at 1.0.
+        assert!((target.samples[1_000 * 2] - 1.0).abs() < 1e-6);
+        // Well inside trigger (200 ms = frame 9600): ducked close to 0.2.
+        assert!(target.samples[9_600 * 2] < 0.25);
+        assert!(target.samples[9_600 * 2] >= 0.19);
+        // Well after release (480 ms = frame 23040): recovered near 1.0.
+        assert!(target.samples[23_040 * 2] > 0.95);
+    }
+
+    #[test]
+    fn stereo_pan_follows_equal_power_law_and_promotes_mono() {
+        let mut left = AudioBuffer::new(48_000, 2, vec![1.0, 1.0]).unwrap();
+        apply_stereo_pan(&mut left, -1.0);
+        assert!((left.samples[0] - 1.0).abs() < 1e-6);
+        assert!(left.samples[1].abs() < 1e-6);
+
+        let mut right = AudioBuffer::new(48_000, 2, vec![1.0, 1.0]).unwrap();
+        apply_stereo_pan(&mut right, 1.0);
+        assert!(right.samples[0].abs() < 1e-6);
+        assert!((right.samples[1] - 1.0).abs() < 1e-6);
+
+        let mut center = AudioBuffer::new(48_000, 2, vec![1.0, 1.0]).unwrap();
+        apply_stereo_pan(&mut center, 0.0);
+        let power = center.samples[0].powi(2) + center.samples[1].powi(2);
+        assert!((power - 1.0).abs() < 1e-5);
+        assert!((center.samples[0] - center.samples[1]).abs() < 1e-6);
+
+        // Mono buffer promotes cleanly to 2-channel stereo preserving total power.
+        let mut mono = AudioBuffer::new(48_000, 1, vec![0.8]).unwrap();
+        apply_stereo_pan(&mut mono, 0.35);
+        assert_eq!(mono.channels, 2);
+        assert_eq!(mono.frame_count(), 1);
+        let mono_power = mono.samples[0].powi(2) + mono.samples[1].powi(2);
+        assert!((mono_power - 0.8 * 0.8).abs() < 1e-5);
+        assert!(mono.samples[1] > mono.samples[0]);
     }
 }

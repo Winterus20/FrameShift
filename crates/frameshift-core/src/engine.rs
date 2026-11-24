@@ -10,12 +10,13 @@ use crate::report::{
     Phase5VerificationReport, SeekIndependenceCheckReport, VideoRenderSummary,
 };
 use crate::resolver::{
-    MediaResolver, ProjectFrameProvider, ResolvedAssetSource, slice_audio_buffer,
+    MediaResolver, ProjectFrameProvider, ResolvedAssetSource, resolve_audio_clip_bounds,
+    slice_audio_buffer,
 };
 use frameshift_media::{
     AlphaMode, AudioBuffer, DEFAULT_AUDIO_SAMPLE_RATE, DecoderPoolTelemetry, EncodeBackend,
-    FfmpegBridge, LruFrameCache, Mp4FrameEncoder, ProxyManager, ProxySpec, Rgba8Frame,
-    SyntheticMediaGenerator, VideoEncodingSettings, downscale_frame_nearest_or_box,
+    ExportEncodingProfile, FfmpegBridge, LruFrameCache, Mp4FrameEncoder, ProxyManager, ProxySpec,
+    Rgba8Frame, SyntheticMediaGenerator, VideoEncodingSettings, downscale_frame_nearest_or_box,
 };
 use frameshift_render::{
     AudioRmsEnvelope, GpuCompositor, OutputAlphaMode, RenderOptions, ShutterOverride,
@@ -38,6 +39,7 @@ const DEFAULT_CACHE_MAX_BYTES: usize = 1024 * 1024 * 1024;
 pub(crate) struct VideoRenderSettings<'a> {
     pub(crate) options: &'a RenderOptions,
     pub(crate) encoding: &'a VideoEncodingSettings,
+    pub(crate) encoding_profile: Option<&'a ExportEncodingProfile>,
     pub(crate) cancel: Option<&'a AtomicBool>,
 }
 
@@ -274,6 +276,35 @@ impl Engine {
             VideoRenderSettings {
                 options,
                 encoding: &VideoEncodingSettings::default(),
+                encoding_profile: None,
+                cancel: None,
+            },
+            on_progress,
+        )
+    }
+
+    /// Renders (optionally only `range`) using a full [`ExportEncodingProfile`]
+    /// (H.264 High, 10-bit HEVC, ProRes 422 HQ, platform delivery presets).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_video_with_profile(
+        &mut self,
+        project: &Project,
+        profile: RenderProfileKind,
+        out_path: &Path,
+        range: Option<RenderRange>,
+        options: &RenderOptions,
+        encoding_profile: &ExportEncodingProfile,
+        on_progress: &mut dyn FnMut(RenderProgress),
+    ) -> Result<VideoRenderSummary, CoreError> {
+        self.render_video_mp4_internal(
+            project,
+            profile,
+            out_path,
+            range,
+            VideoRenderSettings {
+                options,
+                encoding: &VideoEncodingSettings::default(),
+                encoding_profile: Some(encoding_profile),
                 cancel: None,
             },
             on_progress,
@@ -312,6 +343,7 @@ impl Engine {
         let VideoRenderSettings {
             options,
             encoding,
+            encoding_profile,
             cancel,
         } = settings;
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
@@ -368,15 +400,26 @@ impl Engine {
         // Stream one frame at a time into ffmpeg. The previous implementation
         // buffered every output frame in a Vec<Rgba8Frame>; at 1280x720/60 fps
         // for 32 s that alone was ~6.6 GiB (1920 frames x 3.5 MiB).
-        let mut encoder = Mp4FrameEncoder::new_with_settings(
-            profile_def.resolution.width,
-            profile_def.resolution.height,
-            audio.as_ref(),
-            project.timeline.fps,
-            out_path,
-            "libx264",
-            encoding,
-        )?;
+        let mut encoder = if let Some(enc_profile) = encoding_profile {
+            Mp4FrameEncoder::new_with_profile(
+                out_path,
+                profile_def.resolution.width,
+                profile_def.resolution.height,
+                project.timeline.fps,
+                audio.as_ref(),
+                enc_profile,
+            )?
+        } else {
+            Mp4FrameEncoder::new_with_settings(
+                profile_def.resolution.width,
+                profile_def.resolution.height,
+                audio.as_ref(),
+                project.timeline.fps,
+                out_path,
+                "libx264",
+                encoding,
+            )?
+        };
         let total = ticks.len();
         let mut hashes = Vec::with_capacity(total);
         on_progress(RenderProgress::frames(0, total));
@@ -854,11 +897,11 @@ impl Drop for PartialOutputGuard {
 
 /// True when at least one audio clip overlaps `[range.start_tick, range.end_tick)`.
 fn range_intersects_audio(project: &Project, range: &RenderRange) -> bool {
-    project
-        .timeline
-        .audio_clips
-        .iter()
-        .any(|clip| clip.timeline_start < range.end_tick && clip.timeline_end > range.start_tick)
+    project.timeline.audio_clips.iter().any(|clip| {
+        let (start, end) = resolve_audio_clip_bounds(project, clip)
+            .unwrap_or((clip.timeline_start, clip.timeline_end));
+        start < range.end_tick && end > range.start_tick
+    })
 }
 
 pub(crate) fn collect_timeline_frame_ticks(project: &Project) -> Result<Vec<Flicks>, CoreError> {
@@ -967,7 +1010,7 @@ fn verify_audio_impact_sync(
     })
 }
 
-fn audio_envelope_cache_key(project: &Project) -> String {
+pub(crate) fn audio_envelope_cache_key(project: &Project) -> String {
     use std::fmt::Write;
     let mut key = format!("dur={}", project.timeline.duration_ticks.0);
     for ac in &project.timeline.audio_clips {
@@ -975,16 +1018,51 @@ fn audio_envelope_cache_key(project: &Project) -> String {
             .asset(&ac.asset_id)
             .map(|a| a.path.as_str())
             .unwrap_or("");
+        let resolved_event_tick = ac
+            .anchor_event_id
+            .as_deref()
+            .and_then(|id| project.event(id))
+            .map(|ev| ev.target_output_tick.0);
         let _ = write!(
             key,
-            "|{}:{}:{}:{}:{}:{}:{}",
+            "|{}:{}:{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{}:{:?}:{:?}:{:?}",
             ac.id,
             ac.asset_id,
             asset_path,
             ac.timeline_start.0,
             ac.timeline_end.0,
             ac.source_start.0,
-            ac.gain_db.to_bits()
+            ac.gain_db.to_bits(),
+            ac.fade_in.map(|f| (f.duration_ticks.0, f.curve)),
+            ac.fade_out.map(|f| (f.duration_ticks.0, f.curve)),
+            ac.bus,
+            ac.pan.to_bits(),
+            ac.anchor_event_id,
+            resolved_event_tick,
+            ac.apex_offset_ticks.map(|t| t.0),
+        );
+    }
+    for rule in &project.timeline.ducking_rules {
+        let _ = write!(
+            key,
+            "|duck:{:?}:{:?}:{}:{}:{}:{}",
+            rule.trigger_bus,
+            rule.target_bus,
+            rule.threshold.to_bits(),
+            rule.duck_gain.to_bits(),
+            rule.attack_ms.to_bits(),
+            rule.release_ms.to_bits(),
+        );
+    }
+    for ms in &project.timeline.micro_silences {
+        let _ = write!(
+            key,
+            "|ms:{}:{}:{}:{}:{:?}",
+            ms.start_tick.0,
+            ms.end_tick.0,
+            ms.fade_ms.to_bits(),
+            ms.floor_gain.to_bits(),
+            ms.target_bus,
         );
     }
     key
@@ -1237,5 +1315,77 @@ mod tests {
         engine.clear_cache();
         assert_eq!(engine.decoder_telemetry().active_streams, 0);
         std::fs::remove_file(&mp4_path).expect("mp4 unlocked after clear_cache");
+    }
+
+    #[test]
+    fn audio_envelope_cache_key_invalidates_on_all_mix_and_anchor_fields() {
+        use frameshift_schema::{
+            AudioBus, AudioDuckingRuleDef, AudioFadeCurve, AudioFadeDef, MicroSilenceDef,
+        };
+
+        let base = Project::golden_scene_preset();
+        let base_key = audio_envelope_cache_key(&base);
+
+        // fade_in
+        let mut p = base.clone();
+        p.timeline.audio_clips[0].fade_in = Some(AudioFadeDef {
+            duration_ticks: Flicks(100),
+            curve: AudioFadeCurve::Linear,
+        });
+        assert_ne!(audio_envelope_cache_key(&p), base_key);
+
+        // fade_out
+        let mut p = base.clone();
+        p.timeline.audio_clips[0].fade_out = Some(AudioFadeDef {
+            duration_ticks: Flicks(100),
+            curve: AudioFadeCurve::EqualPower,
+        });
+        assert_ne!(audio_envelope_cache_key(&p), base_key);
+
+        // bus
+        let mut p = base.clone();
+        p.timeline.audio_clips[0].bus = AudioBus::SfxImpact;
+        assert_ne!(audio_envelope_cache_key(&p), base_key);
+
+        // pan
+        let mut p = base.clone();
+        p.timeline.audio_clips[0].pan = 0.25;
+        assert_ne!(audio_envelope_cache_key(&p), base_key);
+
+        // anchor_event_id & apex_offset_ticks & moving event target
+        let mut anchored = base.clone();
+        anchored.timeline.audio_clips[0].anchor_event_id = Some("drop_impact".into());
+        let k_anchor = audio_envelope_cache_key(&anchored);
+        assert_ne!(k_anchor, base_key);
+
+        let mut anchored_offset = anchored.clone();
+        anchored_offset.timeline.audio_clips[0].apex_offset_ticks = Some(Flicks(500));
+        assert_ne!(audio_envelope_cache_key(&anchored_offset), k_anchor);
+
+        let mut moved_event = anchored.clone();
+        moved_event.events[0].target_output_tick = Flicks(FLICKS_PER_SECOND);
+        assert_ne!(audio_envelope_cache_key(&moved_event), k_anchor);
+
+        // ducking_rules & micro_silences
+        let mut ducked = base.clone();
+        ducked.timeline.ducking_rules.push(AudioDuckingRuleDef {
+            trigger_bus: AudioBus::Dialogue,
+            target_bus: AudioBus::Music,
+            threshold: 0.1,
+            duck_gain: 0.3,
+            attack_ms: 10.0,
+            release_ms: 100.0,
+        });
+        assert_ne!(audio_envelope_cache_key(&ducked), base_key);
+
+        let mut silenced = base;
+        silenced.timeline.micro_silences.push(MicroSilenceDef {
+            start_tick: Flicks(0),
+            end_tick: Flicks(1000),
+            fade_ms: 4.0,
+            floor_gain: 0.0,
+            target_bus: None,
+        });
+        assert_ne!(audio_envelope_cache_key(&silenced), base_key);
     }
 }

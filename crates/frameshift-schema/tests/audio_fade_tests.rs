@@ -1,5 +1,7 @@
 use frameshift_schema::project::{AudioFadeCurve, AudioFadeDef};
-use frameshift_schema::{AudioClipDef, Project, SchemaError};
+use frameshift_schema::{
+    AudioBus, AudioClipDef, AudioDuckingRuleDef, MicroSilenceDef, Project, SchemaError,
+};
 use frameshift_time::{FLICKS_PER_SECOND, Flicks};
 use serde_json::Value;
 
@@ -215,4 +217,137 @@ fn audio_fade_fields_roundtrip_through_json() {
 
     let restored = Project::from_json_str(&json).expect("deserialize faded project");
     assert_eq!(restored, project);
+}
+
+#[test]
+fn audio_bus_pan_anchor_ducking_and_micro_silence_roundtrip_and_validate() {
+    let mut project = one_second_audio_project();
+    {
+        let ac = &mut project.timeline.audio_clips[0];
+        assert_eq!(ac.bus, AudioBus::Music);
+        assert_eq!(ac.pan, 0.0);
+        assert!(ac.anchor_event_id.is_none());
+        assert!(ac.apex_offset_ticks.is_none());
+    }
+
+    // Legacy AudioClipDef JSON without new fields still deserializes with defaults.
+    let legacy: AudioClipDef = serde_json::from_str(
+        r#"{
+            "id": "legacy_sfx",
+            "asset_id": "asset_bgm",
+            "timeline_start": 0,
+            "timeline_end": 705600000,
+            "source_start": 0
+        }"#,
+    )
+    .expect("legacy audio clip loads");
+    assert_eq!(legacy.bus, AudioBus::Music);
+    assert_eq!(legacy.pan, 0.0);
+    assert!(legacy.anchor_event_id.is_none());
+    assert!(legacy.apex_offset_ticks.is_none());
+
+    // Round-trip all AudioBus variants.
+    for (bus, expected) in [
+        (AudioBus::Music, "\"music\""),
+        (AudioBus::Dialogue, "\"dialogue\""),
+        (AudioBus::SfxImpact, "\"sfx_impact\""),
+        (AudioBus::SfxWhoosh, "\"sfx_whoosh\""),
+        (AudioBus::SfxRiser, "\"sfx_riser\""),
+        (AudioBus::SubBass, "\"sub_bass\""),
+    ] {
+        assert_eq!(serde_json::to_string(&bus).unwrap(), expected);
+        assert_eq!(serde_json::from_str::<AudioBus>(expected).unwrap(), bus);
+    }
+
+    // Populate SFX clip with bus, pan, anchor_event_id, apex_offset_ticks, ducking rule & micro silence.
+    project.timeline.audio_clips.push(AudioClipDef {
+        id: "whoosh_drop".into(),
+        asset_id: "asset_bgm".into(),
+        timeline_start: Flicks(FLICKS_PER_SECOND / 4),
+        timeline_end: Flicks(FLICKS_PER_SECOND),
+        source_start: Flicks::ZERO,
+        gain_db: -3.0,
+        fade_in: None,
+        fade_out: None,
+        bus: AudioBus::SfxWhoosh,
+        pan: -0.65,
+        anchor_event_id: Some("drop_impact".into()),
+        apex_offset_ticks: Some(Flicks(FLICKS_PER_SECOND / 2)),
+    });
+    project.timeline.ducking_rules.push(AudioDuckingRuleDef {
+        trigger_bus: AudioBus::Dialogue,
+        target_bus: AudioBus::Music,
+        threshold: 0.08,
+        duck_gain: 0.3,
+        attack_ms: 12.0,
+        release_ms: 180.0,
+    });
+    project.timeline.micro_silences.push(MicroSilenceDef {
+        start_tick: Flicks(FLICKS_PER_SECOND / 5),
+        end_tick: Flicks(FLICKS_PER_SECOND / 4),
+        fade_ms: 4.0,
+        floor_gain: 0.02,
+        target_bus: Some(AudioBus::Music),
+    });
+
+    project.validate().expect("audio buses/ducking/micro_silence validate");
+    let json = project.to_json_pretty().unwrap();
+    let restored = Project::from_json_str(&json).expect("round-trip succeeds");
+    assert_eq!(restored, project);
+
+    // Reject invalid pan (out of range / non-finite).
+    for bad_pan in [-1.01_f32, 1.01, f32::NAN, f32::INFINITY] {
+        let mut bad = project.clone();
+        bad.timeline.audio_clips[1].pan = bad_pan;
+        assert!(matches!(bad.validate(), Err(SchemaError::InvalidTimeline(_))));
+    }
+
+    // Reject missing anchor_event_id.
+    let mut bad_event = project.clone();
+    bad_event.timeline.audio_clips[1].anchor_event_id = Some("nonexistent_event".into());
+    assert!(matches!(
+        bad_event.validate(),
+        Err(SchemaError::MissingEvent(id)) if id == "nonexistent_event"
+    ));
+
+    // Reject invalid ducking rules.
+    let mut same_bus = project.clone();
+    same_bus.timeline.ducking_rules[0].target_bus = AudioBus::Dialogue;
+    assert!(matches!(same_bus.validate(), Err(SchemaError::InvalidTimeline(_))));
+
+    let mut bad_threshold = project.clone();
+    bad_threshold.timeline.ducking_rules[0].threshold = -0.1;
+    assert!(matches!(
+        bad_threshold.validate(),
+        Err(SchemaError::InvalidTimeline(_))
+    ));
+
+    let mut bad_duck_gain = project.clone();
+    bad_duck_gain.timeline.ducking_rules[0].duck_gain = 1.5;
+    assert!(matches!(
+        bad_duck_gain.validate(),
+        Err(SchemaError::InvalidTimeline(_))
+    ));
+
+    let mut bad_attack = project.clone();
+    bad_attack.timeline.ducking_rules[0].attack_ms = -1.0;
+    assert!(matches!(
+        bad_attack.validate(),
+        Err(SchemaError::InvalidTimeline(_))
+    ));
+
+    // Reject invalid micro silences.
+    let mut bad_ms_bounds = project.clone();
+    bad_ms_bounds.timeline.micro_silences[0].start_tick = Flicks(FLICKS_PER_SECOND / 2);
+    assert!(matches!(
+        bad_ms_bounds.validate(),
+        Err(SchemaError::InvalidTimeline(_))
+    ));
+
+    let mut bad_ms_floor = project;
+    bad_ms_floor.timeline.micro_silences[0].floor_gain = -0.05;
+    assert!(matches!(
+        bad_ms_floor.validate(),
+        Err(SchemaError::InvalidTimeline(_))
+    ));
 }

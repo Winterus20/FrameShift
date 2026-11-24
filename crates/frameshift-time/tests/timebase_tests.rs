@@ -1,9 +1,10 @@
 use frameshift_time::{
-    audio_samples_to_ticks, ticks_to_audio_samples_exact, ticks_to_audio_samples_floor,
-    ticks_to_audio_samples_nearest, Flicks, ImpactCurveStyle, ImpactSolveRequest, ImpactSolver,
-    PtsIndex, Rational32, SourceFitMode, SpeedCurve, SpeedKeyframe, TimeError, AUDIO_44_1_KHZ,
-    AUDIO_48_KHZ, AUDIO_96_KHZ, FLICKS_PER_SECOND, FPS_23_976, FPS_24, FPS_25, FPS_29_97, FPS_30,
-    FPS_59_94, FPS_60,
+    anime_snap_in, anime_snap_out, apply_time_quantize, audio_samples_to_ticks,
+    ticks_to_audio_samples_exact, ticks_to_audio_samples_floor, ticks_to_audio_samples_nearest,
+    twixtor_ramp, BezierSpeedKeyframe, Flicks, ImpactCurveStyle, ImpactSolveRequest, ImpactSolver,
+    KeyframeEase, PtsIndex, Rational32, SourceFitMode, SpeedCurve, SpeedCurveSpec, SpeedKeyframe,
+    TimeError, TimeQuantizeSpec, AUDIO_44_1_KHZ, AUDIO_48_KHZ, AUDIO_96_KHZ, FLICKS_PER_SECOND,
+    FPS_23_976, FPS_24, FPS_25, FPS_29_97, FPS_30, FPS_59_94, FPS_60,
 };
 
 struct SplitMix64(u64);
@@ -336,6 +337,460 @@ fn impact_solver_valid_and_impossible_constraints() {
             Err(violation) => {
                 assert!(!violation.failures.is_empty());
                 assert!(!violation.suggestions.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn cubic_bezier_value_newton_raphson_extrema_and_serde() {
+    let sec = FLICKS_PER_SECOND;
+
+    // 1. Symmetric ease: 0 -> 2s output maps 0 -> 4s source, zero speed at both ends
+    let ease = KeyframeEase {
+        speed: 0.0,
+        influence: 0.8,
+    };
+    let curve = SpeedCurve::cubic_bezier_value(vec![
+        BezierSpeedKeyframe::value(Flicks::ZERO, Flicks::ZERO).with_out_ease(ease),
+        BezierSpeedKeyframe::value(Flicks(2 * sec), Flicks(4 * sec)).with_in_ease(ease),
+    ])
+    .unwrap();
+
+    assert_eq!(curve.source_offset_at(Flicks::ZERO), Flicks::ZERO);
+    assert_eq!(curve.source_offset_at(Flicks(2 * sec)), Flicks(4 * sec));
+    // Symmetry -> midpoint hits exact half (2s source at 1s output)
+    assert!((curve.source_offset_at(Flicks(sec)).0 - 2 * sec).abs() <= 1);
+    assert!(curve.instant_speed_at(Flicks::ZERO).abs() < 1e-9);
+    assert!(curve.instant_speed_at(Flicks(2 * sec)).abs() < 1e-9);
+    assert!(curve.instant_speed_at(Flicks(sec)) > 2.0);
+
+    // Numerical finite-difference verification of instant_speed_derivative_at
+    let t_probe = Flicks(sec / 2);
+    let h = Flicks(1_000);
+    let fd_deriv = (curve.instant_speed_at(t_probe + h) - curve.instant_speed_at(t_probe - h))
+        / (2.0 * h.to_seconds_f64());
+    let analytical_deriv = curve.instant_speed_derivative_at(t_probe);
+    assert!(
+        (fd_deriv - analytical_deriv).abs() < 1e-3,
+        "fd={fd_deriv}, analytical={analytical_deriv}"
+    );
+
+    // 2. Extreme S-curve inflection (influence = 1.0 at both ends: dx/du == 0 at u=0.5)
+    let extreme = SpeedCurve::cubic_bezier_value(vec![
+        BezierSpeedKeyframe::value(Flicks::ZERO, Flicks::ZERO).with_out_ease(KeyframeEase {
+            speed: 0.0,
+            influence: 1.0,
+        }),
+        BezierSpeedKeyframe::value(Flicks(sec), Flicks(sec)).with_in_ease(KeyframeEase {
+            speed: 0.0,
+            influence: 1.0,
+        }),
+    ])
+    .unwrap();
+    assert!((extreme.source_offset_at(Flicks(sec / 2)).0 - sec / 2).abs() <= 2);
+    assert!(extreme.instant_speed_at(Flicks(sec / 2)).is_finite());
+    assert!(extreme.instant_speed_derivative_at(Flicks(sec / 2)).is_finite());
+
+    // 3. Zero-influence corner uses L'Hopital cleanly without NaN
+    let zero_inf = SpeedCurve::cubic_bezier_value(vec![
+        BezierSpeedKeyframe::value(Flicks::ZERO, Flicks::ZERO).with_out_ease(KeyframeEase {
+            speed: 1.0,
+            influence: 0.0,
+        }),
+        BezierSpeedKeyframe::value(Flicks(sec), Flicks(sec)).with_in_ease(KeyframeEase {
+            speed: 1.0,
+            influence: 0.0,
+        }),
+    ])
+    .unwrap();
+    assert!((zero_inf.source_offset_at(Flicks(sec / 2)).0 - sec / 2).abs() <= 1);
+    assert!((zero_inf.instant_speed_at(Flicks::ZERO) - 1.0).abs() < 1e-9);
+
+    // 4. Reverse dip + overshoot extrema detection
+    let overshoot = SpeedCurve::cubic_bezier_value(vec![
+        BezierSpeedKeyframe::value(Flicks::ZERO, Flicks::ZERO).with_out_ease(KeyframeEase {
+            speed: -2.0,
+            influence: 0.5,
+        }),
+        BezierSpeedKeyframe::value(Flicks(2 * sec), Flicks(sec)).with_in_ease(KeyframeEase {
+            speed: -2.0,
+            influence: 0.5,
+        }),
+    ])
+    .unwrap();
+    let (min_s, max_s) = overshoot.source_extrema(Flicks::ZERO, Flicks(2 * sec));
+    assert!(min_s < Flicks::ZERO, "expected negative minimum, got {min_s}");
+    assert!(max_s > Flicks(sec), "expected overshoot > 1s, got {max_s}");
+
+    // 5. Extrapolation outside keyframe span
+    let single_extrap = SpeedCurve::cubic_bezier_value(vec![
+        BezierSpeedKeyframe::value(Flicks(sec), Flicks(2 * sec))
+            .with_in_ease(KeyframeEase {
+                speed: 0.5,
+                influence: 0.333,
+            })
+            .with_out_ease(KeyframeEase {
+                speed: 2.0,
+                influence: 0.333,
+            }),
+    ])
+    .unwrap();
+    assert_eq!(single_extrap.source_offset_at(Flicks::ZERO), Flicks(3 * sec / 2));
+    assert_eq!(single_extrap.source_offset_at(Flicks(2 * sec)), Flicks(4 * sec));
+
+    // 6. Default & #[serde(default)] partial-map deserialization checks
+    assert_eq!(
+        KeyframeEase::default(),
+        KeyframeEase {
+            speed: 0.0,
+            influence: 0.333
+        }
+    );
+    let empty_ease: KeyframeEase = serde::Deserialize::deserialize(
+        serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(
+            std::iter::empty::<(&str, f64)>(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(empty_ease, KeyframeEase::default());
+
+    let partial_ease: KeyframeEase = serde::Deserialize::deserialize(
+        serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(
+            [("speed", 2.5_f64)].into_iter(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        partial_ease,
+        KeyframeEase {
+            speed: 2.5,
+            influence: 0.333
+        }
+    );
+
+    let partial_kf: BezierSpeedKeyframe = serde::Deserialize::deserialize(
+        serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(
+            [("speed", 1.75_f64)].into_iter(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(partial_kf.output_offset, Flicks::ZERO);
+    assert_eq!(partial_kf.speed, 1.75);
+    assert_eq!(partial_kf.source_offset, None);
+    assert_eq!(partial_kf.in_ease, None);
+    assert_eq!(partial_kf.out_ease, None);
+
+    // 7. Validation checks
+    assert!(SpeedCurve::cubic_bezier_value(vec![
+        BezierSpeedKeyframe::speed(Flicks::ZERO, 1.0),
+    ])
+    .is_err());
+    assert!(SpeedCurve::cubic_bezier_value(vec![
+        BezierSpeedKeyframe::value(Flicks::ZERO, Flicks::ZERO).with_out_ease(KeyframeEase {
+            speed: 0.0,
+            influence: 1.2,
+        }),
+        BezierSpeedKeyframe::value(Flicks(sec), Flicks(sec)),
+    ])
+    .is_err());
+}
+
+#[test]
+fn cubic_bezier_speed_broken_handles_and_64_subdivision_gl4_lut() {
+    let sec = FLICKS_PER_SECOND;
+
+    // 1. Broken handles at t = 1s (arriving flat from 0.5x, jumping down steeply toward 3.0x? Wait: slope jump!)
+    let curve = SpeedCurve::cubic_bezier_speed(vec![
+        BezierSpeedKeyframe::speed(Flicks::ZERO, 0.5).with_out_ease(KeyframeEase {
+            speed: 0.0,
+            influence: 0.8,
+        }),
+        BezierSpeedKeyframe::speed(Flicks(sec), 2.5)
+            .with_in_ease(KeyframeEase {
+                speed: 0.0,
+                influence: 0.2,
+            })
+            .with_out_ease(KeyframeEase {
+                speed: -4.0,
+                influence: 0.6,
+            }),
+        BezierSpeedKeyframe::speed(Flicks(2 * sec), 0.5).with_in_ease(KeyframeEase {
+            speed: 0.0,
+            influence: 0.7,
+        }),
+    ])
+    .unwrap();
+
+    // 2 segments * 64 subdivisions + start knot = 129 entries
+    assert_eq!(curve.lut().len(), 1 + 2 * 64);
+
+    // Broken handle: speed at 1s is 2.5, right-hand derivative is -4.0 (while incoming left slope was 0.0)
+    assert!((curve.instant_speed_at(Flicks(sec)) - 2.5).abs() < 1e-12);
+    assert!((curve.instant_speed_derivative_at(Flicks(sec)) - (-4.0)).abs() < 1e-6);
+
+    // Closed-form integral check on [0, 1s]:
+    // W(out=0.8, in=0.2) = 0.5 + 0.3 * (0.2 - 0.8) = 0.32
+    // avg_speed_01 = 0.5 + (2.5 - 0.5) * 0.32 = 1.14 -> 1.14s in ticks
+    let expected_at_1s = 1.14 * sec as f64;
+    assert!(
+        (curve.source_offset_f64(Flicks(sec)) - expected_at_1s).abs() < 1e-4,
+        "got {}, expected {expected_at_1s}",
+        curve.source_offset_f64(Flicks(sec))
+    );
+
+    // Extreme influence = 1.0 integration exactness (W = 0.5 + 0.3 * (0 - 1) = 0.2 -> avg = 1.0 + 3.0*0.2 = 1.6)
+    let extreme_speed = SpeedCurve::cubic_bezier_speed(vec![
+        BezierSpeedKeyframe::speed(Flicks::ZERO, 1.0).with_out_ease(KeyframeEase {
+            speed: 0.0,
+            influence: 1.0,
+        }),
+        BezierSpeedKeyframe::speed(Flicks(sec), 4.0).with_in_ease(KeyframeEase {
+            speed: 0.0,
+            influence: 0.0,
+        }),
+    ])
+    .unwrap();
+    assert!(
+        (extreme_speed.source_offset_f64(Flicks(sec)) - 1.6 * sec as f64).abs() < 1e-4,
+        "extreme integral mismatch: {}",
+        extreme_speed.source_offset_f64(Flicks(sec)) / sec as f64
+    );
+
+    // Anchoring when first keyframe starts at negative output_offset
+    let shifted = SpeedCurve::cubic_bezier_speed(vec![
+        BezierSpeedKeyframe::speed(Flicks(-sec), 1.0),
+        BezierSpeedKeyframe::speed(Flicks(sec), 3.0),
+    ])
+    .unwrap();
+    assert_eq!(shifted.source_offset_at(Flicks::ZERO), Flicks::ZERO);
+
+    // Check linear equivalence when ease handles are omitted
+    let linear_ramp = SpeedCurve::cubic_bezier_speed(vec![
+        BezierSpeedKeyframe::speed(Flicks::ZERO, 1.0),
+        BezierSpeedKeyframe::speed(Flicks(sec), 3.0),
+    ])
+    .unwrap();
+    assert!(matches!(linear_ramp.spec(), SpeedCurveSpec::CubicBezierSpeed { .. }));
+    assert!((linear_ramp.source_offset_f64(Flicks(sec)) - 2.0 * sec as f64).abs() < 1e-4);
+
+    // Reverse + forward source_extrema check on CubicBezierSpeed
+    let rev_fwd = SpeedCurve::cubic_bezier_speed(vec![
+        BezierSpeedKeyframe::speed(Flicks::ZERO, -2.0),
+        BezierSpeedKeyframe::speed(Flicks(sec), 2.0),
+    ])
+    .unwrap();
+    let (rev_min, rev_max) = rev_fwd.source_extrema(Flicks::ZERO, Flicks(sec));
+    assert!(rev_min < Flicks::ZERO, "expected dip below 0, got {rev_min}");
+    assert_eq!(rev_max, Flicks::ZERO);
+}
+
+#[test]
+fn time_quantize_posterize_and_stutter_determinism() {
+    let f24 = FPS_24.exact_frame_duration().unwrap().unwrap();
+
+    // None is identity
+    assert_eq!(
+        apply_time_quantize(Flicks(123_456), FPS_24, &TimeQuantizeSpec::None),
+        Flicks(123_456)
+    );
+
+    // Posterize 12 fps inside 24 fps project (on twos)
+    let p12 = TimeQuantizeSpec::PosterizeFps {
+        fps: Rational32::new(12, 1).unwrap(),
+    };
+    assert_eq!(apply_time_quantize(Flicks::ZERO, FPS_24, &p12), Flicks::ZERO);
+    assert_eq!(apply_time_quantize(f24, FPS_24, &p12), Flicks::ZERO);
+    assert_eq!(
+        apply_time_quantize(Flicks(2 * f24.0), FPS_24, &p12),
+        Flicks(2 * f24.0)
+    );
+    assert_eq!(
+        apply_time_quantize(Flicks(3 * f24.0), FPS_24, &p12),
+        Flicks(2 * f24.0)
+    );
+    // Negative ticks use Euclidean floor
+    assert_eq!(
+        apply_time_quantize(Flicks(-f24.0), FPS_24, &p12),
+        Flicks(-2 * f24.0)
+    );
+
+    // Idempotency even for non-exact rate (11 fps)
+    let p11 = TimeQuantizeSpec::PosterizeFps {
+        fps: Rational32::new(11, 1).unwrap(),
+    };
+    for i in -5..30 {
+        let t = Flicks(i * f24.0);
+        let q1 = apply_time_quantize(t, FPS_24, &p11);
+        let q2 = apply_time_quantize(q1, FPS_24, &p11);
+        assert_eq!(q1, q2, "PosterizeFps must be idempotent for frame {i}");
+    }
+
+    // StutterPattern: anime "on threes" (hold 3, step 3)
+    let on_threes = TimeQuantizeSpec::StutterPattern {
+        hold_frames: 3,
+        step_frames: 3,
+    };
+    let expected_threes = [0, 0, 0, 3, 3, 3, 6, 6, 6];
+    for (idx, &exp_frame) in expected_threes.iter().enumerate() {
+        let t = Flicks(idx as i64 * f24.0 + 100);
+        assert_eq!(
+            apply_time_quantize(t, FPS_24, &on_threes),
+            Flicks(exp_frame * f24.0)
+        );
+    }
+
+    // Asymmetric StutterPattern (hold 3, step 2)
+    let slow_stutter = TimeQuantizeSpec::StutterPattern {
+        hold_frames: 3,
+        step_frames: 2,
+    };
+    let expected_asym = [0, 0, 0, 2, 2, 2, 4, 4, 4];
+    for (idx, &exp_frame) in expected_asym.iter().enumerate() {
+        let t = Flicks(idx as i64 * f24.0);
+        assert_eq!(
+            apply_time_quantize(t, FPS_24, &slow_stutter),
+            Flicks(exp_frame * f24.0)
+        );
+    }
+
+    // Safe fallback on degenerate hold_frames = 0 or invalid rational
+    assert_eq!(
+        apply_time_quantize(
+            Flicks(42_000),
+            FPS_24,
+            &TimeQuantizeSpec::StutterPattern {
+                hold_frames: 0,
+                step_frames: 2
+            }
+        ),
+        Flicks(42_000)
+    );
+    assert_eq!(
+        apply_time_quantize(
+            Flicks(42_000),
+            FPS_24,
+            &TimeQuantizeSpec::PosterizeFps {
+                fps: Rational32 { num: 0, den: 1 }
+            }
+        ),
+        Flicks(42_000)
+    );
+
+    // Default & #[serde(default)] check for TimeQuantizeSpec::StutterPattern
+    assert_eq!(TimeQuantizeSpec::default(), TimeQuantizeSpec::None);
+    let default_stutter: TimeQuantizeSpec = serde::Deserialize::deserialize(
+        serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(
+            [("kind", "stutter_pattern")].into_iter(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        default_stutter,
+        TimeQuantizeSpec::StutterPattern {
+            hold_frames: 1,
+            step_frames: 1
+        }
+    );
+}
+
+#[test]
+fn impact_solver_anime_snap_presets_and_property_bounds() {
+    let sec = FLICKS_PER_SECOND;
+
+    // 1. Test all three preset helpers on standard alignment scenario
+    for style in [anime_snap_in(), anime_snap_out(), twixtor_ramp()] {
+        let req = ImpactSolveRequest {
+            source_bounds_start: Flicks::ZERO,
+            source_bounds_end: Flicks(4 * sec),
+            source_impact: Flicks(sec),
+            output_start: Flicks(10 * sec),
+            output_end: Flicks(14 * sec),
+            target_output: Flicks(12 * sec),
+            min_speed: 0.25,
+            max_speed: 3.0,
+            style,
+            fit_mode: SourceFitMode::ExactRange,
+        };
+
+        let sol = ImpactSolver::solve(&req).expect("AnimeSnap preset must solve feasible problem");
+        assert!((sol.achieved_source_at_target.0 - req.source_impact.0).abs() <= 1);
+        assert!(
+            (sol.speed_curve.source_offset_at(Flicks(4 * sec)).0 - 4 * sec).abs() <= 2,
+            "end integral drifted"
+        );
+
+        // Peak at impact must exceed pre-impact average and drop toward settle afterward
+        let v_start = sol.speed_curve.instant_speed_at(Flicks::ZERO);
+        let v_impact = sol.speed_curve.instant_speed_at(Flicks(2 * sec));
+        let v_end = sol.speed_curve.instant_speed_at(Flicks(4 * sec));
+        assert!(
+            v_impact > sol.pre_impact_avg_speed && v_impact > v_start && v_impact >= v_end,
+            "expected peak at impact: start={v_start}, impact={v_impact}, end={v_end}"
+        );
+    }
+
+    // 2. Reject invalid AnimeSnap parameters cleanly
+    let bad_bias = ImpactSolveRequest {
+        source_bounds_start: Flicks::ZERO,
+        source_bounds_end: Flicks(2 * sec),
+        source_impact: Flicks(sec),
+        output_start: Flicks::ZERO,
+        output_end: Flicks(2 * sec),
+        target_output: Flicks(sec),
+        min_speed: 0.25,
+        max_speed: 3.0,
+        style: ImpactCurveStyle::AnimeSnap {
+            peak_bias: 1.5,
+            influence: 0.8,
+        },
+        fit_mode: SourceFitMode::ExactRange,
+    };
+    assert!(ImpactSolver::solve(&bad_bias).is_err());
+
+    // 3. Property test across 500 seeded random problems for AnimeSnap presets
+    let styles = [anime_snap_in(), anime_snap_out(), twixtor_ramp()];
+    let mut rng = SplitMix64(0xABCD_1234_9876_5432);
+    for idx in 0..500 {
+        let src_len = rng.next_range_i64(1, 20) * (sec / 4);
+        let src_impact = rng.next_range_i64(0, (src_len / (sec / 4)).max(1)) * (sec / 4);
+        let src_impact = src_impact.min(src_len);
+        let out_len = rng.next_range_i64(1, 20) * (sec / 4);
+        let target_off = rng.next_range_i64(0, (out_len / (sec / 4)).max(1)) * (sec / 4);
+        let min_speed = 0.25 + rng.next_f64_unit() * 0.5;
+        let max_speed = min_speed + 0.5 + rng.next_f64_unit() * 3.0;
+        let style = styles[idx % styles.len()];
+
+        let req = ImpactSolveRequest {
+            source_bounds_start: Flicks::ZERO,
+            source_bounds_end: Flicks(src_len),
+            source_impact: Flicks(src_impact),
+            output_start: Flicks(sec),
+            output_end: Flicks(sec + out_len),
+            target_output: Flicks(sec + target_off),
+            min_speed,
+            max_speed,
+            style,
+            fit_mode: SourceFitMode::ExactRange,
+        };
+
+        if let Ok(sol) = ImpactSolver::solve(&req) {
+            assert!(
+                (sol.achieved_source_at_target.0 - req.source_impact.0).abs() <= 1,
+                "impact integral error exceeded 1 flick at iter {idx}"
+            );
+            let total_src = sol.effective_source_end.0 - sol.effective_source_start.0;
+            assert!(
+                (sol.speed_curve.source_offset_at(Flicks(out_len)).0 - total_src).abs() <= 3,
+                "end integral error exceeded 3 flicks at iter {idx}"
+            );
+            for sample in 0..=16 {
+                let t = Flicks((out_len as i128 * sample as i128 / 16) as i64);
+                let spd = sol.speed_curve.instant_speed_at(t);
+                assert!(
+                    spd >= min_speed - 1e-9 && spd <= max_speed + 1e-9,
+                    "speed {spd} out of [{min_speed}, {max_speed}] at sample {sample} iter {idx}"
+                );
             }
         }
     }

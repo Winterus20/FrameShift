@@ -36,13 +36,13 @@ pub use pool::{
 pub use provider::{FnFrameProvider, FrameProvider, SourceFrame, SourcePixelData};
 pub use uniforms::{
     AnimeImpactFrameUniform, AnimeSharpenUniform, BackdropScrimUniform, BlendUniform,
-    BloomPassUniform,
-    ColorBasicUniform, ColorSpaceMode, CustomWgslUniform, DitherMode, DofBokehUniform,
-    DofCocUniform, FilmHalationUniform, FilmOpticsUniform, FxaaUniform, GpuMeshVertex3D,
-    HalftoneGlowUniform, Lut3DUniform, MaskMatteUniform, MotionBlurPassMode, MotionBlurUniform,
-    MotionTileShakeUniform, OutputAlphaMode, ParticleField3DUniform, RadialShockwaveUniform,
-    RibbonTrail3DUniform, Text2DFxUniform, Text2DJfaUniform, Text3DUniform, TonemapMode,
-    Transform3DUniform, TransformUniform, WhipTransitionUniform,
+    BloomPassUniform, BlurMoCurvesUniform, ColorBasicUniform, ColorSpaceMode, CustomWgslUniform,
+    DitherMode, DofBokehUniform, DofCocUniform, FilmHalationUniform, FilmOpticsUniform,
+    FxaaUniform, GpuMeshVertex3D, HalftoneGlowUniform, Lut3DUniform, MaskMatteUniform,
+    MotionBlurPassMode, MotionBlurUniform, MotionTileShakeUniform, OutputAlphaMode,
+    ParticleField3DUniform, RadialShockwaveUniform, RibbonTrail3DUniform, Text2DFxUniform,
+    Text2DJfaUniform, Text3DUniform, TonemapMode, Transform3DUniform, TransformUniform,
+    WhipTransitionUniform,
 };
 pub use vector_text::rasterize_vector_text;
 pub use warp2d::{CornerPinUniform, GridWarpUniform, compute_corner_pin_inv_homography};

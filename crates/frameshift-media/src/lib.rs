@@ -1,7 +1,8 @@
 //! FrameShift media I/O, deterministic synthetic media generation,
 //! frame pixel/color-space buffers, audio mixing/retiming, LRU frame caching,
-//! scaled proxy management, and raw-pipe FFmpeg/FFprobe bridge.
+//! scaled proxy management, clip duplicate/cut analysis, and raw-pipe FFmpeg/FFprobe bridge.
 
+pub mod analysis;
 pub mod audio;
 pub mod cache;
 pub mod error;
@@ -11,14 +12,23 @@ pub mod proxy;
 pub mod streaming;
 pub mod synthetic;
 
+pub use analysis::{
+    ANALYSIS_HEIGHT, ANALYSIS_WIDTH, ClipAnalysis, ClipAnalysisReport, DuplicateRun,
+    InterpolatorBackend, analyze_frame_sequence, blend_frames, build_minterpolate_filter,
+    build_rife_pair_args,
+};
 pub use audio::{
-    AudioAnalysisReport, AudioBuffer, AudioPeakInfo, AudioRetimeMode, DEFAULT_AUDIO_SAMPLE_RATE,
+    AudioAnalysisReport, AudioBuffer, AudioPeakInfo, AudioRetimeMode, BiquadFilterKind,
+    DEFAULT_AUDIO_SAMPLE_RATE, apply_biquad_filter, apply_micro_silence, apply_sidechain_ducking,
+    apply_soft_limiter, apply_stereo_pan,
 };
 pub use cache::{AssetId, CacheTelemetry, FrameCacheKey, LruFrameCache};
 pub use error::MediaError;
 pub use ffmpeg::{
-    EncodeBackend, FfmpegBridge, FileContentIdentity, HwAccelCapability, HwAccelDetector,
-    MediaProbeInfo, Mp4FrameEncoder, SourceFit, VideoEncodingSettings,
+    AudioEncodingSettings, EncodeBackend, ExportEncodingProfile, ExportPostFilter, FfmpegBridge,
+    FileContentIdentity, HwAccelCapability, HwAccelDetector, MediaProbeInfo, Mp4FrameEncoder,
+    PixelFormat, RateControl, SourceFit, VideoCodec, VideoEncodingSettings,
+    build_ffmpeg_encode_args,
 };
 pub use frame::{
     AlphaMode, Rgba8Frame, Rgba16fFrame, fit_rgba8_frame, linear_to_srgb, srgb_to_linear,

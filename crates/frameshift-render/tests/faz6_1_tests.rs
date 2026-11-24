@@ -545,6 +545,8 @@ fn project_animator_updates_faz6_1_node_parameters() {
             },
             clips: vec![],
             audio_clips: vec![],
+            ducking_rules: vec![],
+            micro_silences: vec![],
         },
         events: vec![],
         graph: RenderGraphDef {

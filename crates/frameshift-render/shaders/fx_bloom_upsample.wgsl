@@ -21,7 +21,7 @@ struct BloomPassUniform {
     anamorphic_ratio: f32,
     chromatic_shift: f32,
     mip_norm: f32,
-    _pad: f32,
+    inv_sq_falloff: f32,
 }
 
 @group(0) @binding(0)
@@ -79,6 +79,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tent9 = (e * 4.0 + (b + d + f + h) * 2.0 + (a + c + g + i)) * (1.0 / 16.0);
     var upsampled = tent9;
 
+    let inv_sq_mix = clamp(params.inv_sq_falloff, 0.0, 1.0);
+    if (inv_sq_mix > 1e-6) {
+        // Inverse-square radial 3x3 weights: center r=0 -> 1.0, cardinals r=1 -> 0.5, corners r=sqrt(2) -> 1/3
+        let inv_sq_kernel = (e + (b + d + f + h) * 0.5 + (a + c + g + i) * (1.0 / 3.0)) * (3.0 / 13.0);
+        upsampled = mix(upsampled, inv_sq_kernel, inv_sq_mix);
+    }
+
     // Smooth extended horizontal streak kernel when anamorphic_ratio > 0.05
     if (anamorphic > 0.05) {
         let s2l = sample_bloom(uv + vec2<f32>(-2.0 * x, 0.0));
@@ -110,6 +117,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Exponential scatter falloff (Unity HDRP/URP energy-conserving lerp)
-    let scatter = clamp(params.scatter, 0.0, 0.98);
+    var scatter = clamp(params.scatter, 0.0, 0.98);
+    if (inv_sq_mix > 1e-6) {
+        let mip_d = clamp(params.mip_norm, 0.0, 1.0);
+        let inv_sq_mip = 1.0 / (1.0 + 3.0 * mip_d * mip_d);
+        let target_scatter = clamp(scatter * (0.55 + 0.85 * inv_sq_mip), 0.0, 0.98);
+        scatter = mix(scatter, target_scatter, inv_sq_mix);
+    }
     return vec4<f32>(mix(base_rgb, upsampled, scatter), base.a);
 }

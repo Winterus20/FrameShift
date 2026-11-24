@@ -1,10 +1,10 @@
 use frameshift_schema::{
     AssetDef, AssetKind, BlendMode, CURRENT_SCHEMA_VERSION, Camera3DDef, Camera3DMode, ColorSpace,
     CreativeDecisionRecord, CubicBezierSegmentDef, DisabledPassthrough, ExtendedColorSpace,
-    GraphNodeDef, HardCut, HwAccelPolicy, LutSourceDef, MAX_PRECOMP_DEPTH, NodeId, NodeKind,
-    ParamBindingDef, PreferenceEntry, PreferenceScope, Project, ProjectCommand, ProjectSession,
-    ProxyConfigDef, RenderGraphDef, SampleFilter, SchemaError, SchemaVersion, Shape3DKind,
-    SourceFit, TextAlign2D,
+    GraphNodeDef, HardCut, HwAccelPolicy, LutSourceDef, MAX_PRECOMP_DEPTH, MatteMode, NodeId,
+    NodeKind, ParamBindingDef, PreferenceEntry, PreferenceScope, Project, ProjectCommand,
+    ProjectSession, ProxyConfigDef, RenderGraphDef, SampleFilter, SchemaError, SchemaVersion,
+    Shape3DKind, SourceFit, TextAlign2D, TextAnimatorDef, TextRangeShape, TextSelectorUnit,
 };
 use frameshift_time::{FLICKS_PER_SECOND, Flicks, ImpactCurveStyle, SourceFitMode, SpeedCurve};
 
@@ -96,10 +96,13 @@ fn shared_alpha_matte_project(
         GraphNodeDef {
             id: mask_id.clone(),
             kind: NodeKind::MaskMatte {
-                mode: frameshift_schema::MatteMode::Alpha,
+                mode: MatteMode::Alpha,
                 invert: false,
                 feather: 0.0,
                 opaque_black_outside: false,
+                opacity: 1.0,
+                choke_px: 0.0,
+                spatial_feather_px: 0.0,
             },
             inputs: vec![source_id, matte_id],
             enabled: true,
@@ -1689,7 +1692,7 @@ fn phase_6_2_3d_nodes_defaults_arity_and_validation() {
     ));
 
     assert!(matches!(
-        parsed[1].kind,
+        &parsed[1].kind,
         NodeKind::Transform3D {
             pos,
             rot_deg,
@@ -1699,14 +1702,18 @@ fn phase_6_2_3d_nodes_defaults_arity_and_validation() {
             camera_rot_deg,
             dof_focal_dist,
             dof_blur_strength,
-        } if pos == [0.0, 0.0, 0.0]
-            && rot_deg == [0.0, 0.0, 0.0]
-            && scale == [1.0, 1.0, 1.0]
-            && (fov_deg - 50.0).abs() < 1e-6
-            && camera_pos == [0.0, 0.0, 2.5]
-            && camera_rot_deg == [0.0, 0.0, 0.0]
-            && (dof_focal_dist - 2.5).abs() < 1e-6
+            mirror_edges: false,
+            parent: None,
+            pivot,
+        } if *pos == [0.0, 0.0, 0.0]
+            && *rot_deg == [0.0, 0.0, 0.0]
+            && *scale == [1.0, 1.0, 1.0]
+            && (*fov_deg - 50.0).abs() < 1e-6
+            && *camera_pos == [0.0, 0.0, 2.5]
+            && *camera_rot_deg == [0.0, 0.0, 0.0]
+            && (*dof_focal_dist - 2.5).abs() < 1e-6
             && dof_blur_strength.abs() < 1e-6
+            && *pivot == [0.0, 0.0, 0.0]
     ));
 
     assert!(matches!(
@@ -2522,6 +2529,9 @@ fn wave1_all_serde_names_match_serialized_node_kind_tags() {
             invert: false,
             feather: 0.0,
             opaque_black_outside: false,
+            opacity: 1.0,
+            choke_px: 0.0,
+            spatial_feather_px: 0.0,
         },
         NodeKind::Blend {
             mode: BlendMode::Normal,
@@ -2634,6 +2644,15 @@ fn wave1_all_serde_names_match_serialized_node_kind_tags() {
             opacity: 1.0,
         },
         NodeKind::PrecompInput { slot: 0 },
+        NodeKind::AdjustmentLayer {
+            start_tick: Flicks::ZERO,
+            end_tick: Flicks(FLICKS_PER_SECOND),
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+        },
+        serde_json::from_str(r#"{"type":"blur_mo_curves"}"#).unwrap(),
+        serde_json::from_str(r#"{"type":"null3_d"}"#).unwrap(),
+        serde_json::from_str(r#"{"type":"depth_matte"}"#).unwrap(),
     ];
 
     let serialized_tags: Vec<String> = variants
@@ -3144,4 +3163,530 @@ fn wave1_source_image_hud_warp_precomp_roundtrip_bindings_and_errors() {
         bad_hud.validate_graph(),
         Err(SchemaError::InvalidVectorPathHud { .. })
     ));
+}
+
+#[test]
+fn anime_workflow_nodes_null3d_rig_matte_and_text_animator_v2_roundtrip_and_validate() {
+    // 1. MatteMode::Red + MaskMatte opacity/choke_px/spatial_feather_px defaults and roundtrip
+    let matte: NodeKind = serde_json::from_str(r#"{"type":"mask_matte","mode":"red"}"#)
+        .expect("mask_matte red mode deserializes");
+    assert!(matches!(
+        matte,
+        NodeKind::MaskMatte {
+            mode: MatteMode::Red,
+            opacity,
+            choke_px,
+            spatial_feather_px,
+            ..
+        } if (opacity - 1.0).abs() < 1e-6 && choke_px == 0.0 && spatial_feather_px == 0.0
+    ));
+
+    // 2. Transform3D mirror_edges, parent, pivot & Null3D alias + parenting rig in Scene3D
+    let xform_alias: NodeKind = serde_json::from_str(
+        r#"{"type":"transform_3d","mirror_edges":true,"parent":"cam_null","pivot":[0.1,-0.2,0.3]}"#,
+    )
+    .expect("transform_3d new fields deserialize");
+    assert!(matches!(
+        &xform_alias,
+        NodeKind::Transform3D {
+            mirror_edges: true,
+            parent: Some(p),
+            pivot,
+            ..
+        } if p == &NodeId::from("cam_null") && *pivot == [0.1, -0.2, 0.3]
+    ));
+
+    let null_alias: NodeKind =
+        serde_json::from_str(r#"{"type":"null_3d"}"#).expect("null_3d alias deserializes");
+    assert!(matches!(
+        &null_alias,
+        NodeKind::Null3D {
+            pos,
+            rot_deg,
+            scale,
+            pivot,
+            parent: None,
+        } if *pos == [0.0; 3] && *rot_deg == [0.0; 3] && *scale == [1.0; 3] && *pivot == [0.0; 3]
+    ));
+    assert!(null_alias.is_scene3d_child());
+    assert_eq!(null_alias.expected_input_count(), 0);
+
+    // 3. TextRangeShape & TextAnimatorDef v2 defaults & roundtrip
+    for (shape, expected) in [
+        (TextRangeShape::Square, "\"square\""),
+        (TextRangeShape::RampUp, "\"ramp_up\""),
+        (TextRangeShape::RampDown, "\"ramp_down\""),
+        (TextRangeShape::Triangle, "\"triangle\""),
+        (TextRangeShape::Smooth, "\"smooth\""),
+    ] {
+        assert_eq!(serde_json::to_string(&shape).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_str::<TextRangeShape>(expected).unwrap(),
+            shape
+        );
+    }
+
+    let legacy_anim: TextAnimatorDef =
+        serde_json::from_str(r#"{"unit":"word","range_start":0}"#).expect("legacy animator");
+    assert_eq!(legacy_anim.shape, TextRangeShape::Square);
+    assert_eq!(legacy_anim.rotation_deg_from, 0.0);
+    assert_eq!(legacy_anim.tracking_em_from, 0.0);
+    assert_eq!(legacy_anim.ease_high, 0.0);
+    assert_eq!(legacy_anim.ease_low, 0.0);
+    assert!(legacy_anim.randomize_seed.is_none());
+
+    let mut project = Project::golden_scene_preset();
+    project.timeline.clips[0].event_animations.clear();
+    project.param_bindings.clear();
+    project.graph = RenderGraphDef {
+        output_node: NodeId::from("depth_matte_out"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("bg"),
+                kind: NodeKind::Solid {
+                    color_rgba: [0.1, 0.2, 0.3, 1.0],
+                    color_space: ColorSpace::LinearRec709,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("title"),
+                kind: NodeKind::VectorText {
+                    text: "KINETIC".into(),
+                    font_size_norm: 0.08,
+                    color_rgba: [1.0; 4],
+                    outline_rgba: [0.0; 4],
+                    outline_width_norm: 0.0,
+                    align_center: true,
+                    y_offset_norm: 0.5,
+                    font_family: Some("Impact".into()),
+                    font_path: None,
+                    font_weight: 400,
+                    align: None,
+                    x_offset_norm: None,
+                    tracking_em: None,
+                    line_height_em: None,
+                    opacity: 1.0,
+                    fallback_fonts: vec![],
+                    writing_mode: Default::default(),
+                    var_wght: None,
+                    var_wdth: None,
+                    var_slnt: None,
+                    color_bottom_rgba: None,
+                    gradient_angle_deg: 0.0,
+                    outer_outline_rgba: [0.0; 4],
+                    outer_outline_width_norm: 0.0,
+                    outline_gap_norm: 0.0,
+                    shadow_offset_norm: [0.0; 2],
+                    shadow_blur_norm: 0.0,
+                    shadow_rgba: [0.0; 4],
+                    glow_radius_norm: 0.0,
+                    glow_rgba: [0.0; 4],
+                    hdr_intensity: 1.0,
+                    gpu_slug: true,
+                    text_animator: Some(TextAnimatorDef {
+                        unit: TextSelectorUnit::Grapheme,
+                        range_start: 0,
+                        range_end: Some(7),
+                        start_tick: 0,
+                        duration_ticks: FLICKS_PER_SECOND / 2,
+                        delay_ticks: FLICKS_PER_SECOND / 30,
+                        position_from_norm: [0.0, 0.1],
+                        scale_from: 1.2,
+                        opacity_from: 0.0,
+                        rotation_deg_from: -18.0,
+                        tracking_em_from: 0.35,
+                        shape: TextRangeShape::Triangle,
+                        ease_high: 75.0,
+                        ease_low: 25.0,
+                        randomize_seed: Some(42),
+                    }),
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("cam_null"),
+                kind: NodeKind::Null3D {
+                    pos: [0.0, 0.1, 0.0],
+                    rot_deg: [0.0, 5.0, 0.0],
+                    scale: [1.0, 1.0, 1.0],
+                    pivot: [0.0, 0.0, 0.0],
+                    parent: None,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("layer_xform"),
+                kind: xform_alias,
+                inputs: vec![NodeId::from("bg")],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("scene"),
+                kind: NodeKind::Scene3D {
+                    camera: Camera3DDef::default(),
+                    background_rgba: [0.0; 4],
+                },
+                inputs: vec![NodeId::from("cam_null"), NodeId::from("layer_xform")],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("adj"),
+                kind: NodeKind::AdjustmentLayer {
+                    start_tick: Flicks::ZERO,
+                    end_tick: Flicks(FLICKS_PER_SECOND * 2),
+                    opacity: 0.85,
+                    blend_mode: BlendMode::Screen,
+                },
+                inputs: vec![NodeId::from("scene")],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("moblur"),
+                kind: NodeKind::BlurMoCurves {
+                    shift_x: 0.04,
+                    shift_y: -0.02,
+                    z_dist: -0.15,
+                    rotate_deg: 3.0,
+                    blur_strength: 1.0,
+                    samples: 16,
+                    wrap_mode: 2,
+                },
+                inputs: vec![NodeId::from("adj")],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("depth_map"),
+                kind: NodeKind::Solid {
+                    color_rgba: [0.4, 0.4, 0.4, 1.0],
+                    color_space: ColorSpace::LinearRec709,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("red_matte"),
+                kind: NodeKind::MaskMatte {
+                    mode: MatteMode::Red,
+                    invert: false,
+                    feather: 0.05,
+                    opaque_black_outside: false,
+                    opacity: 0.9,
+                    choke_px: -2.0,
+                    spatial_feather_px: 4.0,
+                },
+                inputs: vec![NodeId::from("moblur"), NodeId::from("title")],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("depth_matte_out"),
+                kind: NodeKind::DepthMatte {
+                    near_depth: 0.1,
+                    far_depth: 0.8,
+                    feather: 0.05,
+                    invert: false,
+                },
+                inputs: vec![NodeId::from("red_matte"), NodeId::from("depth_map")],
+                enabled: true,
+            },
+        ],
+    };
+
+    for (node, param) in [
+        ("cam_null", "pos_x"),
+        ("cam_null", "pivot_y"),
+        ("layer_xform", "pivot_z"),
+        ("adj", "opacity"),
+        ("moblur", "shift_x"),
+        ("moblur", "z_dist"),
+        ("moblur", "rotate_deg"),
+        ("moblur", "blur_strength"),
+        ("red_matte", "opacity"),
+        ("red_matte", "choke_px"),
+        ("red_matte", "spatial_feather_px"),
+        ("depth_matte_out", "near_depth"),
+        ("depth_matte_out", "far_depth"),
+        ("depth_matte_out", "feather"),
+    ] {
+        project.param_bindings.push(ParamBindingDef {
+            node_id: NodeId::from(node),
+            param_name: param.into(),
+            expression: "0.5".into(),
+        });
+    }
+
+    let topo = project.validate().expect("new workflow graph validates");
+    let null_pos = topo.iter().position(|id| id == &NodeId::from("cam_null")).unwrap();
+    let xform_pos = topo.iter().position(|id| id == &NodeId::from("layer_xform")).unwrap();
+    assert!(null_pos < xform_pos, "parent Null3D must precede child Transform3D");
+
+    let json = project.to_json_pretty().unwrap();
+    let restored = Project::from_json_str(&json).expect("roundtrip validates");
+    assert_eq!(restored, project);
+
+    // Validation rejections:
+    // AdjustmentLayer start >= end
+    let bad_adj = RenderGraphDef {
+        output_node: NodeId::from("adj"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("s"),
+                kind: NodeKind::Solid {
+                    color_rgba: [1.0; 4],
+                    color_space: ColorSpace::LinearRec709,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("adj"),
+                kind: NodeKind::AdjustmentLayer {
+                    start_tick: Flicks(100),
+                    end_tick: Flicks(100),
+                    opacity: 1.0,
+                    blend_mode: BlendMode::Normal,
+                },
+                inputs: vec![NodeId::from("s")],
+                enabled: true,
+            },
+        ],
+    };
+    assert!(matches!(
+        bad_adj.validate_graph(),
+        Err(SchemaError::InvalidAdjustmentLayer { .. })
+    ));
+
+    // BlurMoCurves invalid samples (0 or 33) and wrap_mode (3)
+    for bad_json in [
+        r#"{"type":"blur_mo_curves","samples":0}"#,
+        r#"{"type":"blur_mo_curves","samples":33}"#,
+        r#"{"type":"blur_mo_curves","wrap_mode":3}"#,
+    ] {
+        let g = RenderGraphDef {
+            output_node: NodeId::from("b"),
+            nodes: vec![
+                GraphNodeDef {
+                    id: NodeId::from("s"),
+                    kind: NodeKind::Solid {
+                        color_rgba: [1.0; 4],
+                        color_space: ColorSpace::LinearRec709,
+                    },
+                    inputs: vec![],
+                    enabled: true,
+                },
+                GraphNodeDef {
+                    id: NodeId::from("b"),
+                    kind: serde_json::from_str(bad_json).unwrap(),
+                    inputs: vec![NodeId::from("s")],
+                    enabled: true,
+                },
+            ],
+        };
+        assert!(matches!(
+            g.validate_graph(),
+            Err(SchemaError::InvalidBlurMoCurves { .. })
+        ));
+    }
+
+    // Null3D parent cycle detection & missing parent
+    let cyclic_nulls = RenderGraphDef {
+        output_node: NodeId::from("n1"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("n1"),
+                kind: NodeKind::Null3D {
+                    pos: [0.0; 3],
+                    rot_deg: [0.0; 3],
+                    scale: [1.0; 3],
+                    pivot: [0.0; 3],
+                    parent: Some(NodeId::from("n2")),
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("n2"),
+                kind: NodeKind::Null3D {
+                    pos: [0.0; 3],
+                    rot_deg: [0.0; 3],
+                    scale: [1.0; 3],
+                    pivot: [0.0; 3],
+                    parent: Some(NodeId::from("n1")),
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+        ],
+    };
+    assert!(matches!(
+        cyclic_nulls.validate_graph(),
+        Err(SchemaError::CycleDetected { .. })
+    ));
+
+    // DepthMatte invalid range (far_depth < near_depth) and arity
+    let bad_depth = RenderGraphDef {
+        output_node: NodeId::from("dm"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("a"),
+                kind: NodeKind::Solid {
+                    color_rgba: [1.0; 4],
+                    color_space: ColorSpace::LinearRec709,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("b"),
+                kind: NodeKind::Solid {
+                    color_rgba: [0.5; 4],
+                    color_space: ColorSpace::LinearRec709,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("dm"),
+                kind: NodeKind::DepthMatte {
+                    near_depth: 0.8,
+                    far_depth: 0.2,
+                    feather: 0.0,
+                    invert: false,
+                },
+                inputs: vec![NodeId::from("a"), NodeId::from("b")],
+                enabled: true,
+            },
+        ],
+    };
+    assert!(matches!(
+        bad_depth.validate_graph(),
+        Err(SchemaError::InvalidDepthMatte { .. })
+    ));
+
+    // MaskMatte invalid opacity
+    let bad_matte = RenderGraphDef {
+        output_node: NodeId::from("mm"),
+        nodes: vec![
+            GraphNodeDef {
+                id: NodeId::from("a"),
+                kind: NodeKind::Solid {
+                    color_rgba: [1.0; 4],
+                    color_space: ColorSpace::LinearRec709,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("b"),
+                kind: NodeKind::Solid {
+                    color_rgba: [1.0; 4],
+                    color_space: ColorSpace::LinearRec709,
+                },
+                inputs: vec![],
+                enabled: true,
+            },
+            GraphNodeDef {
+                id: NodeId::from("mm"),
+                kind: NodeKind::MaskMatte {
+                    mode: MatteMode::Red,
+                    invert: false,
+                    feather: 0.0,
+                    opaque_black_outside: false,
+                    opacity: 1.5,
+                    choke_px: 0.0,
+                    spatial_feather_px: 0.0,
+                },
+                inputs: vec![NodeId::from("a"), NodeId::from("b")],
+                enabled: true,
+            },
+        ],
+    };
+    assert!(matches!(
+        bad_matte.validate_graph(),
+        Err(SchemaError::InvalidMaskMatte { .. })
+    ));
+}
+
+#[test]
+fn trim_and_split_shift_cubic_bezier_value_and_speed_curves() {
+    use frameshift_time::{BezierSpeedKeyframe, KeyframeEase};
+
+    let sec = FLICKS_PER_SECOND;
+    let mut project = Project::golden_scene_preset();
+
+    // CubicBezierValue clip
+    project.timeline.clips[0].speed_curve = SpeedCurve::cubic_bezier_value(vec![
+        BezierSpeedKeyframe::value(Flicks::ZERO, Flicks::ZERO)
+            .with_out_ease(KeyframeEase {
+                speed: 1.5,
+                influence: 0.4,
+            }),
+        BezierSpeedKeyframe::value(Flicks(2 * sec), Flicks(3 * sec))
+            .with_in_ease(KeyframeEase {
+                speed: 1.0,
+                influence: 0.4,
+            }),
+    ])
+    .unwrap();
+
+    // CubicBezierSpeed clip
+    project.timeline.clips[1].speed_curve = SpeedCurve::cubic_bezier_speed(vec![
+        BezierSpeedKeyframe::speed(Flicks::ZERO, 0.5).with_out_ease(KeyframeEase {
+            speed: 0.5,
+            influence: 0.35,
+        }),
+        BezierSpeedKeyframe::speed(Flicks(2 * sec), 2.0).with_in_ease(KeyframeEase {
+            speed: 0.0,
+            influence: 0.35,
+        }),
+    ])
+    .unwrap();
+
+    let orig_a_src_at_15 = project.clip("clip_a").unwrap().source_start
+        + project
+            .clip("clip_a")
+            .unwrap()
+            .speed_curve
+            .source_offset_at(Flicks(sec + sec / 2));
+
+    let mut session = ProjectSession::new(project).expect("valid bezier curves");
+    let rev = session
+        .apply_command(
+            1,
+            ProjectCommand::TrimClip {
+                clip_id: "clip_a".into(),
+                new_timeline_start: Some(Flicks(sec / 2)),
+                new_timeline_end: None,
+            },
+        )
+        .expect("trim CubicBezierValue succeeds");
+    let trimmed_a = session.project().clip("clip_a").unwrap();
+    assert_eq!(trimmed_a.timeline_start, Flicks(sec / 2));
+    // At offset 1s into trimmed clip (= 1.5s original), source time at endpoint (2s - 0.5s = 1.5s) matches original 2s endpoint.
+    let orig_a_end_expected = orig_a_src_at_15;
+    assert!(orig_a_end_expected > Flicks::ZERO);
+    assert_eq!(
+        trimmed_a.source_start
+            + trimmed_a
+                .speed_curve
+                .source_offset_at(Flicks(sec + sec / 2)),
+        Flicks(3 * sec)
+    );
+
+    session
+        .apply_command(
+            rev,
+            ProjectCommand::SplitClip {
+                clip_id: "clip_b".into(),
+                split_tick: Flicks(3 * sec),
+                right_clip_id: "clip_b_right".into(),
+            },
+        )
+        .expect("split CubicBezierSpeed succeeds");
+    let right_b = session.project().clip("clip_b_right").unwrap();
+    assert_eq!(right_b.timeline_start, Flicks(3 * sec));
+    assert_eq!(right_b.speed_curve.instant_speed_at(Flicks(sec)), 2.0);
 }

@@ -218,6 +218,7 @@ fn shaped_text_animator_selects_grapheme_range_and_staggers_in_ticks() {
                     position_from_norm: [0.0; 2],
                     scale_from: 1.0,
                     opacity_from: 0.0,
+                    ..Default::default()
                 }),
             },
             inputs: vec![],
@@ -273,6 +274,7 @@ fn shaped_text_animator_selects_grapheme_range_and_staggers_in_ticks() {
         position_from_norm: [0.0; 2],
         scale_from: 1.0,
         opacity_from: 0.0,
+        ..Default::default()
     });
     let mut render_word_at = |tick| {
         compositor
@@ -400,6 +402,8 @@ fn wgsl_slug_supports_tategaki_japanese_and_animated_variable_font() {
             },
             clips: vec![],
             audio_clips: vec![],
+            ducking_rules: vec![],
+            micro_silences: vec![],
         },
         events: vec![],
         graph: RenderGraphDef {

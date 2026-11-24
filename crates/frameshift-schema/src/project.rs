@@ -150,6 +150,19 @@ impl AudioFadeDef {
     }
 }
 
+/// Logical audio mix bus for routing, ducking, and micro-silence gating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioBus {
+    #[default]
+    Music,
+    Dialogue,
+    SfxImpact,
+    SfxWhoosh,
+    SfxRiser,
+    SubBass,
+}
+
 /// Timeline audio clip (e.g., music track or SFX).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioClipDef {
@@ -166,6 +179,66 @@ pub struct AudioClipDef {
     /// Optional fade-out multiplier ramp at the clip tail (`1 -> 0`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fade_out: Option<AudioFadeDef>,
+    /// Logical audio mix bus assigned to this clip.
+    #[serde(default)]
+    pub bus: AudioBus,
+    /// Constant-power stereo pan position in `[-1.0, 1.0]` (`0.0` = center).
+    #[serde(default)]
+    pub pan: f32,
+    /// Optional semantic event ID anchoring this SFX/audio clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_event_id: Option<String>,
+    /// Optional signed Flicks offset from clip start to the clip's sonic apex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apex_offset_ticks: Option<Flicks>,
+}
+
+fn default_duck_threshold() -> f32 {
+    0.05
+}
+
+fn default_duck_gain() -> f32 {
+    0.25
+}
+
+fn default_duck_attack_ms() -> f32 {
+    10.0
+}
+
+fn default_duck_release_ms() -> f32 {
+    150.0
+}
+
+/// Sidechain ducking rule attenuating `target_bus` whenever `trigger_bus` exceeds `threshold`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AudioDuckingRuleDef {
+    pub trigger_bus: AudioBus,
+    pub target_bus: AudioBus,
+    #[serde(default = "default_duck_threshold")]
+    pub threshold: f32,
+    #[serde(default = "default_duck_gain")]
+    pub duck_gain: f32,
+    #[serde(default = "default_duck_attack_ms")]
+    pub attack_ms: f32,
+    #[serde(default = "default_duck_release_ms")]
+    pub release_ms: f32,
+}
+
+fn default_micro_silence_fade_ms() -> f32 {
+    5.0
+}
+
+/// Short pre-drop gain dip window applied across the mix or a single `target_bus`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MicroSilenceDef {
+    pub start_tick: Flicks,
+    pub end_tick: Flicks,
+    #[serde(default = "default_micro_silence_fade_ms")]
+    pub fade_ms: f32,
+    #[serde(default)]
+    pub floor_gain: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_bus: Option<AudioBus>,
 }
 
 /// Timeline definition containing fps, duration, resolution, and clips.
@@ -178,6 +251,10 @@ pub struct TimelineDef {
     pub clips: Vec<ClipDef>,
     #[serde(default)]
     pub audio_clips: Vec<AudioClipDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ducking_rules: Vec<AudioDuckingRuleDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub micro_silences: Vec<MicroSilenceDef>,
 }
 
 /// Distinguishes human-marked anchors from algorithmically detected markers (ADR-0003).
@@ -251,7 +328,7 @@ pub struct ParamBindingDef {
 /// A binding whose name is absent here is not applied, so the node keeps its
 /// authored base value. `center_u` / `center_uv_x` (and the `v` / `y` pair) are
 /// both accepted because both spellings write the same channel.
-fn bindable_param_names(kind: &NodeKind) -> &'static [&'static str] {
+pub(crate) fn bindable_param_names(kind: &NodeKind) -> &'static [&'static str] {
     match kind {
         NodeKind::Transform2D { .. } => &[
             "translate_x",
@@ -263,8 +340,16 @@ fn bindable_param_names(kind: &NodeKind) -> &'static [&'static str] {
             "anchor_x",
             "anchor_y",
         ],
-        NodeKind::MaskMatte { .. } => &["feather"],
-        NodeKind::Blend { .. } => &["opacity"],
+        NodeKind::MaskMatte { .. } => &["feather", "opacity", "choke_px", "spatial_feather_px"],
+        NodeKind::Blend { .. } | NodeKind::AdjustmentLayer { .. } => &["opacity"],
+        NodeKind::BlurMoCurves { .. } => &[
+            "shift_x",
+            "shift_y",
+            "z_dist",
+            "rotate_deg",
+            "blur_strength",
+        ],
+        NodeKind::DepthMatte { .. } => &["near_depth", "far_depth", "feather"],
         NodeKind::ColorBasic { .. } => &["exposure", "contrast", "saturation", "flash_amount"],
         NodeKind::ShaderTransition { .. } => &[
             "progress",
@@ -396,6 +481,9 @@ fn bindable_param_names(kind: &NodeKind) -> &'static [&'static str] {
             "scale_x",
             "scale_y",
             "scale_z",
+            "pivot_x",
+            "pivot_y",
+            "pivot_z",
             "cam_x",
             "cam_y",
             "cam_z",
@@ -405,6 +493,10 @@ fn bindable_param_names(kind: &NodeKind) -> &'static [&'static str] {
             "fov_deg",
             "dof_focal_dist",
             "dof_blur_strength",
+        ],
+        NodeKind::Null3D { .. } => &[
+            "pos_x", "pos_y", "pos_z", "rot_x", "rot_y", "rot_z", "scale_x", "scale_y", "scale_z",
+            "pivot_x", "pivot_y", "pivot_z",
         ],
         NodeKind::Text3D { .. } => &[
             "pos_x",
@@ -764,6 +856,17 @@ impl Project {
                     ac.id, ac.gain_db
                 )));
             }
+            if !ac.pan.is_finite() || !(-1.0..=1.0).contains(&ac.pan) {
+                return Err(SchemaError::InvalidTimeline(format!(
+                    "audio clip '{}' pan must be finite and in [-1.0, 1.0], found {}",
+                    ac.id, ac.pan
+                )));
+            }
+            if let Some(ev_id) = &ac.anchor_event_id
+                && !event_ids.contains(ev_id.as_str())
+            {
+                return Err(SchemaError::MissingEvent(ev_id.clone()));
+            }
             let clip_duration = ac.timeline_end - ac.timeline_start;
             for (edge, fade) in [("fade_in", ac.fade_in), ("fade_out", ac.fade_out)] {
                 let Some(fade) = fade else { continue };
@@ -780,6 +883,60 @@ impl Project {
                         ac.id, fade.duration_ticks, clip_duration
                     )));
                 }
+            }
+        }
+
+        for (idx, rule) in self.timeline.ducking_rules.iter().enumerate() {
+            if rule.trigger_bus == rule.target_bus {
+                return Err(SchemaError::InvalidTimeline(format!(
+                    "ducking rule [{idx}] trigger_bus and target_bus must differ ({:?})",
+                    rule.trigger_bus
+                )));
+            }
+            if !rule.threshold.is_finite() || !(0.0..=1.0).contains(&rule.threshold) {
+                return Err(SchemaError::InvalidTimeline(format!(
+                    "ducking rule [{idx}] threshold must be finite and in [0.0, 1.0], found {}",
+                    rule.threshold
+                )));
+            }
+            if !rule.duck_gain.is_finite() || !(0.0..=1.0).contains(&rule.duck_gain) {
+                return Err(SchemaError::InvalidTimeline(format!(
+                    "ducking rule [{idx}] duck_gain must be finite and in [0.0, 1.0], found {}",
+                    rule.duck_gain
+                )));
+            }
+            if !rule.attack_ms.is_finite() || rule.attack_ms < 0.0 {
+                return Err(SchemaError::InvalidTimeline(format!(
+                    "ducking rule [{idx}] attack_ms must be finite and >= 0.0, found {}",
+                    rule.attack_ms
+                )));
+            }
+            if !rule.release_ms.is_finite() || rule.release_ms < 0.0 {
+                return Err(SchemaError::InvalidTimeline(format!(
+                    "ducking rule [{idx}] release_ms must be finite and >= 0.0, found {}",
+                    rule.release_ms
+                )));
+            }
+        }
+
+        for (idx, ms) in self.timeline.micro_silences.iter().enumerate() {
+            if ms.start_tick < Flicks::ZERO || ms.start_tick >= ms.end_tick {
+                return Err(SchemaError::InvalidTimeline(format!(
+                    "micro_silence [{idx}] requires 0 <= start_tick ({}) < end_tick ({})",
+                    ms.start_tick, ms.end_tick
+                )));
+            }
+            if !ms.fade_ms.is_finite() || ms.fade_ms < 0.0 {
+                return Err(SchemaError::InvalidTimeline(format!(
+                    "micro_silence [{idx}] fade_ms must be finite and >= 0.0, found {}",
+                    ms.fade_ms
+                )));
+            }
+            if !ms.floor_gain.is_finite() || !(0.0..=1.0).contains(&ms.floor_gain) {
+                return Err(SchemaError::InvalidTimeline(format!(
+                    "micro_silence [{idx}] floor_gain must be finite and in [0.0, 1.0], found {}",
+                    ms.floor_gain
+                )));
             }
         }
 
@@ -1117,7 +1274,13 @@ impl Project {
                     gain_db: 0.0,
                     fade_in: None,
                     fade_out: None,
+                    bus: AudioBus::Music,
+                    pan: 0.0,
+                    anchor_event_id: None,
+                    apex_offset_ticks: None,
                 }],
+                ducking_rules: Vec::new(),
+                micro_silences: Vec::new(),
             },
             events: vec![EventAnchorDef {
                 event_id: "drop_impact".into(),
@@ -1180,6 +1343,9 @@ impl Project {
                             invert: false,
                             feather: 0.04,
                             opaque_black_outside: false,
+                            opacity: 1.0,
+                            choke_px: 0.0,
+                            spatial_feather_px: 0.0,
                         },
                         inputs: vec![NodeId::from("src_a"), NodeId::from("moving_mask_xform")],
                         enabled: true,

@@ -52,6 +52,8 @@ fn project_with(graph: RenderGraphDef) -> Project {
             },
             clips: vec![],
             audio_clips: vec![],
+            ducking_rules: vec![],
+            micro_silences: vec![],
         },
         events: vec![],
         graph,

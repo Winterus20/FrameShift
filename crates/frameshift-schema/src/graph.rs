@@ -1,4 +1,5 @@
 use crate::error::SchemaError;
+use frameshift_time::Flicks;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -159,6 +160,7 @@ pub enum MatteMode {
     #[default]
     Alpha,
     Luma,
+    Red,
 }
 
 /// Text range unit used by the headless `VectorText` animator.
@@ -174,11 +176,24 @@ pub enum TextSelectorUnit {
     Word,
 }
 
+/// Range selector falloff shape for [`TextAnimatorDef`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextRangeShape {
+    #[default]
+    Square,
+    RampUp,
+    RampDown,
+    Triangle,
+    Smooth,
+}
+
 /// A deterministic in-animation applied to a logical range of shaped text units.
 ///
 /// Tick values are integer FrameShift Flicks. Selected units start at `position_from_norm`,
-/// `scale_from`, and `opacity_from`; each advances toward the normal text style over
-/// `duration_ticks`, with `delay_ticks` staggered between adjacent units.
+/// `scale_from`, `opacity_from`, `rotation_deg_from`, and `tracking_em_from`; each advances
+/// toward the normal text style over `duration_ticks`, with `delay_ticks` staggered between
+/// adjacent units according to `shape`, `ease_high`, `ease_low`, and optional `randomize_seed`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TextAnimatorDef {
     #[serde(default)]
@@ -199,6 +214,18 @@ pub struct TextAnimatorDef {
     pub scale_from: f32,
     #[serde(default = "default_one")]
     pub opacity_from: f32,
+    #[serde(default)]
+    pub rotation_deg_from: f32,
+    #[serde(default)]
+    pub tracking_em_from: f32,
+    #[serde(default)]
+    pub shape: TextRangeShape,
+    #[serde(default)]
+    pub ease_high: f32,
+    #[serde(default)]
+    pub ease_low: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub randomize_seed: Option<u64>,
 }
 
 impl Default for TextAnimatorDef {
@@ -213,6 +240,12 @@ impl Default for TextAnimatorDef {
             position_from_norm: [0.0, 0.0],
             scale_from: 1.0,
             opacity_from: 1.0,
+            rotation_deg_from: 0.0,
+            tracking_em_from: 0.0,
+            shape: TextRangeShape::Square,
+            ease_high: 0.0,
+            ease_low: 0.0,
+            randomize_seed: None,
         }
     }
 }
@@ -426,6 +459,12 @@ pub enum NodeKind {
         feather: f32,
         #[serde(default)]
         opaque_black_outside: bool,
+        #[serde(default = "default_one")]
+        opacity: f32,
+        #[serde(default)]
+        choke_px: f32,
+        #[serde(default)]
+        spatial_feather_px: f32,
     },
     /// Composites top (`inputs[1]`) over base (`inputs[0]`) in premultiplied alpha (2 inputs).
     Blend {
@@ -746,6 +785,12 @@ pub enum NodeKind {
         dof_focal_dist: f32,
         #[serde(default)]
         dof_blur_strength: f32,
+        #[serde(default)]
+        mirror_edges: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<NodeId>,
+        #[serde(default)]
+        pivot: [f32; 3],
     },
     /// Extruded 3D kinetic typography generator using an external TTF/OTF font (0 inputs).
     #[serde(alias = "text_3d")]
@@ -1086,6 +1131,60 @@ pub enum NodeKind {
         #[serde(default)]
         slot: usize,
     },
+    /// Time-bounded adjustment layer composited over its upstream input (1 input).
+    #[serde(alias = "adjustment_layer")]
+    AdjustmentLayer {
+        start_tick: Flicks,
+        end_tick: Flicks,
+        #[serde(default = "default_one")]
+        opacity: f32,
+        #[serde(default)]
+        blend_mode: BlendMode,
+    },
+    /// Directional, zoom, and rotational motion blur (`S_BlurMoCurves`-style) (1 input).
+    #[serde(alias = "blur_mo_curves")]
+    BlurMoCurves {
+        #[serde(default)]
+        shift_x: f32,
+        #[serde(default)]
+        shift_y: f32,
+        #[serde(default)]
+        z_dist: f32,
+        #[serde(default)]
+        rotate_deg: f32,
+        #[serde(default = "default_one")]
+        blur_strength: f32,
+        #[serde(default = "default_blur_samples")]
+        samples: u32,
+        #[serde(default)]
+        wrap_mode: u32,
+    },
+    /// Hierarchical 3D null transform parent node for `Transform3D` / `Null3D` rigs (0 inputs; allowed in `Scene3D`).
+    #[serde(alias = "null_3d")]
+    Null3D {
+        #[serde(default)]
+        pos: [f32; 3],
+        #[serde(default)]
+        rot_deg: [f32; 3],
+        #[serde(default = "default_scale3")]
+        scale: [f32; 3],
+        #[serde(default)]
+        pivot: [f32; 3],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<NodeId>,
+    },
+    /// Depth-map matte slicing `inputs[1]` (depth map) onto `inputs[0]` (base) (2 inputs).
+    #[serde(alias = "depth_matte")]
+    DepthMatte {
+        #[serde(default)]
+        near_depth: f32,
+        #[serde(default = "default_one")]
+        far_depth: f32,
+        #[serde(default)]
+        feather: f32,
+        #[serde(default)]
+        invert: bool,
+    },
 }
 
 fn default_one() -> f32 {
@@ -1416,6 +1515,14 @@ fn default_scrim_fill() -> [f32; 4] {
     [0.0, 0.0, 0.0, 0.55]
 }
 
+fn default_blur_samples() -> u32 {
+    16
+}
+
+fn default_scale3() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
+}
+
 impl NodeKind {
     /// Canonical serde `"type"` tag names for every `NodeKind` variant.
     pub const ALL_SERDE_NAMES: &'static [&'static str] = &[
@@ -1450,6 +1557,10 @@ impl NodeKind {
         "backdrop_scrim",
         "precomp",
         "precomp_input",
+        "adjustment_layer",
+        "blur_mo_curves",
+        "null3_d",
+        "depth_matte",
     ];
 
     /// Built-in WGSL transition shader names supported by `ShaderTransition`.
@@ -1483,7 +1594,8 @@ impl NodeKind {
             | NodeKind::Shape3D { .. }
             | NodeKind::ParticleField3D { .. }
             | NodeKind::RibbonTrail3D { .. }
-            | NodeKind::Scene3D { .. } => 0,
+            | NodeKind::Scene3D { .. }
+            | NodeKind::Null3D { .. } => 0,
             NodeKind::Transform2D { .. }
             | NodeKind::Transform3D { .. }
             | NodeKind::ColorBasic { .. }
@@ -1498,8 +1610,11 @@ impl NodeKind {
             | NodeKind::FilmOptics { .. }
             | NodeKind::CornerPin { .. }
             | NodeKind::GridWarp { .. }
-            | NodeKind::BackdropScrim { .. } => 1,
+            | NodeKind::BackdropScrim { .. }
+            | NodeKind::AdjustmentLayer { .. }
+            | NodeKind::BlurMoCurves { .. } => 1,
             NodeKind::MaskMatte { .. }
+            | NodeKind::DepthMatte { .. }
             | NodeKind::Blend { .. }
             | NodeKind::ShaderTransition { .. } => 2,
             NodeKind::CustomWgsl {
@@ -1526,6 +1641,7 @@ impl NodeKind {
                 | NodeKind::ParticleField3D { .. }
                 | NodeKind::RibbonTrail3D { .. }
                 | NodeKind::Transform3D { .. }
+                | NodeKind::Null3D { .. }
         )
     }
 
@@ -1618,50 +1734,215 @@ impl RenderGraphDef {
 
     /// Validates this graph (and any nested `Precomp` sub-graphs) at `depth`.
     pub fn validate_graph_with_depth(&self, depth: usize) -> Result<Vec<NodeId>, SchemaError> {
-        let mut by_id: BTreeMap<NodeId, &GraphNodeDef> = BTreeMap::new();
-        for node in &self.nodes {
-            if by_id.insert(node.id.clone(), node).is_some() {
-                return Err(SchemaError::DuplicateId {
-                    entity: "graph node",
-                    id: node.id.0.clone(),
+        validate_dag_nodes(&self.nodes, Some(&self.output_node), depth, false)
+    }
+}
+
+pub(crate) fn node_parent(kind: &NodeKind) -> Option<&NodeId> {
+    match kind {
+        NodeKind::Transform3D { parent, .. } | NodeKind::Null3D { parent, .. } => parent.as_ref(),
+        _ => None,
+    }
+}
+
+pub(crate) fn validate_dag_nodes(
+    nodes: &[GraphNodeDef],
+    output_node: Option<&NodeId>,
+    depth: usize,
+    allow_root_precomp_input: bool,
+) -> Result<Vec<NodeId>, SchemaError> {
+    let mut by_id: BTreeMap<NodeId, &GraphNodeDef> = BTreeMap::new();
+    for node in nodes {
+        if by_id.insert(node.id.clone(), node).is_some() {
+            return Err(SchemaError::DuplicateId {
+                entity: "graph node",
+                id: node.id.0.clone(),
+            });
+        }
+    }
+
+    if let Some(output_id) = output_node
+        && !by_id.contains_key(output_id)
+    {
+        return Err(SchemaError::MissingNode(output_id.clone()));
+    }
+
+    let mut indegree: BTreeMap<NodeId, usize> = BTreeMap::new();
+    let mut dependents: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+
+    for id in by_id.keys() {
+        indegree.insert(id.clone(), 0);
+        dependents.insert(id.clone(), Vec::new());
+    }
+
+    for node in nodes {
+        if let NodeKind::CustomWgsl {
+            wgsl_source,
+            expected_inputs,
+            ..
+        } = &node.kind
+        {
+            if *expected_inputs > 2 {
+                return Err(SchemaError::InvalidCustomWgsl {
+                    node_id: node.id.clone(),
+                    message: format!("expected_inputs ({expected_inputs}) must be <= 2"),
+                });
+            }
+            if wgsl_source.trim().is_empty() {
+                return Err(SchemaError::InvalidCustomWgsl {
+                    node_id: node.id.clone(),
+                    message: "wgsl_source must not be empty".into(),
                 });
             }
         }
 
-        if !by_id.contains_key(&self.output_node) {
-            return Err(SchemaError::MissingNode(self.output_node.clone()));
+        if let NodeKind::MaskMatte {
+            feather,
+            opacity,
+            choke_px,
+            spatial_feather_px,
+            ..
+        } = &node.kind
+            && (!feather.is_finite()
+                || !opacity.is_finite()
+                || !(0.0..=1.0).contains(opacity)
+                || !choke_px.is_finite()
+                || !spatial_feather_px.is_finite()
+                || *spatial_feather_px < 0.0)
+        {
+            return Err(SchemaError::InvalidMaskMatte {
+                node_id: node.id.clone(),
+                message: "feather and choke_px must be finite; opacity must be in [0, 1]; spatial_feather_px must be finite and >= 0.0".into(),
+            });
         }
 
-        let mut indegree: BTreeMap<NodeId, usize> = BTreeMap::new();
-        let mut dependents: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-
-        for id in by_id.keys() {
-            indegree.insert(id.clone(), 0);
-            dependents.insert(id.clone(), Vec::new());
-        }
-
-        for node in &self.nodes {
-            if let NodeKind::CustomWgsl {
-                wgsl_source,
-                expected_inputs,
-                ..
-            } = &node.kind
-            {
-                if *expected_inputs > 2 {
-                    return Err(SchemaError::InvalidCustomWgsl {
-                        node_id: node.id.clone(),
-                        message: format!("expected_inputs ({expected_inputs}) must be <= 2"),
-                    });
-                }
-                if wgsl_source.trim().is_empty() {
-                    return Err(SchemaError::InvalidCustomWgsl {
-                        node_id: node.id.clone(),
-                        message: "wgsl_source must not be empty".into(),
-                    });
-                }
+        if let NodeKind::AdjustmentLayer {
+            start_tick,
+            end_tick,
+            opacity,
+            ..
+        } = &node.kind
+        {
+            if *start_tick < Flicks::ZERO || *start_tick >= *end_tick {
+                return Err(SchemaError::InvalidAdjustmentLayer {
+                    node_id: node.id.clone(),
+                    message: format!(
+                        "requires 0 <= start_tick ({start_tick}) < end_tick ({end_tick})"
+                    ),
+                });
             }
+            if !opacity.is_finite() || !(0.0..=1.0).contains(opacity) {
+                return Err(SchemaError::InvalidAdjustmentLayer {
+                    node_id: node.id.clone(),
+                    message: format!("opacity ({opacity}) must be finite and in [0.0, 1.0]"),
+                });
+            }
+        }
 
-            if let NodeKind::Text3D {
+        if let NodeKind::BlurMoCurves {
+            shift_x,
+            shift_y,
+            z_dist,
+            rotate_deg,
+            blur_strength,
+            samples,
+            wrap_mode,
+        } = &node.kind
+        {
+            if !(1..=32).contains(samples) {
+                return Err(SchemaError::InvalidBlurMoCurves {
+                    node_id: node.id.clone(),
+                    message: format!("samples ({samples}) must be in 1..=32"),
+                });
+            }
+            if *wrap_mode > 2 {
+                return Err(SchemaError::InvalidBlurMoCurves {
+                    node_id: node.id.clone(),
+                    message: format!("wrap_mode ({wrap_mode}) must be in 0..=2"),
+                });
+            }
+            if !shift_x.is_finite()
+                || !shift_y.is_finite()
+                || !z_dist.is_finite()
+                || !rotate_deg.is_finite()
+                || !blur_strength.is_finite()
+                || *blur_strength < 0.0
+            {
+                return Err(SchemaError::InvalidBlurMoCurves {
+                    node_id: node.id.clone(),
+                    message: "shift/z_dist/rotate_deg must be finite; blur_strength must be finite and >= 0.0".into(),
+                });
+            }
+        }
+
+        if let NodeKind::DepthMatte {
+            near_depth,
+            far_depth,
+            feather,
+            ..
+        } = &node.kind
+            && (!near_depth.is_finite()
+                || !far_depth.is_finite()
+                || !feather.is_finite()
+                || *near_depth < 0.0
+                || *far_depth < *near_depth
+                || *feather < 0.0)
+        {
+            return Err(SchemaError::InvalidDepthMatte {
+                node_id: node.id.clone(),
+                message: format!(
+                    "requires finite 0.0 <= near_depth ({near_depth}) <= far_depth ({far_depth}) and feather ({feather}) >= 0.0"
+                ),
+            });
+        }
+
+        if let NodeKind::Transform3D {
+            pos,
+            rot_deg,
+            scale,
+            fov_deg,
+            camera_pos,
+            camera_rot_deg,
+            dof_focal_dist,
+            dof_blur_strength,
+            pivot,
+            ..
+        } = &node.kind
+            && (pos.iter().any(|v| !v.is_finite())
+                || rot_deg.iter().any(|v| !v.is_finite())
+                || scale.iter().any(|v| !v.is_finite())
+                || camera_pos.iter().any(|v| !v.is_finite())
+                || camera_rot_deg.iter().any(|v| !v.is_finite())
+                || pivot.iter().any(|v| !v.is_finite())
+                || !fov_deg.is_finite()
+                || !dof_focal_dist.is_finite()
+                || !dof_blur_strength.is_finite())
+        {
+            return Err(SchemaError::InvalidTransform3D {
+                node_id: node.id.clone(),
+                message: "transform3_d coordinates, angles, scale, pivot, and camera parameters must be finite".into(),
+            });
+        }
+
+        if let NodeKind::Null3D {
+            pos,
+            rot_deg,
+            scale,
+            pivot,
+            ..
+        } = &node.kind
+            && (pos.iter().any(|v| !v.is_finite())
+                || rot_deg.iter().any(|v| !v.is_finite())
+                || scale.iter().any(|v| !v.is_finite())
+                || pivot.iter().any(|v| !v.is_finite()))
+        {
+            return Err(SchemaError::InvalidNull3D {
+                node_id: node.id.clone(),
+                message: "null3_d pos, rot_deg, scale, and pivot must be finite".into(),
+            });
+        }
+
+        if let NodeKind::Text3D {
                 font_path,
                 line_height_em,
                 tracking_em,
@@ -1948,10 +2229,16 @@ impl RenderGraphDef {
                         || animator.scale_from < 0.0
                         || !animator.opacity_from.is_finite()
                         || !(0.0..=1.0).contains(&animator.opacity_from)
+                        || !animator.rotation_deg_from.is_finite()
+                        || !animator.tracking_em_from.is_finite()
+                        || !animator.ease_high.is_finite()
+                        || !(-100.0..=100.0).contains(&animator.ease_high)
+                        || !animator.ease_low.is_finite()
+                        || !(-100.0..=100.0).contains(&animator.ease_low)
                     {
                         return Err(SchemaError::InvalidVectorText {
                             node_id: node.id.clone(),
-                            message: "text_animator position, scale, and opacity must be finite; scale >= 0 and opacity in [0, 1]".into(),
+                            message: "text_animator position, scale, opacity, rotation, tracking, and ease must be finite; scale >= 0, opacity in [0, 1], ease in [-100, 100]".into(),
                         });
                     }
                 }
@@ -2183,13 +2470,21 @@ impl RenderGraphDef {
                 }
             }
 
-            if let NodeKind::PrecompInput { .. } = &node.kind
-                && depth == 0
-            {
-                return Err(SchemaError::InvalidPrecomp {
-                    node_id: node.id.clone(),
-                    message: "precomp_input is forbidden in the root render graph".into(),
-                });
+            if let NodeKind::PrecompInput { slot } = &node.kind {
+                if depth == 0 && !allow_root_precomp_input {
+                    return Err(SchemaError::InvalidPrecomp {
+                        node_id: node.id.clone(),
+                        message: "precomp_input is forbidden in the root render graph".into(),
+                    });
+                }
+                if allow_root_precomp_input && *slot >= MAX_PRECOMP_INPUTS {
+                    return Err(SchemaError::InvalidPrecomp {
+                        node_id: node.id.clone(),
+                        message: format!(
+                            "precomp_input slot ({slot}) must be < MAX_PRECOMP_INPUTS ({MAX_PRECOMP_INPUTS})"
+                        ),
+                    });
+                }
             }
 
             if let NodeKind::Precomp {
@@ -2300,11 +2595,37 @@ impl RenderGraphDef {
                         return Err(SchemaError::InvalidScene3D {
                             node_id: node.id.clone(),
                             message: format!(
-                                "input '{upstream}' is not a valid 3D scene child (expected Text3D, Shape3D, ParticleField3D, RibbonTrail3D, or Transform3D)"
+                                "input '{upstream}' is not a valid 3D scene child (expected Text3D, Shape3D, ParticleField3D, RibbonTrail3D, Transform3D, or Null3D)"
                             ),
                         });
                     }
                 }
+            }
+
+            if let Some(parent_id) = node_parent(&node.kind) {
+                let Some(parent_node) = by_id.get(parent_id) else {
+                    return Err(SchemaError::MissingNode(parent_id.clone()));
+                };
+                if !matches!(
+                    parent_node.kind,
+                    NodeKind::Null3D { .. } | NodeKind::Transform3D { .. }
+                ) {
+                    let message = format!(
+                        "parent '{parent_id}' must be a Null3D or Transform3D node"
+                    );
+                    return Err(match node.kind {
+                        NodeKind::Null3D { .. } => SchemaError::InvalidNull3D {
+                            node_id: node.id.clone(),
+                            message,
+                        },
+                        _ => SchemaError::InvalidTransform3D {
+                            node_id: node.id.clone(),
+                            message,
+                        },
+                    });
+                }
+                *indegree.get_mut(&node.id).unwrap() += 1;
+                dependents.get_mut(parent_id).unwrap().push(node.id.clone());
             }
 
             for upstream in &node.inputs {
@@ -2346,7 +2667,6 @@ impl RenderGraphDef {
         }
 
         Ok(order)
-    }
 }
 
 fn extract_cycle_nodes(by_id: &BTreeMap<NodeId, &GraphNodeDef>) -> Vec<NodeId> {
@@ -2371,7 +2691,7 @@ fn extract_cycle_nodes(by_id: &BTreeMap<NodeId, &GraphNodeDef>) -> Vec<NodeId> {
         stack.push(curr.clone());
 
         if let Some(node) = by_id.get(curr) {
-            for upstream in &node.inputs {
+            for upstream in node.inputs.iter().chain(node_parent(&node.kind)) {
                 match color.get(upstream).copied().unwrap_or(Color::White) {
                     Color::Gray => {
                         let start_idx = stack.iter().position(|id| id == upstream).unwrap_or(0);

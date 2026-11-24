@@ -1627,6 +1627,7 @@ fn visualize_matte_frame(
                 let l = 0.2126 * (px[0] as f32) + 0.7152 * (px[1] as f32) + 0.0722 * (px[2] as f32);
                 l.round().clamp(0.0, 255.0) as u8
             }
+            MatteMode::Red => px[0],
         };
         let v = if invert { 255 - raw } else { raw };
         px[0] = v;

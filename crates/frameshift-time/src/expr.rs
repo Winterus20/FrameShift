@@ -115,17 +115,21 @@ enum BuiltinFunc {
     Cos,
     Abs,
     Exp,
+    Floor,
+    Fract,
     EaseOutExpo,
     EaseInExpo,
     EaseInOutExpo,
     EaseOutBack,
     Min,
     Max,
+    Mod,
     Clamp,
     Smoothstep,
     Lerp,
     Step,
     Pow,
+    CubicBezier,
 }
 
 impl BuiltinFunc {
@@ -135,17 +139,21 @@ impl BuiltinFunc {
             "cos" => Some(Self::Cos),
             "abs" => Some(Self::Abs),
             "exp" => Some(Self::Exp),
+            "floor" => Some(Self::Floor),
+            "fract" => Some(Self::Fract),
             "ease_out_expo" => Some(Self::EaseOutExpo),
             "ease_in_expo" => Some(Self::EaseInExpo),
             "ease_in_out_expo" => Some(Self::EaseInOutExpo),
             "ease_out_back" => Some(Self::EaseOutBack),
             "min" => Some(Self::Min),
             "max" => Some(Self::Max),
+            "mod" => Some(Self::Mod),
             "clamp" => Some(Self::Clamp),
             "smoothstep" => Some(Self::Smoothstep),
             "lerp" => Some(Self::Lerp),
             "step" => Some(Self::Step),
             "pow" => Some(Self::Pow),
+            "cubic_bezier" => Some(Self::CubicBezier),
             _ => None,
         }
     }
@@ -156,12 +164,15 @@ impl BuiltinFunc {
             | Self::Cos
             | Self::Abs
             | Self::Exp
+            | Self::Floor
+            | Self::Fract
             | Self::EaseOutExpo
             | Self::EaseInExpo
             | Self::EaseInOutExpo
             | Self::EaseOutBack => 1,
-            Self::Min | Self::Max | Self::Step | Self::Pow => 2,
+            Self::Min | Self::Max | Self::Mod | Self::Step | Self::Pow => 2,
             Self::Clamp | Self::Smoothstep | Self::Lerp => 3,
+            Self::CubicBezier => 5,
         }
     }
 }
@@ -245,6 +256,19 @@ impl SafeExpr {
 }
 
 #[inline]
+fn eval_unit_cubic_bezier(t: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
+    let t_clamped = t.clamp(0.0, 1.0);
+    if t_clamped <= 0.0 {
+        return 0.0;
+    }
+    if t_clamped >= 1.0 {
+        return 1.0;
+    }
+    let u = crate::speed_curve::solve_cubic_bezier_x(x1, x2, t_clamped);
+    crate::speed_curve::eval_cubic_bezier_1d(0.0, y1, y2, 1.0, u)
+}
+
+#[inline]
 fn ensure_finite(val: f64) -> Result<f64, ExprError> {
     if val.is_finite() {
         Ok(val)
@@ -292,7 +316,7 @@ fn eval_node(
             ensure_finite(out)
         }
         ExprNode::Call { func, args } => {
-            let mut vals = [0.0_f64; 3];
+            let mut vals = [0.0_f64; 5];
             for (i, arg) in args.iter().enumerate() {
                 vals[i] = eval_node(arg, ctx, fuel, max_fuel)?;
             }
@@ -301,6 +325,8 @@ fn eval_node(
                 BuiltinFunc::Cos => vals[0].cos(),
                 BuiltinFunc::Abs => vals[0].abs(),
                 BuiltinFunc::Exp => vals[0].exp(),
+                BuiltinFunc::Floor => vals[0].floor(),
+                BuiltinFunc::Fract => vals[0] - vals[0].floor(),
                 BuiltinFunc::EaseOutExpo => {
                     let t = vals[0].clamp(0.0, 1.0);
                     if t <= 0.0 {
@@ -348,6 +374,14 @@ fn eval_node(
                 }
                 BuiltinFunc::Min => vals[0].min(vals[1]),
                 BuiltinFunc::Max => vals[0].max(vals[1]),
+                BuiltinFunc::Mod => {
+                    let (a, b) = (vals[0], vals[1]);
+                    if b == 0.0 {
+                        return Err(ExprError::DivisionByZero);
+                    }
+                    let q = ensure_finite(a / b)?;
+                    a - b * q.floor()
+                }
                 BuiltinFunc::Clamp => {
                     let (x, lo, hi) = (vals[0], vals[1], vals[2]);
                     if lo > hi {
@@ -383,6 +417,15 @@ fn eval_node(
                     if x < edge { 0.0 } else { 1.0 }
                 }
                 BuiltinFunc::Pow => vals[0].powf(vals[1]),
+                BuiltinFunc::CubicBezier => {
+                    let (t_in, x1, y1, x2, y2) = (vals[0], vals[1], vals[2], vals[3], vals[4]);
+                    if !(0.0..=1.0).contains(&x1) || !(0.0..=1.0).contains(&x2) {
+                        return Err(ExprError::InvalidArgument(format!(
+                            "cubic_bezier requires x1 and x2 in [0, 1], got [{x1}, {x2}]"
+                        )));
+                    }
+                    eval_unit_cubic_bezier(t_in, x1, y1, x2, y2)
+                }
             };
             ensure_finite(out)
         }

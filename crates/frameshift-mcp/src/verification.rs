@@ -128,6 +128,12 @@ pub fn run_m3_agent_director_verification(
         "analyze_audio",
         "inspect_project",
         "mutate_project",
+        "undo",
+        "redo",
+        "preflight_project",
+        "plan_autocut",
+        "list_effect_presets",
+        "apply_effect_preset",
         "query_preferences",
         "render_project",
     ];

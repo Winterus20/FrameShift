@@ -6,8 +6,8 @@ use crate::project::{
     AssetDef, ClipDef, CreativeDecisionRecord, EventAnchorDef, PreferenceEntry, Project,
 };
 use frameshift_time::{
-    Flicks, ImpactCurveStyle, ImpactSolveRequest, ImpactSolver, Rational32, SourceFitMode,
-    SpeedCurve, SpeedCurveSpec, SpeedKeyframe, TimeError,
+    BezierSpeedKeyframe, Flicks, ImpactCurveStyle, ImpactSolveRequest, ImpactSolver, KeyframeEase,
+    Rational32, SourceFitMode, SpeedCurve, SpeedCurveSpec, SpeedKeyframe, TimeError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -650,7 +650,96 @@ fn shift_speed_curve(curve: &SpeedCurve, delta: Flicks) -> Result<SpeedCurve, Sc
         SpeedCurveSpec::CubicHermite { keyframes } => {
             SpeedCurve::cubic_hermite(shift_keyframes(curve, keyframes, delta)).map_err(map_error)
         }
+        SpeedCurveSpec::CubicBezierValue { keyframes } => {
+            SpeedCurve::cubic_bezier_value(shift_bezier_value_keyframes(curve, keyframes, delta))
+                .map_err(map_error)
+        }
+        SpeedCurveSpec::CubicBezierSpeed { keyframes } => {
+            SpeedCurve::cubic_bezier_speed(shift_bezier_speed_keyframes(curve, keyframes, delta))
+                .map_err(map_error)
+        }
     }
+}
+
+fn shift_bezier_value_keyframes(
+    curve: &SpeedCurve,
+    keyframes: &[BezierSpeedKeyframe],
+    delta: Flicks,
+) -> Vec<BezierSpeedKeyframe> {
+    let base_source = curve.source_offset_at(delta);
+    let head = if let Some(exact) = keyframes.iter().find(|kf| kf.output_offset == delta) {
+        BezierSpeedKeyframe {
+            output_offset: Flicks::ZERO,
+            speed: exact.speed,
+            source_offset: Some(Flicks::ZERO),
+            in_ease: None,
+            out_ease: exact.out_ease,
+        }
+    } else {
+        BezierSpeedKeyframe {
+            output_offset: Flicks::ZERO,
+            speed: 0.0,
+            source_offset: Some(Flicks::ZERO),
+            in_ease: None,
+            out_ease: Some(KeyframeEase {
+                speed: curve.instant_speed_at(delta),
+                influence: 0.333,
+            }),
+        }
+    };
+    let mut shifted = vec![head];
+    for keyframe in keyframes {
+        if keyframe.output_offset > delta {
+            shifted.push(BezierSpeedKeyframe {
+                output_offset: keyframe.output_offset - delta,
+                speed: keyframe.speed,
+                source_offset: Some(keyframe.source_offset.unwrap_or(Flicks::ZERO) - base_source),
+                in_ease: keyframe.in_ease,
+                out_ease: keyframe.out_ease,
+            });
+        }
+    }
+    shifted
+}
+
+fn shift_bezier_speed_keyframes(
+    curve: &SpeedCurve,
+    keyframes: &[BezierSpeedKeyframe],
+    delta: Flicks,
+) -> Vec<BezierSpeedKeyframe> {
+    let head = if let Some(exact) = keyframes.iter().find(|kf| kf.output_offset == delta) {
+        BezierSpeedKeyframe {
+            output_offset: Flicks::ZERO,
+            speed: exact.speed,
+            source_offset: None,
+            in_ease: None,
+            out_ease: exact.out_ease,
+        }
+    } else {
+        BezierSpeedKeyframe {
+            output_offset: Flicks::ZERO,
+            speed: curve.instant_speed_at(delta),
+            source_offset: None,
+            in_ease: None,
+            out_ease: Some(KeyframeEase {
+                speed: curve.instant_speed_derivative_at(delta),
+                influence: 0.333,
+            }),
+        }
+    };
+    let mut shifted = vec![head];
+    for keyframe in keyframes {
+        if keyframe.output_offset > delta {
+            shifted.push(BezierSpeedKeyframe {
+                output_offset: keyframe.output_offset - delta,
+                speed: keyframe.speed,
+                source_offset: None,
+                in_ease: keyframe.in_ease,
+                out_ease: keyframe.out_ease,
+            });
+        }
+    }
+    shifted
 }
 
 fn shift_keyframes(

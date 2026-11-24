@@ -8,13 +8,13 @@ use crate::pool::{
 use crate::provider::{FrameProvider, SourceFrame, SourcePixelData};
 use crate::uniforms::{
     AnimeImpactFrameUniform, AnimeSharpenUniform, BackdropScrimUniform, BlendUniform,
-    BloomPassUniform, ColorBasicUniform, ColorSpaceMode, CustomWgslUniform, DitherMode,
-    DofBokehUniform, DofCocUniform, FilmHalationUniform, FilmOpticsUniform, FxaaUniform,
-    GpuMeshVertex3D, GpuSlugBand, GpuSlugCurve, GpuSlugGlyph, GpuSlugVertex, HalftoneGlowUniform,
-    Lut3DUniform, MaskMatteUniform, MotionBlurUniform, MotionTileShakeUniform, OutputAlphaMode,
-    ParticleField3DUniform, RadialShockwaveUniform, RibbonTrail3DUniform, SlugUniform,
-    Text2DFxUniform, Text2DJfaUniform, Text3DUniform, TonemapMode, Transform3DUniform,
-    TransformUniform, WhipTransitionUniform,
+    BloomPassUniform, BlurMoCurvesUniform, ColorBasicUniform, ColorSpaceMode, CustomWgslUniform,
+    DitherMode, DofBokehUniform, DofCocUniform, FilmHalationUniform, FilmOpticsUniform,
+    FxaaUniform, GpuMeshVertex3D, GpuSlugBand, GpuSlugCurve, GpuSlugGlyph, GpuSlugVertex,
+    HalftoneGlowUniform, Lut3DUniform, MaskMatteUniform, MotionBlurUniform,
+    MotionTileShakeUniform, OutputAlphaMode, ParticleField3DUniform, RadialShockwaveUniform,
+    RibbonTrail3DUniform, SlugUniform, Text2DFxUniform, Text2DJfaUniform, Text3DUniform,
+    TonemapMode, Transform3DUniform, TransformUniform, WhipTransitionUniform,
 };
 use crate::warp2d::{CornerPinUniform, GridWarpUniform};
 use bytemuck::{Pod, cast_slice};
@@ -23,7 +23,7 @@ use frameshift_schema::{
     DisabledPassthrough, EventBoundAnimation, ExtendedColorSpace, GraphNodeDef, HalftoneColorMode,
     LutSourceDef, MAX_PRECOMP_DEPTH, NodeId, NodeKind, ParamBindingDef, Project, RenderGraphDef,
     RenderProfileDef, SchemaError, Shape3DKind, ShutterPhase, SourceFit, TextAlign2D,
-    WritingMode2D,
+    TextRangeShape, WritingMode2D,
 };
 use frameshift_time::{ExprContext, FLICKS_PER_SECOND, Flicks, SafeExpr};
 use frameshift_vector::{
@@ -433,16 +433,50 @@ fn apply_animated_parameter(kind: &mut NodeKind, param: &str, value: f32) {
             "anchor_y" => anchor[1] = value,
             _ => {}
         },
-        NodeKind::MaskMatte { feather, .. } => {
-            if param == "feather" {
-                *feather = value;
-            }
-        }
-        NodeKind::Blend { opacity, .. } => {
+        NodeKind::MaskMatte {
+            feather,
+            opacity,
+            choke_px,
+            spatial_feather_px,
+            ..
+        } => match param {
+            "feather" => *feather = value,
+            "opacity" => *opacity = value.clamp(0.0, 1.0),
+            "choke_px" => *choke_px = value,
+            "spatial_feather_px" => *spatial_feather_px = value.max(0.0),
+            _ => {}
+        },
+        NodeKind::Blend { opacity, .. } | NodeKind::AdjustmentLayer { opacity, .. } => {
             if param == "opacity" {
-                *opacity = value;
+                *opacity = value.clamp(0.0, 1.0);
             }
         }
+        NodeKind::BlurMoCurves {
+            shift_x,
+            shift_y,
+            z_dist,
+            rotate_deg,
+            blur_strength,
+            ..
+        } => match param {
+            "shift_x" => *shift_x = value,
+            "shift_y" => *shift_y = value,
+            "z_dist" => *z_dist = value,
+            "rotate_deg" => *rotate_deg = value,
+            "blur_strength" => *blur_strength = value.max(0.0),
+            _ => {}
+        },
+        NodeKind::DepthMatte {
+            near_depth,
+            far_depth,
+            feather,
+            ..
+        } => match param {
+            "near_depth" => *near_depth = value.max(0.0),
+            "far_depth" => *far_depth = value.max(0.0),
+            "feather" => *feather = value.max(0.0),
+            _ => {}
+        },
         NodeKind::ColorBasic {
             exposure,
             contrast,
@@ -670,6 +704,9 @@ fn apply_animated_parameter(kind: &mut NodeKind, param: &str, value: f32) {
             camera_rot_deg,
             dof_focal_dist,
             dof_blur_strength,
+            mirror_edges: _,
+            parent: _,
+            pivot,
         } => match param {
             "pos_x" => pos[0] = value,
             "pos_y" => pos[1] = value,
@@ -680,6 +717,9 @@ fn apply_animated_parameter(kind: &mut NodeKind, param: &str, value: f32) {
             "scale_x" => scale[0] = value,
             "scale_y" => scale[1] = value,
             "scale_z" => scale[2] = value,
+            "pivot_x" => pivot[0] = value,
+            "pivot_y" => pivot[1] = value,
+            "pivot_z" => pivot[2] = value,
             "cam_x" => camera_pos[0] = value,
             "cam_y" => camera_pos[1] = value,
             "cam_z" => camera_pos[2] = value,
@@ -689,6 +729,27 @@ fn apply_animated_parameter(kind: &mut NodeKind, param: &str, value: f32) {
             "fov_deg" => *fov_deg = value,
             "dof_focal_dist" => *dof_focal_dist = value,
             "dof_blur_strength" => *dof_blur_strength = value,
+            _ => {}
+        },
+        NodeKind::Null3D {
+            pos,
+            rot_deg,
+            scale,
+            pivot,
+            parent: _,
+        } => match param {
+            "pos_x" => pos[0] = value,
+            "pos_y" => pos[1] = value,
+            "pos_z" => pos[2] = value,
+            "rot_x" => rot_deg[0] = value,
+            "rot_y" => rot_deg[1] = value,
+            "rot_z" => rot_deg[2] = value,
+            "scale_x" => scale[0] = value,
+            "scale_y" => scale[1] = value,
+            "scale_z" => scale[2] = value,
+            "pivot_x" => pivot[0] = value,
+            "pivot_y" => pivot[1] = value,
+            "pivot_z" => pivot[2] = value,
             _ => {}
         },
         NodeKind::Text3D {
@@ -1004,9 +1065,15 @@ fn apply_animated_parameter(kind: &mut NodeKind, param: &str, value: f32) {
             "auto_contrast" => *auto_contrast = value.clamp(0.0, 1.0),
             _ => {}
         },
+        NodeKind::MotionBlurShutter {
+            shutter_angle_deg, ..
+        } => {
+            if param == "shutter_angle_deg" {
+                *shutter_angle_deg = value.clamp(0.0, 720.0);
+            }
+        }
         NodeKind::SourceVideo { .. }
         | NodeKind::Solid { .. }
-        | NodeKind::MotionBlurShutter { .. }
         | NodeKind::PrecompInput { .. } => {}
     }
 }
@@ -1531,43 +1598,48 @@ impl GpuCompositor {
 
         // Disabled nodes copy an input. The shutter override below stays on the enabled path.
         if target_node.disabled_passthrough().is_none()
-            && let NodeKind::MotionBlurShutter {
+            && matches!(target_node.kind, NodeKind::MotionBlurShutter { .. })
+        {
+            let evaluated_root =
+                animator.evaluate_node(&target_node.id, &target_node.kind, sub_tick)?;
+            if let NodeKind::MotionBlurShutter {
                 shutter_angle_deg,
                 sub_samples,
                 phase,
                 ..
-            } = target_node.kind
-        {
-            if target_node.inputs.len() != 1 {
-                return Err(RenderError::MissingGraphInput {
-                    node_id: target_node.id.clone(),
-                    expected: 1,
-                    actual: target_node.inputs.len(),
-                });
+            } = evaluated_root
+            {
+                if target_node.inputs.len() != 1 {
+                    return Err(RenderError::MissingGraphInput {
+                        node_id: target_node.id.clone(),
+                        expected: 1,
+                        actual: target_node.inputs.len(),
+                    });
+                }
+                let samples = effective_blur_sub_samples(sub_samples, sample_ceiling);
+                let (angle, phase_used) = match root_shutter_override {
+                    Some(ov) => (ov.shutter_angle_deg, ov.phase.unwrap_or(phase)),
+                    None => (shutter_angle_deg, phase),
+                };
+                return self.evaluate_motion_blur(
+                    graph,
+                    full_topo,
+                    &target_node.inputs[0],
+                    sub_tick,
+                    frame_ticks,
+                    angle,
+                    samples,
+                    phase_used,
+                    width,
+                    height,
+                    provider,
+                    animator,
+                    sample_ceiling,
+                    precomp_inputs,
+                    depth,
+                    encoder,
+                );
             }
-            let samples = effective_blur_sub_samples(sub_samples, sample_ceiling);
-            let (angle, phase_used) = match root_shutter_override {
-                Some(ov) => (ov.shutter_angle_deg, ov.phase.unwrap_or(phase)),
-                None => (shutter_angle_deg, phase),
-            };
-            return self.evaluate_motion_blur(
-                graph,
-                full_topo,
-                &target_node.inputs[0],
-                sub_tick,
-                frame_ticks,
-                angle,
-                samples,
-                phase_used,
-                width,
-                height,
-                provider,
-                animator,
-                sample_ceiling,
-                precomp_inputs,
-                depth,
-                encoder,
-            );
         }
 
         let cone = collect_direct_cone(graph, target_id)?;
@@ -1757,6 +1829,7 @@ impl GpuCompositor {
                     (tex, true)
                 } else {
                     let tex = self.evaluate_single_node(
+                        graph,
                         node,
                         &evaluated_kind,
                         sub_tick,
@@ -1967,6 +2040,7 @@ impl GpuCompositor {
     #[allow(clippy::too_many_arguments)]
     fn evaluate_single_node(
         &mut self,
+        graph: &RenderGraphDef,
         node: &GraphNodeDef,
         kind: &NodeKind,
         sub_tick: Flicks,
@@ -2154,18 +2228,101 @@ impl GpuCompositor {
                 invert,
                 feather,
                 opaque_black_outside,
+                opacity,
+                choke_px,
+                spatial_feather_px,
             } => {
                 let src = require_input(node, textures, 0)?;
                 let mask = require_input(node, textures, 1)?;
                 let out = self.pool.acquire(&self.ctx.device, width, height);
-                let uniform = MaskMatteUniform::from_params(*mode, *invert, *feather, 1.0)
-                    .with_opaque_black_outside(*opaque_black_outside);
+                let uniform = MaskMatteUniform::from_params(*mode, *invert, *feather, *opacity)
+                    .with_opaque_black_outside(*opaque_black_outside)
+                    .with_choke_and_spatial_feather(*choke_px, *spatial_feather_px);
                 self.record_two_tex_pass(
                     encoder,
                     &node.id.0,
                     &self.pipelines.mask_matte,
                     &src.view,
                     &mask.view,
+                    &uniform,
+                    &out.view,
+                );
+                Ok(out)
+            }
+            NodeKind::DepthMatte {
+                near_depth,
+                far_depth,
+                feather,
+                invert,
+            } => {
+                let base = require_input(node, textures, 0)?;
+                let depth_map = require_input(node, textures, 1)?;
+                let out = self.pool.acquire(&self.ctx.device, width, height);
+                let uniform =
+                    MaskMatteUniform::depth_matte(*near_depth, *far_depth, *feather, *invert);
+                self.record_two_tex_pass(
+                    encoder,
+                    &node.id.0,
+                    &self.pipelines.mask_matte,
+                    &base.view,
+                    &depth_map.view,
+                    &uniform,
+                    &out.view,
+                );
+                Ok(out)
+            }
+            NodeKind::AdjustmentLayer {
+                start_tick,
+                end_tick,
+                opacity,
+                blend_mode,
+            } => {
+                let src = require_input(node, textures, 0)?;
+                let out = self.pool.acquire(&self.ctx.device, width, height);
+                let op = opacity.clamp(0.0, 1.0);
+                if sub_tick < *start_tick || sub_tick >= *end_tick || op <= 0.0 {
+                    copy_texture_2d(encoder, &src.texture, &out.texture, width, height);
+                } else {
+                    let uniform = BlendUniform::new(*blend_mode, op);
+                    self.record_two_tex_pass(
+                        encoder,
+                        &node.id.0,
+                        &self.pipelines.blend,
+                        &src.view,
+                        &src.view,
+                        &uniform,
+                        &out.view,
+                    );
+                }
+                Ok(out)
+            }
+            NodeKind::BlurMoCurves {
+                shift_x,
+                shift_y,
+                z_dist,
+                rotate_deg,
+                blur_strength,
+                samples,
+                wrap_mode,
+            } => {
+                let src = require_input(node, textures, 0)?;
+                let out = self.pool.acquire(&self.ctx.device, width, height);
+                let aspect = width as f32 / height.max(1) as f32;
+                let uniform = BlurMoCurvesUniform::new(
+                    *shift_x,
+                    *shift_y,
+                    *z_dist,
+                    *rotate_deg,
+                    *blur_strength,
+                    *samples,
+                    *wrap_mode,
+                    aspect,
+                );
+                self.record_one_tex_pass(
+                    encoder,
+                    &node.id.0,
+                    &self.pipelines.fx_blur_mocurves,
+                    &src.view,
                     &uniform,
                     &out.view,
                 );
@@ -2940,30 +3097,34 @@ impl GpuCompositor {
                 Ok(out)
             }
             NodeKind::Transform3D {
-                pos,
-                rot_deg,
-                scale,
                 fov_deg,
                 camera_pos,
                 camera_rot_deg,
                 dof_focal_dist,
                 dof_blur_strength,
+                mirror_edges,
+                ..
             } => {
                 let src = require_input(node, textures, 0)?;
                 let out = self.pool.acquire(&self.ctx.device, width, height);
                 let cam =
                     build_camera_matrices(*camera_pos, *camera_rot_deg, *fov_deg, width, height);
-                let uniform = build_transform3d_uniform(
+                let model = resolve_world_matrix(graph, &node.id, kind, sub_tick, animator)?;
+                let uniform = build_transform3d_uniform_from_matrix(
                     &cam,
-                    *pos,
-                    *rot_deg,
-                    *scale,
+                    model,
                     *dof_focal_dist,
                     *dof_blur_strength,
+                    *mirror_edges,
                     width,
                     height,
                 );
                 self.record_transform3d_pass(encoder, &node.id.0, &src.view, &uniform, &out.view);
+                Ok(out)
+            }
+            NodeKind::Null3D { .. } => {
+                let out = self.pool.acquire(&self.ctx.device, width, height);
+                clear_texture(encoder, &out.view, [0.0, 0.0, 0.0, 0.0]);
                 Ok(out)
             }
             NodeKind::Text3D {
@@ -3529,22 +3690,29 @@ impl GpuCompositor {
                         });
                     }
                 }
+                NodeKind::Null3D { .. } => {
+                    // Hierarchy-only parent transform node; resolved via child Transform3D::parent.
+                }
                 NodeKind::Transform3D {
-                    pos,
-                    rot_deg,
-                    scale,
                     dof_focal_dist,
                     dof_blur_strength,
+                    mirror_edges,
                     ..
                 } => {
                     let src_tex = require_input(child_node, textures, 0)?;
-                    let uniform = build_transform3d_uniform(
+                    let model = resolve_world_matrix(
+                        graph,
+                        child_id,
+                        &child_kind,
+                        sub_tick,
+                        animator,
+                    )?;
+                    let uniform = build_transform3d_uniform_from_matrix(
                         &cam,
-                        *pos,
-                        *rot_deg,
-                        *scale,
+                        model,
                         *dof_focal_dist,
                         *dof_blur_strength,
+                        *mirror_edges,
                         width,
                         height,
                     );
@@ -4321,34 +4489,55 @@ impl GpuCompositor {
         let block_center_y_px = (*y_offset_norm) * h_f;
         let bottom_rgba = color_bottom_rgba.unwrap_or(*color_rgba);
 
-        let (selector, timing_seconds, from_style) = if let Some(animator) = text_animator {
-            let unit_tag = match animator.unit {
-                frameshift_schema::TextSelectorUnit::Grapheme => 0,
-                frameshift_schema::TextSelectorUnit::Word => 1,
+        let (selector, timing_seconds, from_style, anim_extra, anim_shape) =
+            if let Some(animator) = text_animator {
+                let unit_tag = match animator.unit {
+                    frameshift_schema::TextSelectorUnit::Grapheme => 0,
+                    frameshift_schema::TextSelectorUnit::Word => 1,
+                };
+                let unit_count = match animator.unit {
+                    frameshift_schema::TextSelectorUnit::Grapheme => cached.grapheme_count,
+                    frameshift_schema::TextSelectorUnit::Word => cached.word_count,
+                };
+                let start = animator.range_start.min(unit_count);
+                let end = animator.range_end.unwrap_or(unit_count).min(unit_count);
+                let range_count = end.saturating_sub(start).max(1);
+                let shape_id = match animator.shape {
+                    TextRangeShape::Square => 0,
+                    TextRangeShape::RampUp => 1,
+                    TextRangeShape::RampDown => 2,
+                    TextRangeShape::Triangle => 3,
+                    TextRangeShape::Smooth => 4,
+                };
+                let (has_seed, seed32) = match animator.randomize_seed {
+                    Some(seed) => (1, (seed as u32) ^ ((seed >> 32) as u32)),
+                    None => (0, 0),
+                };
+                (
+                    [1, unit_tag, start, end],
+                    [
+                        (sub_tick.0 as f64 / FLICKS_PER_SECOND as f64) as f32,
+                        (animator.start_tick as f64 / FLICKS_PER_SECOND as f64) as f32,
+                        (animator.duration_ticks as f64 / FLICKS_PER_SECOND as f64) as f32,
+                        (animator.delay_ticks as f64 / FLICKS_PER_SECOND as f64) as f32,
+                    ],
+                    [
+                        animator.position_from_norm[0],
+                        animator.position_from_norm[1],
+                        animator.scale_from,
+                        animator.opacity_from,
+                    ],
+                    [
+                        animator.rotation_deg_from,
+                        animator.tracking_em_from * font_px,
+                        animator.ease_high,
+                        animator.ease_low,
+                    ],
+                    [shape_id, has_seed, seed32, range_count],
+                )
+            } else {
+                ([0, 0, 0, 0], [0.0; 4], [0.0, 0.0, 1.0, 1.0], [0.0; 4], [0; 4])
             };
-            let unit_count = match animator.unit {
-                frameshift_schema::TextSelectorUnit::Grapheme => cached.grapheme_count,
-                frameshift_schema::TextSelectorUnit::Word => cached.word_count,
-            };
-            let end = animator.range_end.unwrap_or(unit_count).min(unit_count);
-            (
-                [1, unit_tag, animator.range_start.min(unit_count), end],
-                [
-                    (sub_tick.0 as f64 / FLICKS_PER_SECOND as f64) as f32,
-                    (animator.start_tick as f64 / FLICKS_PER_SECOND as f64) as f32,
-                    (animator.duration_ticks as f64 / FLICKS_PER_SECOND as f64) as f32,
-                    (animator.delay_ticks as f64 / FLICKS_PER_SECOND as f64) as f32,
-                ],
-                [
-                    animator.position_from_norm[0],
-                    animator.position_from_norm[1],
-                    animator.scale_from,
-                    animator.opacity_from,
-                ],
-            )
-        } else {
-            ([0, 0, 0, 0], [0.0; 4], [0.0, 0.0, 1.0, 1.0])
-        };
 
         let slug_uniform = SlugUniform {
             canvas_anchor: [w_f, h_f, anchor_x_px, block_center_y_px],
@@ -4364,6 +4553,8 @@ impl GpuCompositor {
             selector,
             timing_seconds,
             from_style,
+            anim_extra,
+            anim_shape,
         };
 
         let slug_bind_group = self.create_slug_bind_group(node_label, cached, &slug_uniform);
@@ -5569,17 +5760,15 @@ fn mul_alpha(rgba: [f32; 4], opacity: f32) -> [f32; 4] {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_transform3d_uniform(
+fn build_transform3d_uniform_from_matrix(
     cam: &CameraMatrices,
-    pos: [f32; 3],
-    rot_deg: [f32; 3],
-    scale: [f32; 3],
+    model: glam::Mat4,
     dof_focal_dist: f32,
     dof_blur_strength: f32,
+    mirror_edges: bool,
     width: u32,
     height: u32,
 ) -> Transform3DUniform {
-    let model = build_model_matrix(pos, rot_deg, scale);
     let mv = cam.view * model;
     let mvp = cam.proj * mv;
     let aspect = width as f32 / height.max(1) as f32;
@@ -5593,7 +5782,102 @@ fn build_transform3d_uniform(
             1.0 / width.max(1) as f32,
         ],
         extra: [1.0 / height.max(1) as f32, 0.0, 0.0, 0.0],
+        flags: [u32::from(mirror_edges), 0, 0, 0],
     }
+}
+
+/// Resolves the hierarchical 3D world matrix for a `Transform3D` or `Null3D` node,
+/// walking any `parent` chain (`Null3D` / `Transform3D`) with cycle protection.
+pub fn resolve_world_matrix(
+    graph: &RenderGraphDef,
+    node_id: &NodeId,
+    evaluated_kind: &NodeKind,
+    sub_tick: Flicks,
+    animator: &dyn NodeAnimator,
+) -> Result<glam::Mat4, RenderError> {
+    let (local_mat, mut parent_opt) = match evaluated_kind {
+        NodeKind::Transform3D {
+            pos,
+            rot_deg,
+            scale,
+            pivot,
+            parent,
+            ..
+        } => (
+            build_model_matrix_with_pivot(*pos, *rot_deg, *scale, *pivot),
+            parent.clone(),
+        ),
+        NodeKind::Null3D {
+            pos,
+            rot_deg,
+            scale,
+            pivot,
+            parent,
+        } => (
+            build_model_matrix_with_pivot(*pos, *rot_deg, *scale, *pivot),
+            parent.clone(),
+        ),
+        other => {
+            return Err(RenderError::Schema(SchemaError::InvalidTransform3D {
+                node_id: node_id.clone(),
+                message: format!("expected Transform3D or Null3D, got {other:?}"),
+            }));
+        }
+    };
+
+    let mut world = local_mat;
+    let mut visited: HashSet<NodeId> = HashSet::new();
+    visited.insert(node_id.clone());
+
+    while let Some(parent_id) = parent_opt {
+        if !visited.insert(parent_id.clone()) {
+            return Err(RenderError::Schema(SchemaError::CycleDetected {
+                cycle: visited.into_iter().collect(),
+            }));
+        }
+        let parent_node = graph
+            .node(&parent_id)
+            .ok_or_else(|| RenderError::Schema(SchemaError::MissingNode(parent_id.clone())))?;
+        let parent_evaluated = if parent_node.enabled {
+            animator.evaluate_node(&parent_id, &parent_node.kind, sub_tick)?
+        } else {
+            parent_node.kind.clone()
+        };
+        let (p_local, next_parent) = match &parent_evaluated {
+            NodeKind::Null3D {
+                pos,
+                rot_deg,
+                scale,
+                pivot,
+                parent,
+            }
+            | NodeKind::Transform3D {
+                pos,
+                rot_deg,
+                scale,
+                pivot,
+                parent,
+                ..
+            } => {
+                let m = if parent_node.enabled {
+                    build_model_matrix_with_pivot(*pos, *rot_deg, *scale, *pivot)
+                } else {
+                    glam::Mat4::IDENTITY
+                };
+                (m, parent.clone())
+            }
+            _ => {
+                return Err(RenderError::Schema(SchemaError::InvalidTransform3D {
+                    node_id: node_id.clone(),
+                    message: format!("parent '{parent_id}' must be a Null3D or Transform3D node"),
+                }));
+            }
+        };
+        world = p_local * world;
+        parent_opt = next_parent;
+    }
+
+    Ok(world)
 }
 
 fn build_text3d_uniform(kind: &NodeKind, cam: &CameraMatrices, t_sec: f32) -> Text3DUniform {
@@ -5925,6 +6209,20 @@ fn build_model_matrix(pos: [f32; 3], rot_deg: [f32; 3], scale: [f32; 3]) -> glam
         rot,
         glam::Vec3::from_array(pos),
     )
+}
+
+fn build_model_matrix_with_pivot(
+    pos: [f32; 3],
+    rot_deg: [f32; 3],
+    scale: [f32; 3],
+    pivot: [f32; 3],
+) -> glam::Mat4 {
+    if pivot == [0.0, 0.0, 0.0] {
+        return build_model_matrix(pos, rot_deg, scale);
+    }
+    let piv = glam::Vec3::from_array(pivot);
+    let local = build_model_matrix(pos, rot_deg, scale);
+    glam::Mat4::from_translation(piv) * local * glam::Mat4::from_translation(-piv)
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<(), RenderError> {
@@ -6548,6 +6846,9 @@ mod tests {
                         invert: false,
                         feather: 0.0,
                         opaque_black_outside,
+                        opacity: 1.0,
+                        choke_px: 0.0,
+                        spatial_feather_px: 0.0,
                     },
                     inputs: vec![NodeId::from("src"), NodeId::from("matte")],
                     enabled: true,
@@ -6637,5 +6938,361 @@ mod tests {
             )
             .expect("render_project_frame_with_audio");
         assert_eq!(r.width, 64);
+    }
+
+    #[test]
+    fn resolve_world_matrix_parent_chain_pivot_and_cycle_guard() {
+        let graph = RenderGraphDef {
+            output_node: NodeId::from("child"),
+            nodes: vec![
+                GraphNodeDef {
+                    id: NodeId::from("null_rig"),
+                    kind: NodeKind::Null3D {
+                        pos: [1.0, 2.0, 0.0],
+                        rot_deg: [0.0, 0.0, 0.0],
+                        scale: [2.0, 2.0, 2.0],
+                        pivot: [0.0, 0.0, 0.0],
+                        parent: None,
+                    },
+                    inputs: vec![],
+                    enabled: true,
+                },
+                GraphNodeDef {
+                    id: NodeId::from("child"),
+                    kind: NodeKind::Transform3D {
+                        pos: [0.5, 0.0, 0.0],
+                        rot_deg: [0.0, 0.0, 90.0],
+                        scale: [1.0, 1.0, 1.0],
+                        fov_deg: 50.0,
+                        camera_pos: [0.0, 0.0, 3.0],
+                        camera_rot_deg: [0.0, 0.0, 0.0],
+                        dof_focal_dist: 3.0,
+                        dof_blur_strength: 0.0,
+                        mirror_edges: false,
+                        parent: Some(NodeId::from("null_rig")),
+                        pivot: [0.5, 0.0, 0.0],
+                    },
+                    inputs: vec![NodeId::from("solid_src")],
+                    enabled: true,
+                },
+                GraphNodeDef {
+                    id: NodeId::from("solid_src"),
+                    kind: NodeKind::Solid {
+                        color_rgba: [1.0; 4],
+                        color_space: ColorSpace::LinearRec709,
+                    },
+                    inputs: vec![],
+                    enabled: true,
+                },
+            ],
+        };
+
+        let child_node = graph.node(&NodeId::from("child")).unwrap();
+        let world = resolve_world_matrix(
+            &graph,
+            &child_node.id,
+            &child_node.kind,
+            Flicks::ZERO,
+            &NoopAnimator,
+        )
+        .expect("parented world matrix must resolve");
+
+        let pivot_world = world.transform_point3(glam::Vec3::new(0.5, 0.0, 0.0));
+        assert!(
+            (pivot_world - glam::Vec3::new(3.0, 2.0, 0.0)).length() < 1e-4,
+            "pivot point rotated by 90 deg must stay at pivot+pos scaled+translated by parent, got {pivot_world:?}"
+        );
+        let tip_world = world.transform_point3(glam::Vec3::new(1.5, 0.0, 0.0));
+        assert!(
+            (tip_world - glam::Vec3::new(3.0, 4.0, 0.0)).length() < 1e-4,
+            "tip 1 unit +X from pivot rotates to +Y and scales by 2 via parent, got {tip_world:?}"
+        );
+
+        let cyclic = RenderGraphDef {
+            output_node: NodeId::from("a"),
+            nodes: vec![
+                GraphNodeDef {
+                    id: NodeId::from("a"),
+                    kind: NodeKind::Null3D {
+                        pos: [0.0; 3],
+                        rot_deg: [0.0; 3],
+                        scale: [1.0; 3],
+                        pivot: [0.0; 3],
+                        parent: Some(NodeId::from("b")),
+                    },
+                    inputs: vec![],
+                    enabled: true,
+                },
+                GraphNodeDef {
+                    id: NodeId::from("b"),
+                    kind: NodeKind::Null3D {
+                        pos: [0.0; 3],
+                        rot_deg: [0.0; 3],
+                        scale: [1.0; 3],
+                        pivot: [0.0; 3],
+                        parent: Some(NodeId::from("a")),
+                    },
+                    inputs: vec![],
+                    enabled: true,
+                },
+            ],
+        };
+        let cyc_err = resolve_world_matrix(
+            &cyclic,
+            &cyclic.nodes[0].id,
+            &cyclic.nodes[0].kind,
+            Flicks::ZERO,
+            &NoopAnimator,
+        )
+        .expect_err("parent cycle must be rejected");
+        assert!(matches!(
+            cyc_err,
+            RenderError::Schema(SchemaError::CycleDetected { .. })
+        ));
+
+        let bad_parent = RenderGraphDef {
+            output_node: NodeId::from("child"),
+            nodes: vec![
+                GraphNodeDef {
+                    id: NodeId::from("bad"),
+                    kind: NodeKind::Solid {
+                        color_rgba: [0.0; 4],
+                        color_space: ColorSpace::LinearRec709,
+                    },
+                    inputs: vec![],
+                    enabled: true,
+                },
+                GraphNodeDef {
+                    id: NodeId::from("child"),
+                    kind: NodeKind::Null3D {
+                        pos: [0.0; 3],
+                        rot_deg: [0.0; 3],
+                        scale: [1.0; 3],
+                        pivot: [0.0; 3],
+                        parent: Some(NodeId::from("bad")),
+                    },
+                    inputs: vec![],
+                    enabled: true,
+                },
+            ],
+        };
+        let bad_err = resolve_world_matrix(
+            &bad_parent,
+            &bad_parent.nodes[1].id,
+            &bad_parent.nodes[1].kind,
+            Flicks::ZERO,
+            &NoopAnimator,
+        )
+        .expect_err("non-3d parent must error");
+        assert!(matches!(
+            bad_err,
+            RenderError::Schema(SchemaError::InvalidTransform3D { .. })
+        ));
+    }
+
+    #[test]
+    fn apply_animated_parameter_covers_new_nodes_and_shutter_angle() {
+        let mut mask = NodeKind::MaskMatte {
+            mode: MatteMode::Red,
+            invert: false,
+            feather: 0.0,
+            opaque_black_outside: false,
+            opacity: 1.0,
+            choke_px: 0.0,
+            spatial_feather_px: 0.0,
+        };
+        apply_animated_parameter(&mut mask, "opacity", 1.5);
+        apply_animated_parameter(&mut mask, "choke_px", -2.5);
+        apply_animated_parameter(&mut mask, "spatial_feather_px", -1.0);
+        assert!(matches!(
+            mask,
+            NodeKind::MaskMatte {
+                opacity,
+                choke_px,
+                spatial_feather_px,
+                ..
+            } if (opacity - 1.0).abs() < 1e-6
+                && (choke_px - (-2.5)).abs() < 1e-6
+                && spatial_feather_px == 0.0
+        ));
+
+        let mut adj = NodeKind::AdjustmentLayer {
+            start_tick: Flicks(0),
+            end_tick: Flicks(100),
+            opacity: 1.0,
+            blend_mode: BlendMode::Screen,
+        };
+        apply_animated_parameter(&mut adj, "opacity", 0.35);
+        assert!(matches!(
+            adj,
+            NodeKind::AdjustmentLayer { opacity, .. } if (opacity - 0.35).abs() < 1e-6
+        ));
+
+        let mut blur = NodeKind::BlurMoCurves {
+            shift_x: 0.0,
+            shift_y: 0.0,
+            z_dist: 0.0,
+            rotate_deg: 0.0,
+            blur_strength: 1.0,
+            samples: 12,
+            wrap_mode: 2,
+        };
+        for (p, v) in [
+            ("shift_x", 0.15),
+            ("shift_y", -0.25),
+            ("z_dist", 0.3),
+            ("rotate_deg", -18.0),
+            ("blur_strength", 2.5),
+        ] {
+            apply_animated_parameter(&mut blur, p, v);
+        }
+        assert!(matches!(
+            blur,
+            NodeKind::BlurMoCurves {
+                shift_x,
+                shift_y,
+                z_dist,
+                rotate_deg,
+                blur_strength,
+                ..
+            } if (shift_x - 0.15).abs() < 1e-6
+                && (shift_y - (-0.25)).abs() < 1e-6
+                && (z_dist - 0.3).abs() < 1e-6
+                && (rotate_deg - (-18.0)).abs() < 1e-6
+                && (blur_strength - 2.5).abs() < 1e-6
+        ));
+
+        let mut depth = NodeKind::DepthMatte {
+            near_depth: 0.1,
+            far_depth: 0.9,
+            feather: 0.05,
+            invert: false,
+        };
+        apply_animated_parameter(&mut depth, "near_depth", -0.5);
+        apply_animated_parameter(&mut depth, "far_depth", 0.7);
+        apply_animated_parameter(&mut depth, "feather", 0.2);
+        assert!(matches!(
+            depth,
+            NodeKind::DepthMatte {
+                near_depth,
+                far_depth,
+                feather,
+                ..
+            } if near_depth == 0.0 && (far_depth - 0.7).abs() < 1e-6 && (feather - 0.2).abs() < 1e-6
+        ));
+
+        let mut null_node = NodeKind::Null3D {
+            pos: [0.0; 3],
+            rot_deg: [0.0; 3],
+            scale: [1.0; 3],
+            pivot: [0.0; 3],
+            parent: None,
+        };
+        for (p, v) in [
+            ("pos_x", 1.0),
+            ("pos_y", 2.0),
+            ("pos_z", 3.0),
+            ("rot_x", 10.0),
+            ("rot_y", 20.0),
+            ("rot_z", 30.0),
+            ("scale_x", 2.0),
+            ("scale_y", 3.0),
+            ("scale_z", 4.0),
+            ("pivot_x", -0.5),
+            ("pivot_y", 0.25),
+            ("pivot_z", 0.75),
+        ] {
+            apply_animated_parameter(&mut null_node, p, v);
+        }
+        assert!(matches!(
+            null_node,
+            NodeKind::Null3D {
+                pos,
+                rot_deg,
+                scale,
+                pivot,
+                ..
+            } if pos == [1.0, 2.0, 3.0]
+                && rot_deg == [10.0, 20.0, 30.0]
+                && scale == [2.0, 3.0, 4.0]
+                && pivot == [-0.5, 0.25, 0.75]
+        ));
+
+        let mut x3d = NodeKind::Transform3D {
+            pos: [0.0; 3],
+            rot_deg: [0.0; 3],
+            scale: [1.0; 3],
+            fov_deg: 50.0,
+            camera_pos: [0.0, 0.0, 3.0],
+            camera_rot_deg: [0.0; 3],
+            dof_focal_dist: 3.0,
+            dof_blur_strength: 0.0,
+            mirror_edges: false,
+            parent: None,
+            pivot: [0.0; 3],
+        };
+        apply_animated_parameter(&mut x3d, "pivot_x", 0.4);
+        apply_animated_parameter(&mut x3d, "pivot_y", -0.2);
+        apply_animated_parameter(&mut x3d, "pivot_z", 0.1);
+        assert!(matches!(
+            x3d,
+            NodeKind::Transform3D { pivot, .. } if pivot == [0.4, -0.2, 0.1]
+        ));
+
+        let mut shutter = NodeKind::MotionBlurShutter {
+            shutter_angle_deg: 180.0,
+            sub_samples: 8,
+            phase: ShutterPhase::Centered,
+            tonemap: false,
+        };
+        apply_animated_parameter(&mut shutter, "shutter_angle_deg", 999.0);
+        assert!(matches!(
+            shutter,
+            NodeKind::MotionBlurShutter {
+                shutter_angle_deg,
+                ..
+            } if (shutter_angle_deg - 720.0).abs() < 1e-6
+        ));
+    }
+
+    #[test]
+    fn null3d_standalone_renders_transparent_zero() {
+        let mut compositor = GpuCompositor::new_headless().expect("headless init");
+        let graph = RenderGraphDef {
+            output_node: NodeId::from("rig"),
+            nodes: vec![GraphNodeDef {
+                id: NodeId::from("rig"),
+                kind: NodeKind::Null3D {
+                    pos: [1.0, 0.5, -0.5],
+                    rot_deg: [0.0, 45.0, 0.0],
+                    scale: [1.0; 3],
+                    pivot: [0.0; 3],
+                    parent: None,
+                },
+                inputs: vec![],
+                enabled: true,
+            }],
+        };
+        let provider = FnFrameProvider(|_: &str, _: Flicks, _: u32, _: u32| {
+            unreachable!("Null3D standalone should not request external frames")
+        });
+        let opts = RenderOptions {
+            tonemap_mode: Some(TonemapMode::None),
+            output_alpha_mode: OutputAlphaMode::Straight,
+            ..Default::default()
+        };
+        let rendered = compositor
+            .render_frame(
+                &graph,
+                Flicks::ZERO,
+                Flicks(FLICKS_PER_SECOND / 30),
+                16,
+                16,
+                &provider,
+                &NoopAnimator,
+                &opts,
+            )
+            .expect("standalone Null3D renders cleanly");
+        assert!(rendered.rgba8.iter().all(|&b| b == 0));
     }
 }

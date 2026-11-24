@@ -44,10 +44,11 @@ impl TransformUniform {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct MaskMatteUniform {
-    /// `x` = matte_mode (`0`=Alpha, `1`=Luma Rec.709, `2`=Red), `y` = invert (`0|1`),
-    /// `z` = opaque_black_outside (`0|1`), `w` = reserved.
+    /// `x` = matte_mode (`0`=Alpha, `1`=Luma Rec.709, `2`=Red, `3`=DepthMatte),
+    /// `y` = invert (`0|1`), `z` = opaque_black_outside (`0|1`), `w` = spatial_feather_px bits.
     pub mode_flags: [u32; 4],
-    /// `x` = edge0, `y` = edge1, `z` = mask_opacity `[0..1]`, `w` = reserved.
+    /// `x` = edge0 (or DepthMatte near_depth), `y` = edge1 (or DepthMatte far_depth),
+    /// `z` = mask_opacity `[0..1]`, `w` = choke_px (or DepthMatte feather).
     pub feather_opacity: [f32; 4],
 }
 
@@ -56,6 +57,7 @@ impl MaskMatteUniform {
         let matte_mode = match mode {
             MatteMode::Alpha => 0,
             MatteMode::Luma => 1,
+            MatteMode::Red => 2,
         };
         let (edge0, edge1) = if feather > 0.0 {
             let clamped = feather.clamp(0.0, 1.0);
@@ -73,6 +75,26 @@ impl MaskMatteUniform {
     pub fn with_opaque_black_outside(mut self, opaque_black_outside: bool) -> Self {
         self.mode_flags[2] = u32::from(opaque_black_outside);
         self
+    }
+
+    pub fn with_choke_and_spatial_feather(
+        mut self,
+        choke_px: f32,
+        spatial_feather_px: f32,
+    ) -> Self {
+        let sf = spatial_feather_px.max(0.0);
+        self.mode_flags[3] = if sf > 0.0 { sf.to_bits() } else { 0 };
+        self.feather_opacity[3] = choke_px;
+        self
+    }
+
+    pub fn depth_matte(near_depth: f32, far_depth: f32, feather: f32, invert: bool) -> Self {
+        let near = near_depth.max(0.0);
+        let far = far_depth.max(near);
+        Self {
+            mode_flags: [3, u32::from(invert), 0, 0],
+            feather_opacity: [near, far, 1.0, feather.max(0.0)],
+        }
     }
 }
 
@@ -352,6 +374,63 @@ impl MotionTileShakeUniform {
             flags: [u32::from(mirror_edges), 0, 0, 0],
         }
     }
+
+    /// Sets damped 3D perspective tilt (pitch/yaw radians) and value-noise shake amplitude.
+    /// Defaults to `0.0` (`0u` bits), preserving legacy output identically.
+    pub fn with_tilt_and_noise(
+        mut self,
+        tilt_x_rad: f32,
+        tilt_y_rad: f32,
+        noise_amp: f32,
+    ) -> Self {
+        self.flags[1] = if tilt_x_rad == 0.0 { 0 } else { tilt_x_rad.to_bits() };
+        self.flags[2] = if tilt_y_rad == 0.0 { 0 } else { tilt_y_rad.to_bits() };
+        self.flags[3] = if noise_amp == 0.0 { 0 } else { noise_amp.to_bits() };
+        self
+    }
+}
+
+/// Uniform buffer for `fx_blur_mocurves.wgsl` (32 bytes, 16-byte aligned).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
+pub struct BlurMoCurvesUniform {
+    pub shift_x: f32,
+    pub shift_y: f32,
+    pub z_dist: f32,
+    pub rotate_deg: f32,
+    pub blur_strength: f32,
+    pub samples: u32,
+    pub wrap_mode: u32,
+    pub aspect: f32,
+}
+
+impl BlurMoCurvesUniform {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        shift_x: f32,
+        shift_y: f32,
+        z_dist: f32,
+        rotate_deg: f32,
+        blur_strength: f32,
+        samples: u32,
+        wrap_mode: u32,
+        aspect: f32,
+    ) -> Self {
+        Self {
+            shift_x,
+            shift_y,
+            z_dist,
+            rotate_deg,
+            blur_strength: blur_strength.max(0.0),
+            samples: samples.clamp(1, 32),
+            wrap_mode: wrap_mode.min(2),
+            aspect: if aspect.is_finite() && aspect > 0.0 {
+                aspect
+            } else {
+                1.0
+            },
+        }
+    }
 }
 
 /// Uniform buffer for `fx_anime_impact_frame.wgsl` (48 bytes, 16-byte aligned).
@@ -542,6 +621,12 @@ impl BloomPassUniform {
             mip_norm,
             _pad: 0.0,
         }
+    }
+
+    /// Enables inverse-square mip & kernel falloff (`0.0` = legacy Jimenez tent/scatter, `1.0` = inverse-square).
+    pub fn with_inverse_square_falloff(mut self, strength: f32) -> Self {
+        self._pad = strength.clamp(0.0, 1.0);
+        self
     }
 }
 
@@ -831,7 +916,7 @@ impl CustomWgslUniform {
     }
 }
 
-/// Uniform buffer for `transform3d.wgsl` (112 bytes, 16-byte aligned).
+/// Uniform buffer for `transform3d.wgsl` (128 bytes, 16-byte aligned).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct Transform3DUniform {
@@ -841,6 +926,8 @@ pub struct Transform3DUniform {
     pub dof_params: [f32; 4],
     /// `x` = texel_size_y, `yzw` = reserved.
     pub extra: [f32; 4],
+    /// `x` = mirror_edges (`0` | `1`), `yzw` = reserved.
+    pub flags: [u32; 4],
 }
 
 /// GPU vertex buffer layout for `text3d_mesh.wgsl` (48 bytes per vertex).
@@ -1085,7 +1172,7 @@ impl From<&frameshift_vector::SlugCurveGpu> for GpuSlugCurve {
     }
 }
 
-/// Uniform buffer for `text_slug.wgsl` (128 bytes, 16-byte aligned).
+/// Uniform buffer for `text_slug.wgsl` (160 bytes, 16-byte aligned).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 pub struct SlugUniform {
@@ -1100,6 +1187,10 @@ pub struct SlugUniform {
     pub timing_seconds: [f32; 4],
     /// x/y = initial position in canvas-height units, z = initial scale, w = initial opacity.
     pub from_style: [f32; 4],
+    /// x = rotation_deg_from, y = tracking_px_from, z = ease_high, w = ease_low.
+    pub anim_extra: [f32; 4],
+    /// x = shape (`0..=4`), y = has_seed (`0|1`), z = seed32, w = range_count.
+    pub anim_shape: [u32; 4],
 }
 
 /// Uniform buffer for `text2d_fx.wgsl` (112 bytes, 16-byte aligned).
@@ -1132,6 +1223,7 @@ const _: () = {
     assert!(std::mem::size_of::<MotionBlurUniform>() == 32);
     assert!(std::mem::size_of::<Lut3DUniform>() == 48);
     assert!(std::mem::size_of::<MotionTileShakeUniform>() == 48);
+    assert!(std::mem::size_of::<BlurMoCurvesUniform>() == 32);
     assert!(std::mem::size_of::<AnimeImpactFrameUniform>() == 48);
     assert!(std::mem::size_of::<RadialShockwaveUniform>() == 48);
     assert!(std::mem::size_of::<HalftoneGlowUniform>() == 48);
@@ -1142,7 +1234,7 @@ const _: () = {
     assert!(std::mem::size_of::<BackdropScrimUniform>() == 64);
     assert!(std::mem::size_of::<FxaaUniform>() == 16);
     assert!(std::mem::size_of::<CustomWgslUniform>() == 80);
-    assert!(std::mem::size_of::<Transform3DUniform>() == 112);
+    assert!(std::mem::size_of::<Transform3DUniform>() == 128);
     assert!(std::mem::size_of::<GpuMeshVertex3D>() == 48);
     assert!(std::mem::size_of::<Text3DUniform>() == 432);
     assert!(std::mem::size_of::<ParticleField3DUniform>() == 176);
@@ -1153,7 +1245,7 @@ const _: () = {
     assert!(std::mem::size_of::<GpuSlugGlyph>() == 64);
     assert!(std::mem::size_of::<GpuSlugBand>() == 16);
     assert!(std::mem::size_of::<GpuSlugCurve>() == 32);
-    assert!(std::mem::size_of::<SlugUniform>() == 128);
+    assert!(std::mem::size_of::<SlugUniform>() == 160);
     assert!(std::mem::size_of::<Text2DFxUniform>() == 112);
     assert!(std::mem::size_of::<Text2DJfaUniform>() == 16);
 };

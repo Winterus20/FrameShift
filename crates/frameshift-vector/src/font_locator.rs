@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use frameshift_media::{AlphaMode, Rgba16fFrame};
-use frameshift_schema::{TextAlign2D, WritingMode2D};
+use frameshift_schema::{TextAlign2D, TextAnimatorDef, TextSelectorUnit, WritingMode2D};
 use frameshift_time::Flicks;
 use lyon_tessellation::path::iterator::PathIterator;
 use lyon_tessellation::path::{Event, Path as LyonPath};
@@ -14,7 +14,9 @@ use crate::canvas::{
     scale_premul, sd_segment_sq, sdf_coverage, source_over_premul,
 };
 use crate::error::VectorError;
-use crate::shaper::{TextLayoutOptions, VariationAxes, shape_text_block};
+use crate::shaper::{
+    TextLayoutOptions, VariationAxes, evaluate_text_animator_with_total, shape_text_block,
+};
 
 static GLOBAL_FONT_INDEX: OnceLock<SystemFontIndex> = OnceLock::new();
 static FONT_BYTES_CACHE: OnceLock<RwLock<HashMap<PathBuf, Arc<Vec<u8>>>>> = OnceLock::new();
@@ -85,6 +87,7 @@ pub struct TtfTextConfig {
     pub outer_outline_width_norm: f32,
     pub outline_gap_norm: f32,
     pub hdr_intensity: f32,
+    pub text_animator: Option<TextAnimatorDef>,
 }
 
 impl Default for TtfTextConfig {
@@ -112,6 +115,7 @@ impl Default for TtfTextConfig {
             outer_outline_width_norm: 0.0,
             outline_gap_norm: 0.0,
             hdr_intensity: 1.0,
+            text_animator: None,
         }
     }
 }
@@ -346,7 +350,7 @@ pub fn rasterize_ttf_text_rgba16f(
     };
     let (resolved, fallbacks) = resolve_font_chain(&query, &config.fallback_fonts, project_dir)?;
     let mut canvas = VectorCanvas::new(width, height)?;
-    draw_ttf_text_with_fallbacks(&mut canvas, config, &resolved, &fallbacks)?;
+    draw_ttf_text_with_fallbacks_at(&mut canvas, config, &resolved, &fallbacks, pts)?;
     canvas.to_rgba16f_frame(pts, alpha_mode)
 }
 
@@ -406,6 +410,17 @@ pub fn draw_ttf_text_with_fallbacks(
     resolved: &ResolvedFont,
     fallback_fonts: &[ResolvedFont],
 ) -> Result<(), VectorError> {
+    draw_ttf_text_with_fallbacks_at(canvas, config, resolved, fallback_fonts, Flicks::ZERO)
+}
+
+/// Draws multi-line, shaped, variable-capable TTF/OTF text at `tick` (evaluating optional `text_animator`).
+pub fn draw_ttf_text_with_fallbacks_at(
+    canvas: &mut VectorCanvas,
+    config: &TtfTextConfig,
+    resolved: &ResolvedFont,
+    fallback_fonts: &[ResolvedFont],
+    tick: Flicks,
+) -> Result<(), VectorError> {
     validate_ttf_text_config(config)?;
 
     let op = config.opacity.clamp(0.0, 1.0);
@@ -456,7 +471,19 @@ pub fn draw_ttf_text_with_fallbacks(
     struct GlyphOutlines {
         contours: Vec<Vec<[f32; 2]>>,
         bounds: [f32; 4],
+        opacity: f32,
     }
+
+    let anim_total_units = config.text_animator.as_ref().map(|a| match a.unit {
+        TextSelectorUnit::Grapheme => shaped.grapheme_count,
+        TextSelectorUnit::Word => shaped.word_count,
+    });
+    let anim_range_mid = config.text_animator.as_ref().map(|a| {
+        let total = anim_total_units.unwrap_or(1);
+        let end = a.range_end.unwrap_or(total).min(total);
+        let count = end.saturating_sub(a.range_start).max(1);
+        (a.range_start, end, 0.5 * ((count - 1) as f32))
+    });
 
     let mut glyphs: Vec<GlyphOutlines> = Vec::with_capacity(shaped.glyphs.len());
     let mut total_min_x = f32::INFINITY;
@@ -465,8 +492,20 @@ pub fn draw_ttf_text_with_fallbacks(
     let mut total_max_y = f32::NEG_INFINITY;
 
     for sg in &shaped.glyphs {
+        let anim_state = evaluate_text_animator_with_total(
+            config.text_animator.as_ref(),
+            (sg.grapheme_start, sg.grapheme_end),
+            (sg.word_start, sg.word_end),
+            anim_total_units,
+            tick,
+        );
+        let glyph_op = anim_state.opacity.clamp(0.0, 1.0);
+        if glyph_op <= 1e-4 || anim_state.scale <= 1e-4 {
+            continue;
+        }
+
         let raw_contours = flatten_closed_contours(&sg.lyon_path, flatten_tol);
-        let contours: Vec<Vec<[f32; 2]>> = raw_contours
+        let mut contours: Vec<Vec<[f32; 2]>> = raw_contours
             .into_iter()
             .map(|c| {
                 c.into_iter()
@@ -474,6 +513,42 @@ pub fn draw_ttf_text_with_fallbacks(
                     .collect()
             })
             .collect();
+
+        if let Some(anim) = config.text_animator.as_ref()
+            && let Some(raw_bounds) = contour_list_bounds(&contours)
+        {
+            let cx = 0.5 * (raw_bounds[0] + raw_bounds[2]);
+            let cy = 0.5 * (raw_bounds[1] + raw_bounds[3]);
+            let mut tracking_shift_px = 0.0_f32;
+            if let Some((r_start, r_end, mid_off)) = anim_range_mid {
+                let (u_start, u_end) = match anim.unit {
+                    TextSelectorUnit::Grapheme => (sg.grapheme_start, sg.grapheme_end),
+                    TextSelectorUnit::Word => (sg.word_start, sg.word_end),
+                };
+                if u_end > u_start && u_end > r_start && u_start < r_end {
+                    let sel = u_start.max(r_start);
+                    let rel = (sel - r_start) as f32 - mid_off;
+                    tracking_shift_px = rel * anim_state.tracking_em * font_px;
+                }
+            }
+            let shift_x = anim_state.position_norm[0] * h_f + tracking_shift_px;
+            let shift_y = anim_state.position_norm[1] * h_f;
+            let sc = anim_state.scale;
+            let rot = anim_state.rotation_deg.to_radians();
+            let (sin_r, cos_r) = rot.sin_cos();
+            for contour in &mut contours {
+                for pt in contour {
+                    let lx = (pt[0] - cx) * sc;
+                    let ly = (pt[1] - cy) * sc;
+                    // Rotation in Y-down screen coordinates matches Y-up CCW(-deg) sign
+                    let rx = lx * cos_r + ly * sin_r;
+                    let ry = -lx * sin_r + ly * cos_r;
+                    pt[0] = cx + rx + shift_x;
+                    pt[1] = cy + ry + shift_y;
+                }
+            }
+        }
+
         let Some(bounds) = contour_list_bounds(&contours) else {
             continue;
         };
@@ -481,7 +556,11 @@ pub fn draw_ttf_text_with_fallbacks(
         total_min_y = total_min_y.min(bounds[1]);
         total_max_x = total_max_x.max(bounds[2]);
         total_max_y = total_max_y.max(bounds[3]);
-        glyphs.push(GlyphOutlines { contours, bounds });
+        glyphs.push(GlyphOutlines {
+            contours,
+            bounds,
+            opacity: glyph_op,
+        });
     }
 
     if glyphs.is_empty() || !total_min_x.is_finite() {
@@ -535,6 +614,12 @@ pub fn draw_ttf_text_with_fallbacks(
     let rw = (rx1 - rx0 + 1) as usize;
     let rh = (ry1 - ry0 + 1) as usize;
     let mut fill_cov_buf = vec![0.0_f32; rw * rh];
+    let has_animator = config.text_animator.is_some();
+    let mut glyph_op_buf = if has_animator {
+        vec![0.0_f32; rw * rh]
+    } else {
+        Vec::new()
+    };
     let need_dist = has_outline || has_outer_outline;
     let mut min_dist_buf = if need_dist {
         vec![max_stroke_reach + 2.0; rw * rh]
@@ -567,6 +652,17 @@ pub fn draw_ttf_text_with_fallbacks(
                     rw,
                     &mut fill_cov_buf[start_off..],
                 );
+                if has_animator {
+                    for py in cy0..=cy1 {
+                        let row_off = ((py - ry0) as usize) * rw;
+                        for px in cx0..=cx1 {
+                            let idx = row_off + ((px - rx0) as usize);
+                            if fill_cov_buf[idx] > 0.0 {
+                                glyph_op_buf[idx] = glyph_op_buf[idx].max(glyph.opacity);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -602,6 +698,9 @@ pub fn draw_ttf_text_with_fallbacks(
                     let idx = row_off + ((px - rx0) as usize);
                     if fill_cov_buf[idx] >= 1.0 {
                         min_dist_buf[idx] = 0.0;
+                        if has_animator {
+                            glyph_op_buf[idx] = glyph_op_buf[idx].max(glyph.opacity);
+                        }
                         continue;
                     }
                     let p_x = px as f32 + 0.5;
@@ -622,6 +721,9 @@ pub fn draw_ttf_text_with_fallbacks(
                     let dist = min_dist_sq.sqrt();
                     if dist < min_dist_buf[idx] {
                         min_dist_buf[idx] = dist;
+                        if has_animator {
+                            glyph_op_buf[idx] = glyph_op_buf[idx].max(glyph.opacity);
+                        }
                     }
                 }
             }
@@ -678,6 +780,15 @@ pub fn draw_ttf_text_with_fallbacks(
             }
             if has_fill && fcov > 0.0 {
                 acc = source_over_premul(acc, scale_premul(fill_premul, fcov));
+            }
+            if has_animator {
+                let g_op = glyph_op_buf[idx];
+                if g_op <= 0.0 {
+                    continue;
+                }
+                if (g_op - 1.0).abs() > 0.0 {
+                    acc = scale_premul(acc, g_op);
+                }
             }
             if apply_opacity {
                 acc = scale_premul(acc, op);

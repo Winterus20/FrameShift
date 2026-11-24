@@ -3,15 +3,24 @@ use frameshift_app::{
     AgentActor, AgentEditReceipt, AppError, NewReviewNote, PreviewArtifactState, ReviewNoteStore,
     ReviewNoteView, TickRange, apply_agent_command,
 };
-use frameshift_core::{Engine, InspectionPackManifest, MediaResolver, VideoRenderSummary};
-use frameshift_media::AudioAnalysisReport;
+use frameshift_core::workbench::{
+    PreflightReport, builtin_effect_chain_presets, effect_presets, find_effect_chain_preset,
+    preflight, splice_effect_chain_preset,
+};
+use frameshift_core::{
+    AutocutParams, Engine, InspectionPackManifest, MediaResolver, RenderOptions,
+    VideoRenderSummary, plan_autocut,
+};
+use frameshift_media::{AudioAnalysisReport, ExportEncodingProfile};
+use frameshift_schema::template::{EffectChainPreset, TemplateSlotValue};
 use frameshift_schema::{
-    CURRENT_SCHEMA_VERSION, NodeKind, PreferenceEntry, PreferenceScope, Project, ProjectCommand,
-    ProjectSession, RenderProfileKind, SchemaError, SchemaVersion,
+    CURRENT_SCHEMA_VERSION, NodeId, NodeKind, PreferenceEntry, PreferenceScope, Project,
+    ProjectCommand, ProjectSession, RenderProfileKind, SchemaError, SchemaVersion,
 };
 use frameshift_time::{FLICKS_PER_SECOND, Flicks};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -88,6 +97,64 @@ pub enum RenderProjectResult {
         revision_id: u64,
         summary: VideoRenderSummary,
     },
+}
+
+/// Output of `undo` and `redo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoRedoResult {
+    pub operation: String,
+    pub before_revision_id: u64,
+    pub revision_id: u64,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub undo_len: usize,
+    pub redo_len: usize,
+    pub project_name: String,
+}
+
+/// Output of `plan_autocut`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanAutocutResult {
+    pub start_tick: Flicks,
+    pub duration_ticks: Flicks,
+    pub min_segment_ticks: Flicks,
+    pub include_start: bool,
+    pub include_end: bool,
+    pub detected_beats_count: usize,
+    pub boundaries: Vec<Flicks>,
+    pub segment_count: usize,
+}
+
+/// Optional parameters for [`McpServer::plan_autocut`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanAutocutOptions {
+    pub asset_id: Option<String>,
+    pub window_ticks: Option<Flicks>,
+    pub start_tick: Option<Flicks>,
+    pub duration_ticks: Option<Flicks>,
+    pub min_segment_ticks: Option<Flicks>,
+    pub include_start: bool,
+    pub include_end: bool,
+}
+
+/// Request payload for [`McpServer::apply_effect_preset`].
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ApplyEffectPresetRequest {
+    pub expected_revision_id: u64,
+    #[serde(default)]
+    pub preset_id: Option<String>,
+    #[serde(default)]
+    pub preset: Option<EffectChainPreset>,
+    #[serde(default)]
+    pub target_node_id: Option<String>,
+    #[serde(default)]
+    pub node_id_prefix: Option<String>,
+    #[serde(default)]
+    pub slot_values: Option<BTreeMap<String, TemplateSlotValue>>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub intent: Option<String>,
 }
 
 /// Stateful JSON-RPC 2.0 MCP Server wrapping a [`ProjectSession`] and lazy [`Engine`].
@@ -232,15 +299,101 @@ impl McpServer {
                 }),
             },
             McpToolDescriptor {
+                name: "undo".into(),
+                description: "Undoes the most recent committed project command while advancing revision_id monotonically.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "expected_revision_id": { "type": "integer" }
+                    }
+                }),
+            },
+            McpToolDescriptor {
+                name: "redo".into(),
+                description: "Reapplies the most recently undone project command while advancing revision_id monotonically.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "expected_revision_id": { "type": "integer" }
+                    }
+                }),
+            },
+            McpToolDescriptor {
+                name: "preflight_project".into(),
+                description: "Runs schema validation, media asset checks, LUT path checks, and optional tool availability checks.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "check_tools": { "type": "boolean" },
+                        "expected_revision_id": { "type": "integer" }
+                    }
+                }),
+            },
+            McpToolDescriptor {
+                name: "plan_autocut".into(),
+                description: "Plans beat-aligned cut boundaries over an explicit timeline window using project audio analysis.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "asset_id": { "type": "string" },
+                        "window_ticks": { "type": "integer" },
+                        "start_tick": { "type": "integer" },
+                        "duration_ticks": { "type": "integer" },
+                        "min_segment_ticks": { "type": "integer" },
+                        "include_start": { "type": "boolean" },
+                        "include_end": { "type": "boolean" }
+                    }
+                }),
+            },
+            McpToolDescriptor {
+                name: "list_effect_presets".into(),
+                description: "Lists single-node effect presets and multi-node anime/AMV effect chain presets with typed slots.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "category": { "type": "string" }
+                    }
+                }),
+            },
+            McpToolDescriptor {
+                name: "apply_effect_preset".into(),
+                description: "Validates and splices a built-in or inline EffectChainPreset into the render graph with typed slot values and optimistic locking.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "required": ["expected_revision_id"],
+                    "properties": {
+                        "expected_revision_id": { "type": "integer" },
+                        "preset_id": { "type": "string" },
+                        "preset": { "type": "object" },
+                        "target_node_id": { "type": "string" },
+                        "node_id_prefix": { "type": "string" },
+                        "slot_values": { "type": "object" },
+                        "agent_id": { "type": "string" },
+                        "intent": { "type": "string" }
+                    }
+                }),
+            },
+            McpToolDescriptor {
                 name: "render_project".into(),
-                description: "Renders either a single PNG frame at tick or a full timeline MP4 video.".into(),
+                description: "Renders either a single PNG frame at tick or a full timeline video (optionally with a named platform encoding preset).".into(),
                 input_schema: json!({
                     "type": "object",
                     "required": ["profile", "out_path"],
                     "properties": {
                         "profile": { "type": "string", "enum": ["draft", "final"] },
                         "out_path": { "type": "string" },
-                        "tick": { "type": "integer" }
+                        "tick": { "type": "integer" },
+                        "platform_preset": {
+                            "type": "string",
+                            "enum": [
+                                "tiktok_1080p60",
+                                "reels_1080p30",
+                                "youtube_1080p60",
+                                "anime_10bit_hevc",
+                                "prores_422hq"
+                            ]
+                        },
+                        "expected_revision_id": { "type": "integer" }
                     }
                 }),
             },
@@ -483,6 +636,149 @@ impl McpServer {
         }
     }
 
+    fn check_expected_revision(&self, expected_revision_id: Option<u64>) -> Result<u64, McpError> {
+        let actual = self.session.revision_id();
+        if let Some(expected) = expected_revision_id
+            && expected != actual
+        {
+            return Err(McpError::RevisionConflict { expected, actual });
+        }
+        Ok(actual)
+    }
+
+    fn apply_undo_or_redo(
+        &mut self,
+        is_undo: bool,
+        expected_revision_id: Option<u64>,
+    ) -> Result<UndoRedoResult, McpError> {
+        let before_rev = self.check_expected_revision(expected_revision_id)?;
+        let (operation, next_rev) = if is_undo {
+            ("undo", self.session.undo(before_rev)?)
+        } else {
+            ("redo", self.session.redo(before_rev)?)
+        };
+        Ok(UndoRedoResult {
+            operation: operation.to_owned(),
+            before_revision_id: before_rev,
+            revision_id: next_rev,
+            can_undo: self.session.can_undo(),
+            can_redo: self.session.can_redo(),
+            undo_len: self.session.undo_len(),
+            redo_len: self.session.redo_len(),
+            project_name: self.session.project().name.clone(),
+        })
+    }
+
+    /// Undoes the most recent committed project command.
+    pub fn undo(&mut self, expected_revision_id: Option<u64>) -> Result<UndoRedoResult, McpError> {
+        self.apply_undo_or_redo(true, expected_revision_id)
+    }
+
+    /// Reapplies the most recently undone project command.
+    pub fn redo(&mut self, expected_revision_id: Option<u64>) -> Result<UndoRedoResult, McpError> {
+        self.apply_undo_or_redo(false, expected_revision_id)
+    }
+
+    /// Runs schema, asset, LUT, and optional tool preflight checks against the active project.
+    pub fn preflight_project(
+        &self,
+        check_tools: bool,
+        expected_revision_id: Option<u64>,
+    ) -> Result<PreflightReport, McpError> {
+        self.check_expected_revision(expected_revision_id)?;
+        Ok(preflight(self.session.project(), check_tools))
+    }
+
+    /// Plans beat-aligned cut boundaries over an explicit timeline window.
+    pub fn plan_autocut(
+        &self,
+        options: PlanAutocutOptions,
+    ) -> Result<PlanAutocutResult, McpError> {
+        let report = self.analyze_audio(options.asset_id.as_deref(), options.window_ticks)?;
+        let start_tick = options.start_tick.unwrap_or(Flicks::ZERO);
+        let duration_ticks = options.duration_ticks.unwrap_or_else(|| {
+            Flicks(
+                self.session
+                    .project()
+                    .timeline
+                    .duration_ticks
+                    .0
+                    .saturating_sub(start_tick.0),
+            )
+        });
+        let min_segment_ticks = options.min_segment_ticks.unwrap_or(Flicks::ZERO);
+        let params = AutocutParams {
+            start_tick,
+            duration_ticks,
+            min_segment_ticks,
+            include_start: options.include_start,
+            include_end: options.include_end,
+        };
+        let boundaries = plan_autocut(&report, params)?;
+        Ok(PlanAutocutResult {
+            start_tick,
+            duration_ticks,
+            min_segment_ticks,
+            include_start: options.include_start,
+            include_end: options.include_end,
+            detected_beats_count: report.detected_beats.len(),
+            segment_count: boundaries.len().saturating_sub(1),
+            boundaries,
+        })
+    }
+
+    /// Lists single-node presets and built-in multi-node effect chain presets.
+    pub fn list_effect_presets(&self, category: Option<&str>) -> Value {
+        let single_node_presets = effect_presets();
+        let mut chain_presets = builtin_effect_chain_presets();
+        if let Some(cat) = category.map(str::trim).filter(|c| !c.is_empty()) {
+            chain_presets.retain(|preset| preset.category.eq_ignore_ascii_case(cat));
+        }
+        json!({
+            "single_node_presets": single_node_presets,
+            "chain_presets": chain_presets,
+        })
+    }
+
+    /// Validates and splices an [`EffectChainPreset`] into the render graph with optimistic locking.
+    pub fn apply_effect_preset(
+        &mut self,
+        req: ApplyEffectPresetRequest,
+    ) -> Result<MutateProjectResult, McpError> {
+        self.check_expected_revision(Some(req.expected_revision_id))?;
+        let preset = match (req.preset_id.as_deref(), req.preset) {
+            (Some(_), Some(_)) => {
+                return Err(McpError::InvalidParams(
+                    "provide either 'preset_id' or 'preset', not both".into(),
+                ));
+            }
+            (None, None) => {
+                return Err(McpError::InvalidParams(
+                    "either 'preset_id' or 'preset' is required".into(),
+                ));
+            }
+            (Some(preset_id), None) => find_effect_chain_preset(preset_id).ok_or_else(|| {
+                McpError::InvalidParams(format!("unknown effect chain preset '{preset_id}'"))
+            })?,
+            (None, Some(inline)) => inline,
+        };
+
+        let target = req.target_node_id.map(NodeId);
+        let prefix = req.node_id_prefix.unwrap_or_else(|| preset.id.clone());
+        let cmd = splice_effect_chain_preset(
+            self.session.project(),
+            target.as_ref(),
+            &prefix,
+            &preset,
+            req.slot_values.as_ref(),
+        )?;
+        let agent_id = req.agent_id.unwrap_or_else(|| "mcp-agent".into());
+        let intent = req
+            .intent
+            .unwrap_or_else(|| format!("Apply effect chain preset '{}'", preset.id));
+        self.mutate_project_as_agent(req.expected_revision_id, agent_id, intent, cmd)
+    }
+
     /// Renders a single PNG frame (`tick = Some(..)`) or full MP4 (`tick = None`).
     pub fn render_project(
         &mut self,
@@ -490,8 +786,38 @@ impl McpServer {
         out_path: &Path,
         tick: Option<Flicks>,
     ) -> Result<RenderProjectResult, McpError> {
+        self.render_project_with_options(profile, out_path, tick, None, None)
+    }
+
+    /// Renders a frame or video with optional platform encoding preset and optimistic revision lock.
+    pub fn render_project_with_options(
+        &mut self,
+        profile: RenderProfileKind,
+        out_path: &Path,
+        tick: Option<Flicks>,
+        platform_preset: Option<&str>,
+        expected_revision_id: Option<u64>,
+    ) -> Result<RenderProjectResult, McpError> {
+        let rev = self.check_expected_revision(expected_revision_id)?;
+        let encoding_profile = if let Some(preset_name) = platform_preset {
+            if tick.is_some() {
+                return Err(McpError::InvalidParams(
+                    "platform_preset is only supported for video renders (when tick is omitted)"
+                        .into(),
+                ));
+            }
+            Some(
+                ExportEncodingProfile::from_platform_name(preset_name).ok_or_else(|| {
+                    McpError::InvalidParams(format!(
+                        "unknown platform_preset '{preset_name}'; expected one of tiktok_1080p60, reels_1080p30, youtube_1080p60, anime_10bit_hevc, prores_422hq"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+
         let project = self.session.project().clone();
-        let rev = project.revision_id;
         let engine = self.ensure_engine()?;
 
         if let Some(t) = tick {
@@ -512,7 +838,19 @@ impl McpServer {
                 out_path: out_path.to_path_buf(),
             })
         } else {
-            let summary = engine.render_video_mp4(&project, profile, out_path)?;
+            let summary = if let Some(enc) = encoding_profile.as_ref() {
+                engine.render_video_with_profile(
+                    &project,
+                    profile,
+                    out_path,
+                    None,
+                    &RenderOptions::default(),
+                    enc,
+                    &mut |_| {},
+                )?
+            } else {
+                engine.render_video_mp4(&project, profile, out_path)?
+            };
             Ok(RenderProjectResult::Video {
                 revision_id: rev,
                 summary,
@@ -617,9 +955,21 @@ impl McpServer {
                     "isError": false,
                 }))
             }
-            "describe_schema" | "analyze_audio" | "inspect_project" | "mutate_project"
-            | "list_edit_receipts" | "add_review_note" | "list_review_notes"
-            | "query_preferences" | "render_project" => {
+            "describe_schema"
+            | "analyze_audio"
+            | "inspect_project"
+            | "mutate_project"
+            | "list_edit_receipts"
+            | "add_review_note"
+            | "list_review_notes"
+            | "query_preferences"
+            | "undo"
+            | "redo"
+            | "preflight_project"
+            | "plan_autocut"
+            | "list_effect_presets"
+            | "apply_effect_preset"
+            | "render_project" => {
                 self.dispatch_tool(method, params.unwrap_or_else(|| json!({})))
             }
             other => Err(RpcDispatchError::MethodNotFound(other.to_owned())),
@@ -695,11 +1045,70 @@ impl McpServer {
                 let res = self.query_preferences(&p.key, p.scene_id.as_deref());
                 to_json_value(res)
             }
+            "undo" => {
+                let p: RevisionCheckParams = serde_json::from_value(args)
+                    .map_err(|e| RpcDispatchError::InvalidParams(e.to_string()))?;
+                let res = self
+                    .undo(p.expected_revision_id)
+                    .map_err(RpcDispatchError::App)?;
+                to_json_value(res)
+            }
+            "redo" => {
+                let p: RevisionCheckParams = serde_json::from_value(args)
+                    .map_err(|e| RpcDispatchError::InvalidParams(e.to_string()))?;
+                let res = self
+                    .redo(p.expected_revision_id)
+                    .map_err(RpcDispatchError::App)?;
+                to_json_value(res)
+            }
+            "preflight_project" => {
+                let p: PreflightProjectParams = serde_json::from_value(args)
+                    .map_err(|e| RpcDispatchError::InvalidParams(e.to_string()))?;
+                let res = self
+                    .preflight_project(p.check_tools, p.expected_revision_id)
+                    .map_err(RpcDispatchError::App)?;
+                to_json_value(res)
+            }
+            "plan_autocut" => {
+                let p: PlanAutocutParams = serde_json::from_value(args)
+                    .map_err(|e| RpcDispatchError::InvalidParams(e.to_string()))?;
+                let res = self
+                    .plan_autocut(PlanAutocutOptions {
+                        asset_id: p.asset_id,
+                        window_ticks: p.window_ticks.map(Flicks),
+                        start_tick: p.start_tick.map(Flicks),
+                        duration_ticks: p.duration_ticks.map(Flicks),
+                        min_segment_ticks: p.min_segment_ticks.map(Flicks),
+                        include_start: p.include_start,
+                        include_end: p.include_end,
+                    })
+                    .map_err(RpcDispatchError::App)?;
+                to_json_value(res)
+            }
+            "list_effect_presets" => {
+                let p: ListEffectPresetsParams = serde_json::from_value(args)
+                    .map_err(|e| RpcDispatchError::InvalidParams(e.to_string()))?;
+                Ok(self.list_effect_presets(p.category.as_deref()))
+            }
+            "apply_effect_preset" => {
+                let p: ApplyEffectPresetRequest = serde_json::from_value(args)
+                    .map_err(|e| RpcDispatchError::InvalidParams(e.to_string()))?;
+                let res = self
+                    .apply_effect_preset(p)
+                    .map_err(RpcDispatchError::App)?;
+                to_json_value(res)
+            }
             "render_project" => {
                 let p: RenderProjectParams = serde_json::from_value(args)
                     .map_err(|e| RpcDispatchError::InvalidParams(e.to_string()))?;
                 let res = self
-                    .render_project(p.profile, Path::new(&p.out_path), p.tick.map(Flicks))
+                    .render_project_with_options(
+                        p.profile,
+                        Path::new(&p.out_path),
+                        p.tick.map(Flicks),
+                        p.platform_preset.as_deref(),
+                        p.expected_revision_id,
+                    )
                     .map_err(RpcDispatchError::App)?;
                 to_json_value(res)
             }
@@ -800,12 +1209,54 @@ struct QueryPreferencesParams {
     scene_id: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RevisionCheckParams {
+    #[serde(default)]
+    expected_revision_id: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PreflightProjectParams {
+    #[serde(default)]
+    check_tools: bool,
+    #[serde(default)]
+    expected_revision_id: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlanAutocutParams {
+    #[serde(default)]
+    asset_id: Option<String>,
+    #[serde(default)]
+    window_ticks: Option<i64>,
+    #[serde(default)]
+    start_tick: Option<i64>,
+    #[serde(default)]
+    duration_ticks: Option<i64>,
+    #[serde(default)]
+    min_segment_ticks: Option<i64>,
+    #[serde(default)]
+    include_start: bool,
+    #[serde(default)]
+    include_end: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ListEffectPresetsParams {
+    #[serde(default)]
+    category: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RenderProjectParams {
     profile: RenderProfileKind,
     out_path: String,
     #[serde(default)]
     tick: Option<i64>,
+    #[serde(default)]
+    platform_preset: Option<String>,
+    #[serde(default)]
+    expected_revision_id: Option<u64>,
 }
 
 fn map_app_error(error: AppError) -> McpError {
@@ -984,5 +1435,72 @@ mod tests {
             listed["result"]["structuredContent"]["notes"][0]["note"]["body"],
             "Review the new title card"
         );
+    }
+
+    #[test]
+    fn apply_effect_preset_rejects_custom_wgsl_and_undo_checks_stack_and_revision() {
+        let project = Project::golden_scene_preset();
+        let mut server = McpServer::new(project).expect("valid server");
+        let rev = server.revision_id();
+
+        let err = server.undo(Some(rev)).expect_err("empty undo stack must fail");
+        assert!(matches!(err, McpError::Schema(SchemaError::EmptyUndoStack)));
+
+        let err = server
+            .undo(Some(rev + 99))
+            .expect_err("wrong revision must return RevisionConflict");
+        assert!(matches!(err, McpError::RevisionConflict { .. }));
+
+        let wgsl_preset = EffectChainPreset {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            id: "bad_custom".into(),
+            name: "Bad Custom WGSL".into(),
+            category: "custom".into(),
+            nodes: vec![
+                frameshift_schema::GraphNodeDef {
+                    id: NodeId::from("in_0"),
+                    kind: NodeKind::PrecompInput { slot: 0 },
+                    inputs: Vec::new(),
+                    enabled: true,
+                },
+                frameshift_schema::GraphNodeDef {
+                    id: NodeId::from("wgsl"),
+                    kind: NodeKind::CustomWgsl {
+                        wgsl_source: "// custom".into(),
+                        expected_inputs: 1,
+                        params: [0.0; 16],
+                    },
+                    inputs: vec![NodeId::from("in_0")],
+                    enabled: true,
+                },
+            ],
+            param_bindings: Vec::new(),
+            slots: Vec::new(),
+            review: frameshift_schema::template::TemplateReview::default(),
+        };
+        let wgsl_err = server
+            .apply_effect_preset(ApplyEffectPresetRequest {
+                expected_revision_id: rev,
+                preset_id: None,
+                preset: Some(wgsl_preset),
+                target_node_id: None,
+                node_id_prefix: None,
+                slot_values: None,
+                agent_id: None,
+                intent: None,
+            })
+            .expect_err("CustomWgsl in EffectChainPreset must be rejected");
+        assert!(wgsl_err.to_string().contains("CustomWgsl") || wgsl_err.to_string().contains("shader"));
+
+        let render_err = server
+            .render_project_with_options(
+                RenderProfileKind::Draft,
+                Path::new("frame.png"),
+                Some(Flicks::ZERO),
+                Some("tiktok_1080p60"),
+                Some(rev),
+            )
+            .expect_err("platform_preset with tick=Some must be rejected");
+        assert!(matches!(render_err, McpError::InvalidParams(_)));
     }
 }

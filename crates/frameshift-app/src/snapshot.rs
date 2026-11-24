@@ -2,6 +2,7 @@ use crate::controller::WorkspaceUiController;
 use frameshift_media::{AlphaMode, Rgba8Frame};
 use frameshift_schema::{
     AssetKind, GraphNodeDef, HwAccelPolicy, NodeKind, PreferenceScope, RenderProfileKind,
+    TemplateSlotKind,
 };
 use frameshift_time::{FLICKS_PER_SECOND, Flicks};
 
@@ -584,6 +585,10 @@ pub fn render_desktop_ui_snapshot(
                 BG_SUBSURFACE
             },
         );
+        canvas.fill_rect(
+            Rect::new(row_r.x + 1, row_r.y + 1, 2, (row_r.h - 2).max(1)),
+            node_kind_accent(&node.kind),
+        );
         if is_selected {
             canvas.stroke_rect(row_r, 1, ACCENT_CYAN);
         }
@@ -990,7 +995,8 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
 }
 
-fn node_kind_label(kind: &NodeKind) -> &'static str {
+/// Returns a concise display label for a [`NodeKind`] in UI inspectors and snapshots.
+pub fn node_kind_label(kind: &NodeKind) -> &'static str {
     match kind {
         NodeKind::SourceVideo { .. } => "SourceVideo",
         NodeKind::SourceImage { .. } => "SourceImage",
@@ -1023,6 +1029,80 @@ fn node_kind_label(kind: &NodeKind) -> &'static str {
         NodeKind::BackdropScrim { .. } => "BackdropScrim",
         NodeKind::Precomp { .. } => "Precomp",
         NodeKind::PrecompInput { .. } => "PrecompInput",
+        NodeKind::AdjustmentLayer { .. } => "AdjustmentLayer",
+        NodeKind::BlurMoCurves { .. } => "BlurMoCurves",
+        NodeKind::Null3D { .. } => "Null3D",
+        NodeKind::DepthMatte { .. } => "DepthMatte",
+    }
+}
+
+/// Returns the category accent RGBA color for a [`NodeKind`] in UI node graphs and snapshots.
+pub fn node_kind_accent(kind: &NodeKind) -> [u8; 4] {
+    match kind {
+        NodeKind::SourceVideo { .. }
+        | NodeKind::SourceImage { .. }
+        | NodeKind::Solid { .. }
+        | NodeKind::VectorText { .. }
+        | NodeKind::VectorPathHud { .. }
+        | NodeKind::PrecompInput { .. } => ACCENT_GREEN,
+        NodeKind::Transform2D { .. }
+        | NodeKind::CornerPin { .. }
+        | NodeKind::GridWarp { .. }
+        | NodeKind::Precomp { .. } => ACCENT_BLUE,
+        NodeKind::MaskMatte { .. }
+        | NodeKind::Blend { .. }
+        | NodeKind::AdjustmentLayer { .. }
+        | NodeKind::DepthMatte { .. }
+        | NodeKind::BackdropScrim { .. } => ACCENT_YELLOW,
+        NodeKind::ShaderTransition { .. } => ACCENT_PINK,
+        NodeKind::Transform3D { .. }
+        | NodeKind::Null3D { .. }
+        | NodeKind::Text3D { .. }
+        | NodeKind::ParticleField3D { .. }
+        | NodeKind::RibbonTrail3D { .. }
+        | NodeKind::Shape3D { .. }
+        | NodeKind::Scene3D { .. } => ACCENT_PURPLE,
+        NodeKind::ColorBasic { .. }
+        | NodeKind::Lut3D { .. }
+        | NodeKind::MotionBlurShutter { .. }
+        | NodeKind::MotionTileShake { .. }
+        | NodeKind::AnimeImpactFrame { .. }
+        | NodeKind::RadialShockwave { .. }
+        | NodeKind::HalftoneGlow { .. }
+        | NodeKind::DeepGlow { .. }
+        | NodeKind::AnimeSharpen { .. }
+        | NodeKind::FilmOptics { .. }
+        | NodeKind::BlurMoCurves { .. } => ACCENT_CYAN,
+        NodeKind::CustomWgsl { .. } => ACCENT_RED,
+    }
+}
+
+/// Returns a display label for a [`TemplateSlotKind`] in UI/inspector surfaces.
+pub fn template_slot_kind_label(kind: TemplateSlotKind) -> &'static str {
+    match kind {
+        TemplateSlotKind::AssetPath(AssetKind::Video) => "VideoAsset",
+        TemplateSlotKind::AssetPath(AssetKind::Audio) => "AudioAsset",
+        TemplateSlotKind::AssetPath(AssetKind::Image) => "ImageAsset",
+        TemplateSlotKind::Text => "Text",
+        TemplateSlotKind::Tick => "Tick",
+        TemplateSlotKind::Number => "Number",
+        TemplateSlotKind::Boolean => "Boolean",
+        TemplateSlotKind::Color => "Color",
+        TemplateSlotKind::Choice => "Choice",
+        TemplateSlotKind::SpeedCurve => "SpeedCurve",
+        TemplateSlotKind::Font => "Font",
+    }
+}
+
+/// Returns the UI accent color associated with a [`TemplateSlotKind`].
+pub fn template_slot_kind_accent(kind: TemplateSlotKind) -> [u8; 4] {
+    match kind {
+        TemplateSlotKind::AssetPath(_) => ACCENT_GREEN,
+        TemplateSlotKind::Text | TemplateSlotKind::Font => ACCENT_CYAN,
+        TemplateSlotKind::Tick | TemplateSlotKind::SpeedCurve => ACCENT_PINK,
+        TemplateSlotKind::Number | TemplateSlotKind::Boolean => ACCENT_BLUE,
+        TemplateSlotKind::Color => ACCENT_YELLOW,
+        TemplateSlotKind::Choice => ACCENT_PURPLE,
     }
 }
 
@@ -1303,6 +1383,59 @@ fn describe_node_params(node: &GraphNodeDef) -> String {
         NodeKind::PrecompInput { slot } => {
             format!("slot={slot}")
         }
+        NodeKind::AdjustmentLayer {
+            start_tick,
+            end_tick,
+            opacity,
+            blend_mode,
+        } => {
+            format!(
+                "[{}..{}] mode={blend_mode:?} op={opacity:.2}",
+                start_tick.0, end_tick.0
+            )
+        }
+        NodeKind::BlurMoCurves {
+            shift_x,
+            shift_y,
+            z_dist,
+            rotate_deg,
+            blur_strength,
+            samples,
+            wrap_mode,
+        } => {
+            format!(
+                "s=[{shift_x:.2},{shift_y:.2}] z={z_dist:.2} rot={rotate_deg:.1} str={blur_strength:.2} n={samples} w={wrap_mode}"
+            )
+        }
+        NodeKind::Null3D {
+            pos,
+            rot_deg,
+            scale,
+            parent,
+            ..
+        } => {
+            format!(
+                "pos=[{:.2},{:.2},{:.2}] rot=[{:.0},{:.0},{:.0}] s=[{:.2},{:.2},{:.2}] p={}",
+                pos[0],
+                pos[1],
+                pos[2],
+                rot_deg[0],
+                rot_deg[1],
+                rot_deg[2],
+                scale[0],
+                scale[1],
+                scale[2],
+                parent.as_ref().map_or("-", |id| id.0.as_str())
+            )
+        }
+        NodeKind::DepthMatte {
+            near_depth,
+            far_depth,
+            feather,
+            invert,
+        } => {
+            format!("near={near_depth:.2} far={far_depth:.2} feather={feather:.2} inv={invert}")
+        }
     }
 }
 
@@ -1575,5 +1708,101 @@ mod tests {
         let snap_640 = render_desktop_ui_snapshot(&ctrl, &vp, 640, 360);
         assert_eq!(snap_640.width, 640);
         assert_eq!(snap_640.height, 360);
+    }
+
+    #[test]
+    fn node_and_template_slot_kind_metadata_cover_new_variants() {
+        use frameshift_schema::{BlendMode, TemplateSlotKind};
+
+        let adj = GraphNodeDef {
+            id: NodeId("adj".into()),
+            kind: NodeKind::AdjustmentLayer {
+                start_tick: Flicks(0),
+                end_tick: Flicks(FLICKS_PER_SECOND),
+                opacity: 0.75,
+                blend_mode: BlendMode::Overlay,
+            },
+            inputs: vec![NodeId("motion_blur_out".into())],
+            enabled: true,
+        };
+        let blur = GraphNodeDef {
+            id: NodeId("mocurves".into()),
+            kind: NodeKind::BlurMoCurves {
+                shift_x: 0.05,
+                shift_y: -0.02,
+                z_dist: 0.1,
+                rotate_deg: 5.0,
+                blur_strength: 1.0,
+                samples: 16,
+                wrap_mode: 2,
+            },
+            inputs: vec![NodeId("adj".into())],
+            enabled: true,
+        };
+        let null = GraphNodeDef {
+            id: NodeId("cam_rig".into()),
+            kind: NodeKind::Null3D {
+                pos: [0.0, 0.2, 0.0],
+                rot_deg: [0.0, 15.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+                pivot: [0.0, 0.0, 0.0],
+                parent: None,
+            },
+            inputs: vec![],
+            enabled: true,
+        };
+        let depth = GraphNodeDef {
+            id: NodeId("dmatte".into()),
+            kind: NodeKind::DepthMatte {
+                near_depth: 0.1,
+                far_depth: 0.9,
+                feather: 0.05,
+                invert: true,
+            },
+            inputs: vec![NodeId("mocurves".into()), NodeId("mocurves".into())],
+            enabled: true,
+        };
+
+        assert_eq!(node_kind_label(&adj.kind), "AdjustmentLayer");
+        assert_eq!(node_kind_label(&blur.kind), "BlurMoCurves");
+        assert_eq!(node_kind_label(&null.kind), "Null3D");
+        assert_eq!(node_kind_label(&depth.kind), "DepthMatte");
+
+        assert_eq!(node_kind_accent(&adj.kind), ACCENT_YELLOW);
+        assert_eq!(node_kind_accent(&blur.kind), ACCENT_CYAN);
+        assert_eq!(node_kind_accent(&null.kind), ACCENT_PURPLE);
+        assert_eq!(node_kind_accent(&depth.kind), ACCENT_YELLOW);
+
+        assert!(describe_node_params(&adj).contains("Overlay"));
+        assert!(describe_node_params(&blur).contains("n=16"));
+        assert!(describe_node_params(&null).contains("rot=[0,15,0]"));
+        assert!(describe_node_params(&depth).contains("inv=true"));
+
+        for (kind, expected_label) in [
+            (TemplateSlotKind::AssetPath(AssetKind::Video), "VideoAsset"),
+            (TemplateSlotKind::AssetPath(AssetKind::Audio), "AudioAsset"),
+            (TemplateSlotKind::AssetPath(AssetKind::Image), "ImageAsset"),
+            (TemplateSlotKind::Text, "Text"),
+            (TemplateSlotKind::Tick, "Tick"),
+            (TemplateSlotKind::Number, "Number"),
+            (TemplateSlotKind::Boolean, "Boolean"),
+            (TemplateSlotKind::Color, "Color"),
+            (TemplateSlotKind::Choice, "Choice"),
+            (TemplateSlotKind::SpeedCurve, "SpeedCurve"),
+            (TemplateSlotKind::Font, "Font"),
+        ] {
+            assert_eq!(template_slot_kind_label(kind), expected_label);
+            assert_eq!(template_slot_kind_accent(kind)[3], 255);
+        }
+
+        let mut project = Project::golden_scene_preset();
+        project.graph.nodes.extend([adj, blur, null, depth]);
+        project.graph.output_node = NodeId("dmatte".into());
+        let ctrl = WorkspaceUiController::from_project(project).unwrap();
+        let vp = Rgba8Frame::filled(64, 36, Flicks::ZERO, [10, 20, 30, 255], AlphaMode::Straight)
+            .unwrap();
+        let snap = render_desktop_ui_snapshot(&ctrl, &vp, 1280, 720);
+        assert_eq!(snap.width, 1280);
+        assert_eq!(snap.height, 720);
     }
 }

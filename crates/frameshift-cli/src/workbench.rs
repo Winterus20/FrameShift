@@ -11,7 +11,7 @@ use frameshift_core::export::{ExportJobState, ExportQueue, ExportTarget};
 use frameshift_core::workbench::{
     PreflightReport, apply_effect, effect_presets, impact_cut_project, inspect_effect, preflight,
 };
-use frameshift_media::{FfmpegBridge, ProxyManager, ProxySpec};
+use frameshift_media::{ExportEncodingProfile, FfmpegBridge, ProxyManager, ProxySpec};
 use frameshift_schema::portable::{ProjectMediaManifest, relink_missing_media_with_hash};
 use frameshift_schema::template::{
     TEMPLATE_PACKAGE_VERSION, TemplatePackage, TemplateReview, TemplateSlot, TemplateSlotKind,
@@ -76,7 +76,7 @@ pub fn print_usage() {
          \tframeshift-cli media-manifest <project.json>\n\
          \tframeshift-cli media-relink <project.json> <search-root> <revision> --out <project.json> [<manifest.json>]\n\
          \tframeshift-cli retarget <project.json> <event-id> <time> <revision> --out <project.json>\n\
-         \tframeshift-cli export <project.json> <out.mp4> [--profile draft|final] [--range <start>..<end>]\n\
+         \tframeshift-cli export <project.json> <out.mp4|out.mov> [--profile draft|final] [--range <start>..<end>] [--platform <tiktok_1080p60|reels_1080p30|youtube_1080p60|anime_10bit_hevc|prores_422hq>]\n\
          \tframeshift-cli export-set <project.json> <targets.json> --manifest <export.json> [--retry]"
     );
 }
@@ -329,7 +329,10 @@ fn proxy_preview(args: &[String]) -> Result<()> {
 
 fn asset_is_matte_input(graph: &RenderGraphDef, asset_id: &str) -> bool {
     for node in &graph.nodes {
-        if matches!(&node.kind, NodeKind::MaskMatte { .. })
+        if matches!(
+            &node.kind,
+            NodeKind::MaskMatte { .. } | NodeKind::DepthMatte { .. }
+        )
             && let Some(matte_input) = node.inputs.get(1)
             && input_uses_asset(graph, matte_input, asset_id, &mut BTreeSet::new())
         {
@@ -688,6 +691,87 @@ fn template_validate(args: &[String]) -> Result<()> {
     }))
 }
 
+fn template_slot_kind_label(kind: TemplateSlotKind) -> &'static str {
+    match kind {
+        TemplateSlotKind::AssetPath(AssetKind::Video) => "video_asset",
+        TemplateSlotKind::AssetPath(AssetKind::Image) => "image_asset",
+        TemplateSlotKind::AssetPath(AssetKind::Audio) => "audio_asset",
+        TemplateSlotKind::Text => "text",
+        TemplateSlotKind::Tick => "tick",
+        TemplateSlotKind::Number => "number",
+        TemplateSlotKind::Boolean => "boolean",
+        TemplateSlotKind::Color => "color",
+        TemplateSlotKind::Choice => "choice",
+        TemplateSlotKind::SpeedCurve => "speed_curve",
+        TemplateSlotKind::Font => "font",
+    }
+}
+
+fn prepare_template_slot_values(
+    package: &TemplatePackage,
+    slots_path: &Path,
+    values: &mut BTreeMap<String, TemplateSlotValue>,
+) -> Result<()> {
+    for (slot_id, value) in values.iter_mut() {
+        let declared_kind = package
+            .slots
+            .iter()
+            .find(|slot| &slot.id == slot_id)
+            .map(|slot| template_slot_kind_label(slot.kind));
+        match value {
+            TemplateSlotValue::AssetPath(path) if !path.starts_with("synthetic://") => {
+                let source = slots_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(&*path);
+                let absolute = source
+                    .canonicalize()
+                    .with_context(|| format!("missing slot asset '{path}'"))?;
+                if !absolute.is_file() {
+                    bail!("slot asset '{}' must be a file", absolute.display());
+                }
+                *path = absolute.to_string_lossy().into_owned();
+            }
+            TemplateSlotValue::AssetPath(_)
+            | TemplateSlotValue::Text(_)
+            | TemplateSlotValue::Tick(_)
+            | TemplateSlotValue::Boolean(_)
+            | TemplateSlotValue::SpeedCurve(_) => {}
+            TemplateSlotValue::Number(num) if !num.is_finite() => {
+                bail!(
+                    "slot '{slot_id}' ({}) requires a finite number",
+                    declared_kind.unwrap_or("number")
+                );
+            }
+            TemplateSlotValue::Number(_) => {}
+            TemplateSlotValue::Color(rgba)
+                if !rgba.iter().all(|c| c.is_finite() && *c >= 0.0) || rgba[3] > 1.0 =>
+            {
+                bail!(
+                    "slot '{slot_id}' ({}) color channels must be finite >= 0.0 with alpha <= 1.0",
+                    declared_kind.unwrap_or("color")
+                );
+            }
+            TemplateSlotValue::Color(_) => {}
+            TemplateSlotValue::Choice(choice) if choice.trim().is_empty() => {
+                bail!(
+                    "slot '{slot_id}' ({}) choice must not be empty",
+                    declared_kind.unwrap_or("choice")
+                );
+            }
+            TemplateSlotValue::Choice(_) => {}
+            TemplateSlotValue::Font(font) if font.trim().is_empty() => {
+                bail!(
+                    "slot '{slot_id}' ({}) font value must not be empty",
+                    declared_kind.unwrap_or("font")
+                );
+            }
+            TemplateSlotValue::Font(_) => {}
+        }
+    }
+    Ok(())
+}
+
 fn template_open(args: &[String]) -> Result<()> {
     let [path, slots, flag, out] = args else {
         bail!("usage: template-open <package.json> <slots.json> --out <project.json>")
@@ -698,23 +782,7 @@ fn template_open(args: &[String]) -> Result<()> {
     let package = frameshift_schema::template::TemplatePackage::load_local(path)?;
     let mut values: BTreeMap<String, TemplateSlotValue> =
         serde_json::from_slice(&std::fs::read(slots)?)?;
-    for value in values.values_mut() {
-        if let TemplateSlotValue::AssetPath(path) = value
-            && !path.starts_with("synthetic://")
-        {
-            let source = Path::new(slots)
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(&*path);
-            let absolute = source
-                .canonicalize()
-                .with_context(|| format!("missing slot asset '{path}'"))?;
-            if !absolute.is_file() {
-                bail!("slot asset '{}' must be a file", absolute.display());
-            }
-            *path = absolute.to_string_lossy().into_owned();
-        }
-    }
+    prepare_template_slot_values(&package, Path::new(slots), &mut values)?;
     let project = package.instantiate(&values)?;
     let report = preflight(&project, false);
     if !report.ok {
@@ -883,33 +951,54 @@ fn ensure_revision(expected: u64, actual: u64) -> Result<()> {
     Ok(())
 }
 
-fn export(args: &[String]) -> Result<()> {
-    let [project_path, out, flags @ ..] = args else {
-        bail!(
-            "usage: export <project.json> <out.mp4> [--profile draft|final] [--range <start>..<end>]"
-        )
-    };
-    let project = load_project(Path::new(project_path))?;
+fn parse_export_target(project: &Project, out: &str, flags: &[String]) -> Result<ExportTarget> {
     let mut target = ExportTarget::new(out, RenderProfileKind::Final);
-    let mut flags = flags.iter();
-    while let Some(flag) = flags.next() {
-        let value = flags
-            .next()
-            .with_context(|| format!("{flag} needs a value"))?;
-        match flag.as_str() {
+    let mut iter = flags.iter();
+    while let Some(flag) = iter.next() {
+        let (name, inline_val) = match flag.split_once('=') {
+            Some((k, v)) => (k, Some(v)),
+            None => (flag.as_str(), None),
+        };
+        let value = match inline_val {
+            Some(v) => v,
+            None => iter
+                .next()
+                .with_context(|| format!("{name} needs a value"))?
+                .as_str(),
+        };
+        match name {
             "--profile" => target.profile = crate::parse_profile(value)?,
             "--range" => {
                 let spec = crate::parse_range_spec(value)?;
                 let fps = project.timeline.fps;
                 target.range = Some(frameshift_core::RenderRange::resolve(
-                    &project,
+                    project,
                     resolve_time_spec(spec.start, fps)?,
                     resolve_time_spec(spec.end, fps)?,
                 )?);
             }
+            "--platform" => {
+                if ExportEncodingProfile::from_platform_name(value).is_none() {
+                    bail!(
+                        "unknown export platform '{value}'; expected one of tiktok_1080p60, reels_1080p30, youtube_1080p60, anime_10bit_hevc, prores_422hq"
+                    );
+                }
+                target.platform_preset = Some(value.to_owned());
+            }
             _ => bail!("unknown export flag {flag}"),
         }
     }
+    Ok(target)
+}
+
+fn export(args: &[String]) -> Result<()> {
+    let [project_path, out, flags @ ..] = args else {
+        bail!(
+            "usage: export <project.json> <out.mp4|out.mov> [--profile draft|final] [--range <start>..<end>] [--platform <tiktok_1080p60|reels_1080p30|youtube_1080p60|anime_10bit_hevc|prores_422hq>]"
+        )
+    };
+    let project = load_project(Path::new(project_path))?;
+    let target = parse_export_target(&project, out, flags)?;
     let manifest = Path::new(out).with_extension("export.json");
     run_export(
         &project,
@@ -967,4 +1056,109 @@ fn run_export(
         bail!("export {} failed; see {}", job.job_id, manifest.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frameshift_schema::{ColorSpace, GraphNodeDef};
+    use frameshift_time::{FLICKS_PER_SECOND, Flicks};
+
+    #[test]
+    fn parse_export_target_supports_platform_profile_and_range() {
+        let project = impact_cut_project();
+        let target = parse_export_target(
+            &project,
+            "out.mov",
+            &[
+                "--profile".into(),
+                "draft".into(),
+                "--range".into(),
+                "0..2s".into(),
+                "--platform".into(),
+                "prores_422hq".into(),
+            ],
+        )
+        .expect("valid export flags should parse");
+        assert_eq!(target.profile, RenderProfileKind::Draft);
+        assert_eq!(target.platform_preset.as_deref(), Some("prores_422hq"));
+        let range = target.range.expect("range should be resolved");
+        assert_eq!(range.start_tick, Flicks::ZERO);
+        assert_eq!(range.end_tick, Flicks(2 * FLICKS_PER_SECOND));
+
+        let inline = parse_export_target(
+            &project,
+            "out.mp4",
+            &["--platform=tiktok_1080p60".into()],
+        )
+        .expect("inline --platform= should parse");
+        assert_eq!(inline.platform_preset.as_deref(), Some("tiktok_1080p60"));
+
+        let err = parse_export_target(
+            &project,
+            "out.mp4",
+            &["--platform".into(), "unknown_target".into()],
+        )
+        .expect_err("unknown platform preset must fail");
+        assert!(err.to_string().contains("unknown export platform"));
+    }
+
+    #[test]
+    fn asset_is_matte_input_detects_mask_and_depth_matte_nodes() {
+        let graph = RenderGraphDef {
+            output_node: NodeId::from("depth_matte"),
+            nodes: vec![
+                GraphNodeDef {
+                    id: NodeId::from("fg"),
+                    kind: NodeKind::SourceVideo {
+                        asset_id: "asset_fg".into(),
+                        clip_id: None,
+                        color_space: ColorSpace::DisplaySrgb,
+                        fit: frameshift_schema::SourceFit::Contain,
+                    },
+                    inputs: Vec::new(),
+                    enabled: true,
+                },
+                GraphNodeDef {
+                    id: NodeId::from("matte_src"),
+                    kind: NodeKind::SourceImage {
+                        asset_id: "asset_depth".into(),
+                        color_space: ColorSpace::DisplaySrgb,
+                        fit: frameshift_schema::SourceFit::Stretch,
+                        opacity: 1.0,
+                    },
+                    inputs: Vec::new(),
+                    enabled: true,
+                },
+                GraphNodeDef {
+                    id: NodeId::from("depth_matte"),
+                    kind: NodeKind::DepthMatte {
+                        near_depth: 0.2,
+                        far_depth: 0.8,
+                        feather: 0.05,
+                        invert: false,
+                    },
+                    inputs: vec![NodeId::from("fg"), NodeId::from("matte_src")],
+                    enabled: true,
+                },
+            ],
+        };
+        assert!(asset_is_matte_input(&graph, "asset_depth"));
+        assert!(!asset_is_matte_input(&graph, "asset_fg"));
+    }
+
+    #[test]
+    fn template_slot_kind_label_covers_new_variants() {
+        assert_eq!(template_slot_kind_label(TemplateSlotKind::Color), "color");
+        assert_eq!(template_slot_kind_label(TemplateSlotKind::Choice), "choice");
+        assert_eq!(
+            template_slot_kind_label(TemplateSlotKind::SpeedCurve),
+            "speed_curve"
+        );
+        assert_eq!(template_slot_kind_label(TemplateSlotKind::Font), "font");
+        assert_eq!(
+            template_slot_kind_label(TemplateSlotKind::AssetPath(AssetKind::Video)),
+            "video_asset"
+        );
+    }
 }

@@ -71,6 +71,9 @@ Bu dosya tüm `brain/` belleğinin hızlı rotasıdır. Oturum başında `state.
 | [research/faz6-6-scene3d-pbr-dof-blend.md](research/faz6-6-scene3d-pbr-dof-blend.md) | Faz 6.6 Part B — 3D PBR Cook-Torrance GGX, Kamera-Bağıl IBL, Scene3D DoF & Blend Modları | `active` | Filament GGX PBR, bevel AO, Z-echo depth ayrımı, separable CoC + poligonal/anamorfik bokeh, algısal Overlay + 5 yeni blend modu |
 | [research/faz6-6-fx-transitions-sdf.md](research/faz6-6-fx-transitions-sdf.md) | Faz 6.6 Part C — Shockwave, 10 Aspect-Correct Geçiş, Halftone & 2-Yönlü JFA SDF | `active` | Sürekli Gauss shockwave, 10 geçiş aspect-ratio + IGN blur + FBM Burn + KIFS Kaleidoscope, CMYK/ColorDot halftone, `Rgba16Float` JFA SDF |
 | [FrameShift ürün geliştirme yol haritası](research/2026-11-22-frameshift-urun-gelistirme-yol-haritasi.md) | HyperFrames, OpenMotion ve After Effects’ten Ürün Dersleri | `draft` | P0 canlı kurgu/ajan/export, P1 hız grafiği/tipografi/matte/precomp, kabul eşikleri |
+| [2026-11-24-social-anime-editors-workflow.md](research/2026-11-24-social-anime-editors-workflow.md) | TikTok, Instagram ve YouTube Ünlü Anime Editörlerinin İş Akışı | `active` | Xenoz/Molob/Nep ekolleri, 5 stil, 6 adımlı AE/Blender/SFX iş akışı ve FrameShift boşluk eşleşmesi |
+| [2026-11-24-anime-workflow-gap-audit.md](research/2026-11-24-anime-workflow-gap-audit.md) | Sosyal Medya Anime Editör İş Akışı vs FrameShift Boşluk Denetimi | `active` | 6 adımlı swarm denetimi: medya/RIFE, ses/SFX, Speed Graph, Null3D/matte/RSMB, Post-FX/tipografi, export/preset/MCP P0–P2 planı |
+| [2026-11-24-ai-rife-ort-rotoscope-guide.md](research/2026-11-24-ai-rife-ort-rotoscope-guide.md) | AI Medya Araçları Rehberi: RIFE, `ort` ve ONNX Rotoscope | `active` | `rife-ncnn-vulkan` (Twixtor), `ort` (Rust ONNX), `anime-segmentation`/`BiRefNet`/`SAM 2`/`Depth-Anything-V2-Small` lisans ve entegrasyon rehberi |
 | `IMPLEMENTATION_PLAN.md` | Faz 0–5 Detaylı Implementasyon Planı | `active-plan` | [Kök belgede](../IMPLEMENTATION_PLAN.md) |
 | `ENGINE_ALTERNATIVES_RESEARCH.md` | Motor ve Araç Alternatifleri | `archived-ref` | [Kök belgede](../ENGINE_ALTERNATIVES_RESEARCH.md) |
 | `VISUAL_REFERENCES.md` | Görsel Referans Kare Gözlemleri | `active-ref` | [Kök belgede](../VISUAL_REFERENCES.md) |
@@ -103,6 +106,8 @@ Asta v3 üretimindeki darboğazları ele alan tur: 11 araştırma raporu, ADR-00
 
 | Tarih | Başlık | Özet |
 | :--- | :--- | :--- |
+| [2026-11-24](log/2026-11-24-anime-workflow-p0-implementation.md) | Anime Edit İş Akışı Boşluk Denetimi ve P0 Implementasyonu | 0 yeni crate ile 9 crate'te SpeedGraph/AnimeSnap, platform export, `BlurMoCurves`/`AdjustmentLayer`/`Null3D`/`DepthMatte`, `TextAnimator` v2, ses limiter/bus ve 6 yeni MCP aracı; `clippy` 0 uyarı. |
+| [2026-11-24](log/2026-11-24-social-anime-editors-research.md) | Sosyal Medya Ünlü Anime Editörleri Araştırması | Xenoz/Molob/Nep iş akışı, 5 anime edit stili araştırma raporu ve SC-0004 / SC-0005 arketip stil kartları eklendi. |
 | [2026-11-22](log/2026-11-22-github-publication.md) | GitHub publication checkpoint | Existing workspace publication and two known `autocut` test failures. |
 | [2026-11-20](log/2026-11-20-brain-ve-agents-kurulumu.md) | `brain/` ve `AGENTS.md` Kurulumu | Kalıcı bellek, ilk ADR'lar ve kurumsal ajan kuralları oluşturuldu |
 | [2026-11-21](log/2026-11-21-implementasyon-plani.md) | Detaylı Implementasyon Planı Hazırlığı | Faz 0–5 yol haritası, crate mimarisi ve risk matrisi kullanıcı onayına sunuldu |

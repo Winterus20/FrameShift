@@ -271,3 +271,171 @@ fn safe_expr_kinetic_easings_and_exp_endpoints_overshoot_safety_and_fuel() {
     );
     assert!(fuel_expr.eval(&ctx, 2).is_ok());
 }
+
+#[test]
+fn safe_expr_floor_fract_mod_and_cubic_bezier() {
+    let ctx = sample_ctx();
+
+    // floor(x)
+    assert_eq!(
+        SafeExpr::parse("floor(1.9)").unwrap().eval_default(&ctx).unwrap(),
+        1.0
+    );
+    assert_eq!(
+        SafeExpr::parse("floor(-1.1)").unwrap().eval_default(&ctx).unwrap(),
+        -2.0
+    );
+    assert_eq!(
+        SafeExpr::parse("floor(0.0)").unwrap().eval_default(&ctx).unwrap(),
+        0.0
+    );
+
+    // fract(x) = x - floor(x) (periodic [0, 1))
+    assert!(
+        (SafeExpr::parse("fract(1.25)").unwrap().eval_default(&ctx).unwrap() - 0.25).abs() < 1e-12
+    );
+    assert!(
+        (SafeExpr::parse("fract(-0.25)").unwrap().eval_default(&ctx).unwrap() - 0.75).abs() < 1e-12
+    );
+    assert_eq!(
+        SafeExpr::parse("fract(2.0)").unwrap().eval_default(&ctx).unwrap(),
+        0.0
+    );
+
+    // mod(a, b) = a - b * floor(a / b)
+    assert!(
+        (SafeExpr::parse("mod(5.5, 2.0)").unwrap().eval_default(&ctx).unwrap() - 1.5).abs() < 1e-12
+    );
+    assert!(
+        (SafeExpr::parse("mod(-0.25, 1.0)").unwrap().eval_default(&ctx).unwrap() - 0.75).abs()
+            < 1e-12
+    );
+    assert_eq!(
+        SafeExpr::parse("mod(1.0, 0.0)").unwrap().eval_default(&ctx),
+        Err(ExprError::DivisionByZero)
+    );
+
+    // cubic_bezier(t, x1, y1, x2, y2)
+    assert_eq!(
+        SafeExpr::parse("cubic_bezier(-0.2, 0.42, 0.0, 0.58, 1.0)")
+            .unwrap()
+            .eval_default(&ctx)
+            .unwrap(),
+        0.0
+    );
+    assert_eq!(
+        SafeExpr::parse("cubic_bezier(0.0, 0.42, 0.0, 0.58, 1.0)")
+            .unwrap()
+            .eval_default(&ctx)
+            .unwrap(),
+        0.0
+    );
+    assert_eq!(
+        SafeExpr::parse("cubic_bezier(1.0, 0.42, 0.0, 0.58, 1.0)")
+            .unwrap()
+            .eval_default(&ctx)
+            .unwrap(),
+        1.0
+    );
+    assert_eq!(
+        SafeExpr::parse("cubic_bezier(1.4, 0.42, 0.0, 0.58, 1.0)")
+            .unwrap()
+            .eval_default(&ctx)
+            .unwrap(),
+        1.0
+    );
+    // Linear identity
+    assert!(
+        (SafeExpr::parse("cubic_bezier(0.37, 0.0, 0.0, 1.0, 1.0)")
+            .unwrap()
+            .eval_default(&ctx)
+            .unwrap()
+            - 0.37)
+            .abs()
+            < 1e-12
+    );
+    // Symmetric CSS ease-in-out hits exact 0.5 at t = 0.5
+    assert!(
+        (SafeExpr::parse("cubic_bezier(0.5, 0.42, 0.0, 0.58, 1.0)")
+            .unwrap()
+            .eval_default(&ctx)
+            .unwrap()
+            - 0.5)
+            .abs()
+            < 1e-12
+    );
+    // Extreme S-curve inflection (x1=1, x2=0 -> dx/du=0 at u=0.5) converges cleanly
+    let steep = SafeExpr::parse("cubic_bezier(0.5, 1.0, 0.0, 0.0, 1.0)")
+        .unwrap()
+        .eval_default(&ctx)
+        .unwrap();
+    assert!((steep - 0.5).abs() < 1e-9);
+    // Overshoot allowed on y1/y2
+    let overshoot = SafeExpr::parse("cubic_bezier(0.5, 0.34, 1.6, 0.64, 1.0)")
+        .unwrap()
+        .eval_default(&ctx)
+        .unwrap();
+    assert!(overshoot > 1.05, "expected overshoot > 1.05, got {overshoot}");
+
+    // Domain, arity, non-finite, and fuel checks
+    assert!(matches!(
+        SafeExpr::parse("cubic_bezier(0.5, -0.1, 0.0, 0.5, 1.0)")
+            .unwrap()
+            .eval_default(&ctx),
+        Err(ExprError::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        SafeExpr::parse("cubic_bezier(0.5, 0.2, 0.0, 1.2, 1.0)")
+            .unwrap()
+            .eval_default(&ctx),
+        Err(ExprError::InvalidArgument(_))
+    ));
+    assert_eq!(
+        SafeExpr::parse("cubic_bezier(0.5, 0.0, 0.0, 1.0)"),
+        Err(ExprError::InvalidArity {
+            func: "cubic_bezier".into(),
+            expected: 5,
+            actual: 4,
+        })
+    );
+    assert_eq!(
+        SafeExpr::parse("mod(1.0)"),
+        Err(ExprError::InvalidArity {
+            func: "mod".into(),
+            expected: 2,
+            actual: 1,
+        })
+    );
+    assert_eq!(
+        SafeExpr::parse("floor(1.0, 2.0)"),
+        Err(ExprError::InvalidArity {
+            func: "floor".into(),
+            expected: 1,
+            actual: 2,
+        })
+    );
+
+    let cb_fuel = SafeExpr::parse("cubic_bezier(0.5, 0.42, 0.0, 0.58, 1.0)").unwrap();
+    assert_eq!(cb_fuel.node_count(), 6);
+    assert_eq!(
+        cb_fuel.eval(&ctx, 5),
+        Err(ExprError::FuelExhausted { max_fuel: 5 })
+    );
+    assert!(cb_fuel.eval(&ctx, 6).is_ok());
+
+    let nan_ctx = ExprContext {
+        t_sec: f64::NAN,
+        ..ctx
+    };
+    for s in [
+        "floor(t_sec)",
+        "fract(t_sec)",
+        "mod(t_sec, 1.0)",
+        "cubic_bezier(t_sec, 0.42, 0.0, 0.58, 1.0)",
+    ] {
+        assert_eq!(
+            SafeExpr::parse(s).unwrap().eval_default(&nan_ctx),
+            Err(ExprError::NonFiniteValue)
+        );
+    }
+}

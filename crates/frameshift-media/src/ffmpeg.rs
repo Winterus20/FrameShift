@@ -4,6 +4,7 @@ use crate::frame::Sha256;
 use crate::frame::{AlphaMode, Rgba8Frame, fit_rgba8_frame};
 use frameshift_time::{FLICKS_PER_SECOND, Flicks, PtsIndex, Rational32};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -12,12 +13,356 @@ use std::thread::JoinHandle;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+const X26X_PRESETS: &[&str] = &[
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+];
+
+fn default_true() -> bool {
+    true
+}
+
 /// Content identity for a file, computed from its exact bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileContentIdentity {
     pub byte_len: u64,
     /// Lowercase SHA-256 digest.
     pub sha256: String,
+}
+
+/// Target video codec for FFmpeg export encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    Hevc,
+    ProRes422Hq,
+    ProRes4444,
+}
+
+impl VideoCodec {
+    /// Returns the FFmpeg `-c:v` encoder identifier.
+    pub fn ffmpeg_encoder(self) -> &'static str {
+        match self {
+            Self::H264 => "libx264",
+            Self::Hevc => "libx265",
+            Self::ProRes422Hq | Self::ProRes4444 => "prores_ks",
+        }
+    }
+
+    /// Returns `true` for Apple ProRes mastering codecs targeting `.mov` containers.
+    pub fn is_prores(self) -> bool {
+        matches!(self, Self::ProRes422Hq | Self::ProRes4444)
+    }
+
+    /// Preferred file extension (`"mp4"` or `"mov"`).
+    pub fn default_extension(self) -> &'static str {
+        if self.is_prores() { "mov" } else { "mp4" }
+    }
+}
+
+/// Output pixel format for encoded video streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum PixelFormat {
+    #[default]
+    Yuv420p,
+    Yuv420p10le,
+    Yuva444p10le,
+}
+
+impl PixelFormat {
+    /// Returns the FFmpeg `-pix_fmt` name.
+    pub fn ffmpeg_pix_fmt(self) -> &'static str {
+        match self {
+            Self::Yuv420p => "yuv420p",
+            Self::Yuv420p10le => "yuv420p10le",
+            Self::Yuva444p10le => "yuva444p10le",
+        }
+    }
+}
+
+/// Rate-control policy for H.264 / HEVC encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RateControl {
+    Crf(u8),
+    Vbr {
+        target_kbps: u32,
+        max_kbps: u32,
+        bufsize_kbps: u32,
+    },
+}
+
+impl Default for RateControl {
+    fn default() -> Self {
+        Self::Crf(16)
+    }
+}
+
+/// Audio stream encoding parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AudioEncodingSettings {
+    pub bitrate_kbps: u32,
+    pub sample_rate_hz: u32,
+}
+
+impl Default for AudioEncodingSettings {
+    fn default() -> Self {
+        Self {
+            bitrate_kbps: 192,
+            sample_rate_hz: 48_000,
+        }
+    }
+}
+
+/// Optional FFmpeg post-encode `-vf` filter settings (debanding + subtle sharpening).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct ExportPostFilter {
+    pub deband: bool,
+    pub unsharp_amount: f32,
+}
+
+impl ExportPostFilter {
+    /// Returns the combined `-vf` filtergraph string, if any post-filter is active.
+    pub fn to_ffmpeg_vf(self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.deband {
+            parts.push("deband=range=16:thr=0.02".to_owned());
+        }
+        if self.unsharp_amount.is_finite() && self.unsharp_amount > 0.0 {
+            parts.push(format!("unsharp=3:3:{}", self.unsharp_amount));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(","))
+        }
+    }
+}
+
+/// Full export encoding profile supporting H.264, 10-bit HEVC, ProRes mastering,
+/// social platform presets, Rec.709 color tagging, faststart, and optional post-filtering.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportEncodingProfile {
+    pub codec: VideoCodec,
+    pub pixel_format: PixelFormat,
+    pub rate_control: RateControl,
+    /// FFmpeg encoder preset for `libx264` / `libx265`.
+    pub preset: String,
+    #[serde(default)]
+    pub audio: AudioEncodingSettings,
+    #[serde(default)]
+    pub post_filter: ExportPostFilter,
+    #[serde(default = "default_true")]
+    pub bt709_tags: bool,
+    #[serde(default = "default_true")]
+    pub faststart: bool,
+}
+
+impl Default for ExportEncodingProfile {
+    fn default() -> Self {
+        Self {
+            codec: VideoCodec::H264,
+            pixel_format: PixelFormat::Yuv420p,
+            rate_control: RateControl::Crf(16),
+            preset: "veryfast".into(),
+            audio: AudioEncodingSettings::default(),
+            post_filter: ExportPostFilter::default(),
+            bt709_tags: true,
+            faststart: true,
+        }
+    }
+}
+
+impl ExportEncodingProfile {
+    /// TikTok 1080p60 social delivery profile (H.264 High 8-bit VBR + deband/sharpen + faststart).
+    pub fn tiktok_1080p60() -> Self {
+        Self {
+            codec: VideoCodec::H264,
+            pixel_format: PixelFormat::Yuv420p,
+            rate_control: RateControl::Vbr {
+                target_kbps: 18_000,
+                max_kbps: 25_000,
+                bufsize_kbps: 36_000,
+            },
+            preset: "slow".into(),
+            audio: AudioEncodingSettings {
+                bitrate_kbps: 256,
+                sample_rate_hz: 48_000,
+            },
+            post_filter: ExportPostFilter {
+                deband: true,
+                unsharp_amount: 0.25,
+            },
+            bt709_tags: true,
+            faststart: true,
+        }
+    }
+
+    /// Instagram Reels 1080p30 delivery profile (H.264 High 8-bit VBR + deband/sharpen + faststart).
+    pub fn reels_1080p30() -> Self {
+        Self {
+            codec: VideoCodec::H264,
+            pixel_format: PixelFormat::Yuv420p,
+            rate_control: RateControl::Vbr {
+                target_kbps: 12_000,
+                max_kbps: 18_000,
+                bufsize_kbps: 24_000,
+            },
+            preset: "slow".into(),
+            audio: AudioEncodingSettings {
+                bitrate_kbps: 192,
+                sample_rate_hz: 48_000,
+            },
+            post_filter: ExportPostFilter {
+                deband: true,
+                unsharp_amount: 0.2,
+            },
+            bt709_tags: true,
+            faststart: true,
+        }
+    }
+
+    /// YouTube 1080p60 high-bitrate H.264 High profile (320 kbps AAC, faststart).
+    pub fn youtube_1080p60() -> Self {
+        Self {
+            codec: VideoCodec::H264,
+            pixel_format: PixelFormat::Yuv420p,
+            rate_control: RateControl::Vbr {
+                target_kbps: 24_000,
+                max_kbps: 35_000,
+                bufsize_kbps: 48_000,
+            },
+            preset: "slow".into(),
+            audio: AudioEncodingSettings {
+                bitrate_kbps: 320,
+                sample_rate_hz: 48_000,
+            },
+            post_filter: ExportPostFilter::default(),
+            bt709_tags: true,
+            faststart: true,
+        }
+    }
+
+    /// 10-bit HEVC anime archival/AMV master profile (`yuv420p10le`, CRF 14, deband).
+    pub fn anime_10bit_hevc() -> Self {
+        Self {
+            codec: VideoCodec::Hevc,
+            pixel_format: PixelFormat::Yuv420p10le,
+            rate_control: RateControl::Crf(14),
+            preset: "slow".into(),
+            audio: AudioEncodingSettings {
+                bitrate_kbps: 320,
+                sample_rate_hz: 48_000,
+            },
+            post_filter: ExportPostFilter {
+                deband: true,
+                unsharp_amount: 0.0,
+            },
+            bt709_tags: true,
+            faststart: true,
+        }
+    }
+
+    /// Apple ProRes 422 HQ mastering profile (`.mov` with `pcm_s16le` audio, emitted as `yuv422p10le`).
+    pub fn prores_422hq() -> Self {
+        Self {
+            codec: VideoCodec::ProRes422Hq,
+            pixel_format: PixelFormat::Yuv420p10le,
+            rate_control: RateControl::Crf(0),
+            preset: "medium".into(),
+            audio: AudioEncodingSettings {
+                bitrate_kbps: 1536,
+                sample_rate_hz: 48_000,
+            },
+            post_filter: ExportPostFilter::default(),
+            bt709_tags: true,
+            faststart: false,
+        }
+    }
+
+    /// Resolves a built-in export profile by platform or preset name (case-insensitive).
+    pub fn from_platform_name(name: &str) -> Option<Self> {
+        let normalized = name.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        match normalized.as_str() {
+            "tiktok" | "tiktok_1080p60" | "tiktok_60" => Some(Self::tiktok_1080p60()),
+            "reels" | "instagram" | "instagram_reels" | "reels_1080p30" | "ig_reels" => {
+                Some(Self::reels_1080p30())
+            }
+            "youtube" | "yt" | "youtube_1080p60" => Some(Self::youtube_1080p60()),
+            "anime" | "anime_10bit" | "anime_10bit_hevc" | "hevc_10bit" | "hevc" => {
+                Some(Self::anime_10bit_hevc())
+            }
+            "prores" | "prores_422hq" | "prores422hq" | "prores_hq" => Some(Self::prores_422hq()),
+            _ => None,
+        }
+    }
+
+    /// Validates all profile fields prior to spawning `ffmpeg`.
+    pub fn validate(&self) -> Result<(), MediaError> {
+        if !self.codec.is_prores() && !X26X_PRESETS.contains(&self.preset.as_str()) {
+            return Err(MediaError::InvalidEncodingSettings(format!(
+                "unsupported encoder preset '{}'",
+                self.preset
+            )));
+        }
+        match self.rate_control {
+            RateControl::Crf(crf) => {
+                if !self.codec.is_prores() && crf > 51 {
+                    return Err(MediaError::InvalidEncodingSettings(format!(
+                        "CRF {crf} exceeds valid 0..=51 range"
+                    )));
+                }
+            }
+            RateControl::Vbr {
+                target_kbps,
+                max_kbps,
+                bufsize_kbps,
+            } => {
+                if target_kbps == 0 || max_kbps < target_kbps || bufsize_kbps == 0 {
+                    return Err(MediaError::InvalidEncodingSettings(format!(
+                        "invalid VBR settings: target={target_kbps}k, max={max_kbps}k, bufsize={bufsize_kbps}k"
+                    )));
+                }
+            }
+        }
+        if self.audio.sample_rate_hz == 0 || self.audio.bitrate_kbps == 0 {
+            return Err(MediaError::InvalidEncodingSettings(format!(
+                "invalid audio encoding settings: {} Hz, {} kbps",
+                self.audio.sample_rate_hz, self.audio.bitrate_kbps
+            )));
+        }
+        if !self.post_filter.unsharp_amount.is_finite()
+            || self.post_filter.unsharp_amount < 0.0
+            || self.post_filter.unsharp_amount > 5.0
+        {
+            return Err(MediaError::InvalidEncodingSettings(format!(
+                "unsharp_amount {} must be finite and within 0.0..=5.0",
+                self.post_filter.unsharp_amount
+            )));
+        }
+        if self.pixel_format == PixelFormat::Yuva444p10le && self.codec != VideoCodec::ProRes4444 {
+            return Err(MediaError::InvalidEncodingSettings(
+                "yuva444p10le alpha pixel format is only supported with ProRes4444".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn effective_ffmpeg_pix_fmt(&self) -> &'static str {
+        match (self.codec, self.pixel_format) {
+            (VideoCodec::ProRes422Hq, _) => "yuv422p10le",
+            (VideoCodec::ProRes4444, PixelFormat::Yuva444p10le) => "yuva444p10le",
+            (VideoCodec::ProRes4444, _) => "yuv444p10le",
+            (_, pf) => pf.ffmpeg_pix_fmt(),
+        }
+    }
 }
 
 /// Reproducible software H.264 encoding settings for MP4 output.
@@ -40,24 +385,29 @@ impl Default for VideoEncodingSettings {
 
 impl VideoEncodingSettings {
     pub fn validate(&self) -> Result<(), MediaError> {
-        const PRESETS: &[&str] = &[
-            "ultrafast",
-            "superfast",
-            "veryfast",
-            "faster",
-            "fast",
-            "medium",
-            "slow",
-            "slower",
-            "veryslow",
-        ];
-        if !PRESETS.contains(&self.preset.as_str()) || self.crf > 51 {
+        if !X26X_PRESETS.contains(&self.preset.as_str()) || self.crf > 51 {
             return Err(MediaError::InvalidEncodingSettings(format!(
                 "unsupported libx264 settings: preset='{}', crf={} (expected a standard preset and crf 0..=51)",
                 self.preset, self.crf
             )));
         }
         Ok(())
+    }
+}
+
+impl From<&VideoEncodingSettings> for ExportEncodingProfile {
+    fn from(settings: &VideoEncodingSettings) -> Self {
+        Self {
+            preset: settings.preset.clone(),
+            rate_control: RateControl::Crf(settings.crf),
+            ..Self::default()
+        }
+    }
+}
+
+impl From<VideoEncodingSettings> for ExportEncodingProfile {
+    fn from(settings: VideoEncodingSettings) -> Self {
+        Self::from(&settings)
     }
 }
 
@@ -947,6 +1297,41 @@ impl Mp4FrameEncoder {
         encoding: &VideoEncodingSettings,
     ) -> Result<Self, MediaError> {
         encoding.validate()?;
+        let profile = ExportEncodingProfile::from(encoding);
+        Self::spawn_with_profile(
+            out_path,
+            width,
+            height,
+            fps,
+            audio,
+            &profile,
+            Some(video_encoder),
+        )
+    }
+
+    /// Starts an encoder using a full [`ExportEncodingProfile`] (H.264, 10-bit HEVC, ProRes,
+    /// platform presets, Rec.709 color tags, faststart, and optional post-filtering).
+    pub fn new_with_profile(
+        out_path: &Path,
+        width: u32,
+        height: u32,
+        fps: Rational32,
+        audio: Option<&AudioBuffer>,
+        profile: &ExportEncodingProfile,
+    ) -> Result<Self, MediaError> {
+        Self::spawn_with_profile(out_path, width, height, fps, audio, profile, None)
+    }
+
+    fn spawn_with_profile(
+        out_path: &Path,
+        width: u32,
+        height: u32,
+        fps: Rational32,
+        audio: Option<&AudioBuffer>,
+        profile: &ExportEncodingProfile,
+        video_encoder_override: Option<&str>,
+    ) -> Result<Self, MediaError> {
+        profile.validate()?;
         if fps.num == 0 || fps.den == 0 {
             return Err(frameshift_time::TimeError::InvalidRational {
                 num: fps.num,
@@ -974,27 +1359,18 @@ impl Mp4FrameEncoder {
             None
         };
 
-        let size_arg = format!("{width}x{height}");
-        let fps_arg = format!("{}/{}", fps.num, fps.den);
+        let args = build_ffmpeg_encode_os_args(
+            width,
+            height,
+            fps,
+            temp_wav_guard.as_ref().map(|g| g.0.as_path()),
+            out_path,
+            profile,
+            video_encoder_override,
+        )?;
+
         let mut cmd = Command::new("ffmpeg");
-        cmd.args([
-            "-y", "-v", "error", "-nostdin", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", &size_arg,
-            "-r", &fps_arg, "-i", "pipe:0",
-        ]);
-        if let Some(ref wav_guard) = temp_wav_guard {
-            cmd.arg("-i").arg(&wav_guard.0);
-        }
-        cmd.args(["-c:v", video_encoder, "-pix_fmt", "yuv420p"]);
-        if video_encoder == "libx264" {
-            cmd.arg("-preset").arg(&encoding.preset);
-            cmd.arg("-crf").arg(encoding.crf.to_string());
-        }
-        if temp_wav_guard.is_some() {
-            cmd.args(["-c:a", "aac", "-b:a", "192k"]);
-        } else {
-            cmd.arg("-an");
-        }
-        cmd.arg(out_path)
+        cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -1140,6 +1516,173 @@ impl Drop for Mp4FrameEncoder {
             .take()
             .and_then(|handle| handle.join().ok());
     }
+}
+
+/// Builds the complete `ffmpeg` CLI argument list for encoding raw RGBA8 frames (and optional
+/// WAV audio) according to `profile`.
+///
+/// Exposed as a pure helper so callers and unit tests can validate Rec.709 colorimetry tags,
+/// codec/pixel-format selection, H.264 High profile, MP4 faststart, audio settings, and `-vf`
+/// post-filters without spawning `ffmpeg`.
+pub fn build_ffmpeg_encode_args(
+    width: u32,
+    height: u32,
+    fps: Rational32,
+    audio_wav_path: Option<&Path>,
+    out_path: &Path,
+    profile: &ExportEncodingProfile,
+) -> Result<Vec<String>, MediaError> {
+    let os_args = build_ffmpeg_encode_os_args(
+        width,
+        height,
+        fps,
+        audio_wav_path,
+        out_path,
+        profile,
+        None,
+    )?;
+    Ok(os_args
+        .into_iter()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect())
+}
+
+fn build_ffmpeg_encode_os_args(
+    width: u32,
+    height: u32,
+    fps: Rational32,
+    audio_wav_path: Option<&Path>,
+    out_path: &Path,
+    profile: &ExportEncodingProfile,
+    video_encoder_override: Option<&str>,
+) -> Result<Vec<OsString>, MediaError> {
+    profile.validate()?;
+    if fps.num == 0 || fps.den == 0 {
+        return Err(frameshift_time::TimeError::InvalidRational {
+            num: fps.num,
+            den: fps.den,
+        }
+        .into());
+    }
+    if width == 0 || height == 0 {
+        return Err(MediaError::InvalidDimensions { width, height });
+    }
+
+    let mut args: Vec<OsString> = Vec::new();
+    let push_str = |args: &mut Vec<OsString>, s: &str| args.push(OsString::from(s));
+
+    let size_arg = format!("{width}x{height}");
+    let fps_arg = format!("{}/{}", fps.num, fps.den);
+    for flag in [
+        "-y", "-v", "error", "-nostdin", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", &size_arg,
+        "-r", &fps_arg, "-i", "pipe:0",
+    ] {
+        push_str(&mut args, flag);
+    }
+
+    if let Some(wav_path) = audio_wav_path {
+        push_str(&mut args, "-i");
+        args.push(wav_path.as_os_str().to_os_string());
+    }
+
+    if let Some(vf) = profile.post_filter.to_ffmpeg_vf() {
+        push_str(&mut args, "-vf");
+        push_str(&mut args, &vf);
+    }
+
+    let encoder = video_encoder_override.unwrap_or_else(|| profile.codec.ffmpeg_encoder());
+    let is_prores = encoder == "prores_ks" || (video_encoder_override.is_none() && profile.codec.is_prores());
+    let is_mov_ext = out_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mov"));
+
+    push_str(&mut args, "-c:v");
+    push_str(&mut args, encoder);
+    push_str(&mut args, "-pix_fmt");
+    push_str(&mut args, profile.effective_ffmpeg_pix_fmt());
+
+    if encoder == "libx264" && profile.pixel_format == PixelFormat::Yuv420p {
+        push_str(&mut args, "-profile:v");
+        push_str(&mut args, "high");
+    }
+
+    if is_prores {
+        let prores_profile = match profile.codec {
+            VideoCodec::ProRes4444 => "4",
+            _ => "3",
+        };
+        push_str(&mut args, "-profile:v");
+        push_str(&mut args, prores_profile);
+    } else if encoder == "libx264" || encoder == "libx265" {
+        push_str(&mut args, "-preset");
+        push_str(&mut args, &profile.preset);
+        match profile.rate_control {
+            RateControl::Crf(crf) => {
+                push_str(&mut args, "-crf");
+                push_str(&mut args, &crf.to_string());
+            }
+            RateControl::Vbr {
+                target_kbps,
+                max_kbps,
+                bufsize_kbps,
+            } => {
+                push_str(&mut args, "-b:v");
+                push_str(&mut args, &format!("{target_kbps}k"));
+                push_str(&mut args, "-maxrate");
+                push_str(&mut args, &format!("{max_kbps}k"));
+                push_str(&mut args, "-bufsize");
+                push_str(&mut args, &format!("{bufsize_kbps}k"));
+            }
+        }
+        if encoder == "libx265" && !is_mov_ext {
+            push_str(&mut args, "-tag:v");
+            push_str(&mut args, "hvc1");
+        }
+    }
+
+    if profile.bt709_tags {
+        for flag in [
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-color_range",
+            "tv",
+        ] {
+            push_str(&mut args, flag);
+        }
+    }
+
+    if audio_wav_path.is_some() {
+        let sample_rate = profile.audio.sample_rate_hz.to_string();
+        if is_prores {
+            push_str(&mut args, "-c:a");
+            push_str(&mut args, "pcm_s16le");
+            push_str(&mut args, "-ar");
+            push_str(&mut args, &sample_rate);
+        } else {
+            let bitrate = format!("{}k", profile.audio.bitrate_kbps);
+            push_str(&mut args, "-c:a");
+            push_str(&mut args, "aac");
+            push_str(&mut args, "-ar");
+            push_str(&mut args, &sample_rate);
+            push_str(&mut args, "-b:a");
+            push_str(&mut args, &bitrate);
+        }
+    } else {
+        push_str(&mut args, "-an");
+    }
+
+    if profile.faststart && !is_prores && !is_mov_ext {
+        push_str(&mut args, "-movflags");
+        push_str(&mut args, "+faststart");
+    }
+
+    args.push(out_path.as_os_str().to_os_string());
+    Ok(args)
 }
 
 fn io_failure_message(context: &str, io_err: &std::io::Error, stderr: &str) -> String {
@@ -1428,5 +1971,150 @@ mod tests {
             FfmpegBridge::decode_video_window(&mp4_path, &empty_pts, 0, 4, width, height),
             Err(MediaError::EmptyMediaStream(_))
         ));
+    }
+
+    fn has_flag_pair(args: &[String], key: &str, value: &str) -> bool {
+        args.windows(2).any(|w| w[0] == key && w[1] == value)
+    }
+
+    #[test]
+    fn ffmpeg_arg_builder_applies_bt709_high_profile_faststart_and_audio_for_default() {
+        let legacy = VideoEncodingSettings {
+            preset: "medium".into(),
+            crf: 18,
+        };
+        let profile = ExportEncodingProfile::from(&legacy);
+        let args = build_ffmpeg_encode_args(
+            1920,
+            1080,
+            Rational32::new(60, 1).unwrap(),
+            Some(Path::new("audio.wav")),
+            Path::new("out.mp4"),
+            &profile,
+        )
+        .unwrap();
+
+        assert!(has_flag_pair(&args, "-c:v", "libx264"));
+        assert!(has_flag_pair(&args, "-pix_fmt", "yuv420p"));
+        assert!(has_flag_pair(&args, "-profile:v", "high"));
+        assert!(has_flag_pair(&args, "-preset", "medium"));
+        assert!(has_flag_pair(&args, "-crf", "18"));
+        assert!(has_flag_pair(&args, "-colorspace", "bt709"));
+        assert!(has_flag_pair(&args, "-color_primaries", "bt709"));
+        assert!(has_flag_pair(&args, "-color_trc", "bt709"));
+        assert!(has_flag_pair(&args, "-color_range", "tv"));
+        assert!(has_flag_pair(&args, "-c:a", "aac"));
+        assert!(has_flag_pair(&args, "-ar", "48000"));
+        assert!(has_flag_pair(&args, "-b:a", "192k"));
+        assert!(has_flag_pair(&args, "-movflags", "+faststart"));
+        assert!(!args.iter().any(|a| a == "-vf"));
+        assert_eq!(args.last().map(String::as_str), Some("out.mp4"));
+    }
+
+    #[test]
+    fn platform_presets_resolve_and_build_expected_ffmpeg_arguments() {
+        let tiktok = ExportEncodingProfile::from_platform_name("TikTok").unwrap();
+        assert_eq!(tiktok, ExportEncodingProfile::tiktok_1080p60());
+        let tiktok_args = build_ffmpeg_encode_args(
+            1080,
+            1920,
+            Rational32::new(60, 1).unwrap(),
+            Some(Path::new("bgm.wav")),
+            Path::new("tiktok.mp4"),
+            &tiktok,
+        )
+        .unwrap();
+        assert!(has_flag_pair(&tiktok_args, "-b:v", "18000k"));
+        assert!(has_flag_pair(&tiktok_args, "-maxrate", "25000k"));
+        assert!(has_flag_pair(&tiktok_args, "-bufsize", "36000k"));
+        assert!(has_flag_pair(&tiktok_args, "-profile:v", "high"));
+        assert!(has_flag_pair(&tiktok_args, "-ar", "48000"));
+        assert!(has_flag_pair(&tiktok_args, "-b:a", "256k"));
+        assert!(has_flag_pair(
+            &tiktok_args,
+            "-vf",
+            "deband=range=16:thr=0.02,unsharp=3:3:0.25"
+        ));
+        assert!(has_flag_pair(&tiktok_args, "-movflags", "+faststart"));
+
+        let reels = ExportEncodingProfile::from_platform_name("instagram-reels").unwrap();
+        assert_eq!(reels, ExportEncodingProfile::reels_1080p30());
+
+        let yt = ExportEncodingProfile::from_platform_name("YouTube").unwrap();
+        assert_eq!(yt, ExportEncodingProfile::youtube_1080p60());
+
+        let anime_hevc = ExportEncodingProfile::from_platform_name("anime_10bit_hevc").unwrap();
+        assert_eq!(anime_hevc, ExportEncodingProfile::anime_10bit_hevc());
+        let hevc_args = build_ffmpeg_encode_args(
+            1920,
+            1080,
+            Rational32::new(24, 1).unwrap(),
+            None,
+            Path::new("anime.mp4"),
+            &anime_hevc,
+        )
+        .unwrap();
+        assert!(has_flag_pair(&hevc_args, "-c:v", "libx265"));
+        assert!(has_flag_pair(&hevc_args, "-pix_fmt", "yuv420p10le"));
+        assert!(has_flag_pair(&hevc_args, "-crf", "14"));
+        assert!(has_flag_pair(&hevc_args, "-vf", "deband=range=16:thr=0.02"));
+        assert!(!has_flag_pair(&hevc_args, "-profile:v", "high"));
+        assert!(hevc_args.iter().any(|a| a == "-an"));
+
+        let prores = ExportEncodingProfile::from_platform_name("prores_422hq").unwrap();
+        assert_eq!(prores, ExportEncodingProfile::prores_422hq());
+        let prores_args = build_ffmpeg_encode_args(
+            1920,
+            1080,
+            Rational32::new(60, 1).unwrap(),
+            Some(Path::new("master.wav")),
+            Path::new("master.mov"),
+            &prores,
+        )
+        .unwrap();
+        assert!(has_flag_pair(&prores_args, "-c:v", "prores_ks"));
+        assert!(has_flag_pair(&prores_args, "-pix_fmt", "yuv422p10le"));
+        assert!(has_flag_pair(&prores_args, "-profile:v", "3"));
+        assert!(has_flag_pair(&prores_args, "-c:a", "pcm_s16le"));
+        assert!(has_flag_pair(&prores_args, "-ar", "48000"));
+        assert!(!prores_args.iter().any(|a| a == "-movflags"));
+        assert!(!prores_args.iter().any(|a| a == "-b:a"));
+
+        assert!(ExportEncodingProfile::from_platform_name("unknown").is_none());
+    }
+
+    #[test]
+    fn export_profile_validation_rejects_invalid_configurations() {
+        let bad_vbr = ExportEncodingProfile {
+            rate_control: RateControl::Vbr {
+                target_kbps: 10_000,
+                max_kbps: 5_000,
+                bufsize_kbps: 20_000,
+            },
+            ..Default::default()
+        };
+        assert!(bad_vbr.validate().is_err());
+
+        let bad_alpha = ExportEncodingProfile {
+            pixel_format: PixelFormat::Yuva444p10le,
+            ..Default::default()
+        };
+        assert!(bad_alpha.validate().is_err());
+
+        let mut prores4444 = ExportEncodingProfile::prores_422hq();
+        prores4444.codec = VideoCodec::ProRes4444;
+        prores4444.pixel_format = PixelFormat::Yuva444p10le;
+        assert!(prores4444.validate().is_ok());
+        let args = build_ffmpeg_encode_args(
+            1920,
+            1080,
+            FPS_24,
+            None,
+            Path::new("alpha.mov"),
+            &prores4444,
+        )
+        .unwrap();
+        assert!(has_flag_pair(&args, "-pix_fmt", "yuva444p10le"));
+        assert!(has_flag_pair(&args, "-profile:v", "4"));
     }
 }

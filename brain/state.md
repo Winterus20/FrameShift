@@ -1,6 +1,10 @@
 # FrameShift — Aktif Durum (`state.md`)
 
-**Son Güncelleme:** 2026-11-23
+**Son Güncelleme:** 2026-11-24
+
+**Anime Editör İş Akışı Boşluk Denetimi & P0 Implementasyonu (2026-11-24):** 6 adımlı swarm denetimi ([gap audit](research/2026-11-24-anime-workflow-gap-audit.md)) sonrasında 0 yeni Cargo crate'iyle tüm 9 workspace crate'inde P0 yükseltmeleri uygulandı ([günlük](log/2026-11-24-anime-workflow-p0-implementation.md)): AE `KeyframeEase`/`CubicBezierValue`/`CubicBezierSpeed`/`AnimeSnap`/`TimeQuantizeSpec` (`frameshift-time`), Rec.709+`faststart`+platform profilleri (`tiktok_1080p60`/`reels_1080p30`/`youtube_1080p60`/`anime_10bit_hevc`/`prores_422hq`)+`ClipAnalysis` (`dedup`+SCD)+audio soft limiter/biquad/ducking/micro-silence (`frameshift-media`), `AudioBus`/event-anchored SFX+`AdjustmentLayer`+`BlurMoCurves` (`fx_blur_mocurves.wgsl`)+`Null3D` parent rig+`DepthMatte`/`MaskMatte::Red`+`TextAnimator` v2+`EffectChainPreset` (`frameshift-schema`/`vector`/`render`), `audio_envelope_cache_key` bug fix+`AudioBuffer` cache+CLI `--platform`+6 yeni MCP aracı (`frameshift-app`/`core`/`cli`/`mcp`). `cargo clippy --workspace --all-targets -- -D warnings` **0 uyarı** ile geçti; tüm yeni testler geçti (ortamda `ffmpeg` ikilisi ve Windows sistem fontları bulunmadığı için yalnızca FFmpeg alt-süreç testleri ve 5 önceden mevcut Termux font/lavapipe testi dışında tüm hedefler yeşildir).
+
+**Sosyal Medya Anime Editörleri Araştırması & Stil Kartları (2026-11-24):** TikTok, Instagram Reels ve YouTube'da öne çıkan anime editörlerinin (Xenoz, Molob, Nep/Neptune) stilleri (Flow, Jugg, Raw/Daddy, Typography, 3D/Blender) ve 6 adımlı AE/Blender/SFX üretim iş akışı ikincil web araştırmasıyla belgelendi: [araştırma raporu](research/2026-11-24-social-anime-editors-workflow.md) ve iki arketip stil kartı ([SC-0004 Xenoz Flow/Impact](style-cards/SC-0004-xenoz-flow-impact-amv.md), [SC-0005 Nep/Jugg One-Framer](style-cards/SC-0005-nep-one-framer-jugg-edit.md)).
 
 **Chainsaw Man × Blow (2026-11-23):** Denji/Pochita açılışı, dönüşümde 4,375 sn müzik ankrajı ve beat odaklı efektler içeren 7:6 kurgu Python/FFmpeg üzerinden hazırlandı. [Günlük](log/2026-11-23-chainsaw-man-blow.md).
 
@@ -66,6 +70,10 @@
 ---
 
 ## Son Oturum Bağlantısı
+
+- [2026-11-24 — Sosyal Medya Anime Edit İş Akışı Boşluk Denetimi ve P0 Implementasyonu](log/2026-11-24-anime-workflow-p0-implementation.md): 0 yeni crate ile 9 crate'te AnimeSnap/Bezier SpeedGraph, platform export profilleri, `BlurMoCurves`/`AdjustmentLayer`/`Null3D`/`DepthMatte`/`TextAnimator` v2, ses limiter/bus/bugfix ve 6 yeni MCP aracı eklendi; `clippy` 0 uyarı.
+
+- [2026-11-24 — Sosyal Medya Ünlü Anime Editörleri Araştırması ve Stil Kartları](log/2026-11-24-social-anime-editors-research.md): 5 anime edit stili, 6 adımlı AE/Blender/SFX iş akışı raporu ve `SC-0004` (Xenoz) / `SC-0005` (Nep/Jugg) arketip kartları eklendi.
 
 - [2026-11-22 — Headless P0–P2 ürün yol haritası uygulaması](log/2026-11-22-headless-roadmap-implementation.md): 4 sn MP4, timeline/speed graph/template/retarget smoke'ları, byte-pinned proxy, MCP fişleri, hedefli schema regresyonları ve kalan GUI/platform sınırları.
 

@@ -312,6 +312,7 @@ fn is_multi_input_boundary_kind(kind: &NodeKind) -> bool {
     matches!(
         kind,
         NodeKind::MaskMatte { .. }
+            | NodeKind::DepthMatte { .. }
             | NodeKind::Blend { .. }
             | NodeKind::ShaderTransition { .. }
             | NodeKind::Scene3D { .. }

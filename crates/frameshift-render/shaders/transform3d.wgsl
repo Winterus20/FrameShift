@@ -8,7 +8,7 @@ struct VertexOutput {
     @location(1) view_dist: f32,
 }
 
-// 112 bytes, 16-byte aligned.
+// 128 bytes, 16-byte aligned.
 struct Transform3DUniform {
     mvp: mat4x4<f32>,
     model_view_z_row: vec4<f32>,
@@ -16,6 +16,8 @@ struct Transform3DUniform {
     dof_params: vec4<f32>,
     // x = texel_size_y, yzw = reserved
     extra: vec4<f32>,
+    // x = mirror_edges (0u | 1u), yzw = reserved
+    flags: vec4<u32>,
 }
 
 @group(0) @binding(0)
@@ -61,13 +63,23 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     }
 
     let aspect = select(u.dof_params.z, 1.0, u.dof_params.z <= 0.0);
-    let local_pos = vec4<f32>(quad_xy.x * aspect, quad_xy.y, 0.0, 1.0);
+    let mirror_edges = u.flags.x != 0u;
+    let span = select(1.0, 6.0, mirror_edges);
+    let local_pos = vec4<f32>(quad_xy.x * aspect * span, quad_xy.y * span, 0.0, 1.0);
 
     var out: VertexOutput;
     out.position = u.mvp * local_pos;
-    out.uv = quad_uv;
+    out.uv = select(
+        quad_uv,
+        (quad_uv - vec2<f32>(0.5, 0.5)) * span + vec2<f32>(0.5, 0.5),
+        mirror_edges,
+    );
     out.view_dist = abs(dot(u.model_view_z_row, local_pos));
     return out;
+}
+
+fn mirror_uv(uv: vec2<f32>) -> vec2<f32> {
+    return 1.0 - abs(fract(uv * 0.5) * 2.0 - 1.0);
 }
 
 @fragment
@@ -75,8 +87,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let focal_dist = u.dof_params.x;
     let blur_strength = max(u.dof_params.y, 0.0);
     let coc = abs(in.view_dist - focal_dist) * blur_strength;
+    let mirror_edges = u.flags.x != 0u;
 
-    let base_sample = textureSampleLevel(src_tex, linear_sampler, in.uv, 0.0);
+    let base_uv = select(in.uv, mirror_uv(in.uv), mirror_edges);
+    let base_sample = textureSampleLevel(src_tex, linear_sampler, base_uv, 0.0);
     if (coc <= 0.001) {
         let out_a = clamp(base_sample.a, 0.0, 1.0);
         if (out_a <= 0.001) {
@@ -99,7 +113,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let r = sqrt((fi + 0.5) / f32(VOGEL_TAPS));
         let theta = fi * GOLDEN_ANGLE;
         let offset_uv = vec2<f32>(cos(theta), sin(theta)) * (r * blur_radius_px) * texel;
-        let sample_uv = clamp(in.uv + offset_uv, vec2<f32>(0.0), vec2<f32>(1.0));
+        let raw_uv = in.uv + offset_uv;
+        let sample_uv = select(
+            clamp(raw_uv, vec2<f32>(0.0), vec2<f32>(1.0)),
+            mirror_uv(raw_uv),
+            mirror_edges,
+        );
         let tap = textureSampleLevel(src_tex, linear_sampler, sample_uv, 0.0);
         acc = acc + vec4<f32>(max(tap.rgb, vec3<f32>(0.0)), clamp(tap.a, 0.0, 1.0));
     }

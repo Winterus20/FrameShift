@@ -1,10 +1,20 @@
 use crate::flicks::Flicks;
-use crate::speed_curve::{SpeedCurve, SpeedCurveSpec, SpeedKeyframe};
+use crate::speed_curve::{
+    BezierSpeedKeyframe, KeyframeEase, SpeedCurve, SpeedCurveSpec, SpeedKeyframe,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+const fn default_anime_snap_peak_bias() -> f64 {
+    0.85
+}
+
+const fn default_anime_snap_influence() -> f64 {
+    0.80
+}
+
 /// Curve shape requested from `ImpactSolver`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImpactCurveStyle {
     /// Two piecewise-constant segments (`pre_speed` then `post_speed`).
@@ -13,6 +23,57 @@ pub enum ImpactCurveStyle {
     /// Smooth C1 `CubicHermite` curve with zero-slope knots that hits the exact
     /// pre-impact and post-impact integrals without exceeding `[min_speed, max_speed]`.
     SmoothRamp,
+    /// Anime-edit / AMV speed-ramp snap: builds tension before the impact and spikes
+    /// into a high speed peak around the impact (`peak_bias`), then drops into slow-mo
+    /// afterward while keeping pre- and post-impact integrals locked to `source_impact`
+    /// and staying within `[min_speed, max_speed]`.
+    AnimeSnap {
+        #[serde(default = "default_anime_snap_peak_bias")]
+        peak_bias: f64,
+        #[serde(default = "default_anime_snap_influence")]
+        influence: f64,
+    },
+}
+
+impl ImpactCurveStyle {
+    /// Builds an anime snap-in preset (slow anticipation followed by a steep whip-up peak into impact).
+    pub const fn anime_snap_in() -> Self {
+        Self::AnimeSnap {
+            peak_bias: 0.85,
+            influence: 0.80,
+        }
+    }
+
+    /// Builds an anime snap-out preset (sharp speed burst coming out of impact before dropping to slow-mo).
+    pub const fn anime_snap_out() -> Self {
+        Self::AnimeSnap {
+            peak_bias: 0.15,
+            influence: 0.80,
+        }
+    }
+
+    /// Builds a balanced high-influence Twixtor-style speed ramp centered on the impact.
+    pub const fn twixtor_ramp() -> Self {
+        Self::AnimeSnap {
+            peak_bias: 0.50,
+            influence: 0.90,
+        }
+    }
+}
+
+/// Preset helper producing an anime snap-in `ImpactCurveStyle`.
+pub const fn anime_snap_in() -> ImpactCurveStyle {
+    ImpactCurveStyle::anime_snap_in()
+}
+
+/// Preset helper producing an anime snap-out `ImpactCurveStyle`.
+pub const fn anime_snap_out() -> ImpactCurveStyle {
+    ImpactCurveStyle::anime_snap_out()
+}
+
+/// Preset helper producing a Twixtor-style speed ramp `ImpactCurveStyle`.
+pub const fn twixtor_ramp() -> ImpactCurveStyle {
+    ImpactCurveStyle::twixtor_ramp()
 }
 
 /// Controls whether the solver must consume the exact `[source_bounds_start, source_bounds_end]`
@@ -213,6 +274,30 @@ impl ImpactSolver {
             });
         }
 
+        if let ImpactCurveStyle::AnimeSnap {
+            peak_bias,
+            influence,
+        } = req.style
+            && (!peak_bias.is_finite()
+                || !(0.0..=1.0).contains(&peak_bias)
+                || !influence.is_finite()
+                || !(0.0..=1.0).contains(&influence))
+        {
+            failures.push(ConstraintFailure::InvalidSpeedBounds {
+                min_speed: req.min_speed,
+                max_speed: req.max_speed,
+            });
+            suggestions.push(SuggestedAlternative {
+                description:
+                    "AnimeSnap requires finite peak_bias and influence in [0.0, 1.0]".into(),
+                suggested_target_output: None,
+                suggested_min_speed: None,
+                suggested_max_speed: None,
+                suggested_output_start: None,
+                suggested_output_end: None,
+            });
+        }
+
         if !failures.is_empty() {
             return Err(ConstraintViolation {
                 failures,
@@ -244,6 +329,30 @@ impl ImpactSolver {
             &mut failures,
             &mut suggestions,
         );
+
+        if let ImpactCurveStyle::AnimeSnap {
+            peak_bias,
+            influence,
+        } = req.style
+            && (!peak_bias.is_finite()
+                || !(0.0..=1.0).contains(&peak_bias)
+                || !influence.is_finite()
+                || !(0.0..=1.0).contains(&influence))
+        {
+            failures.push(ConstraintFailure::InvalidSpeedBounds {
+                min_speed: req.min_speed,
+                max_speed: req.max_speed,
+            });
+            suggestions.push(SuggestedAlternative {
+                description:
+                    "AnimeSnap requires finite peak_bias and influence in [0.0, 1.0]".into(),
+                suggested_target_output: None,
+                suggested_min_speed: None,
+                suggested_max_speed: None,
+                suggested_output_start: None,
+                suggested_output_end: None,
+            });
+        }
 
         if !failures.is_empty() {
             return Err(ConstraintViolation {
@@ -566,6 +675,10 @@ fn build_solution_curve(
 
             SpeedCurveSpec::CubicHermite { keyframes }
         }
+        ImpactCurveStyle::AnimeSnap {
+            peak_bias,
+            influence,
+        } => build_anime_snap_spec(dt_pre, dt_post, v_pre, v_post, peak_bias, influence, req),
     };
 
     SpeedCurve::new(spec).map_err(|err| ConstraintViolation {
@@ -582,4 +695,295 @@ fn build_solution_curve(
             suggested_output_end: None,
         }],
     })
+}
+
+/// Computes the exact integral weight `W(out_inf, in_inf) = 0.5 + 0.3 * (in_inf - out_inf)`
+/// for a zero-slope `CubicBezierSpeed` ramp from `v0` to `v1`.
+#[inline]
+fn bezier_speed_ramp_weight(out_inf: f64, in_inf: f64) -> f64 {
+    0.5 + 0.3 * (in_inf - out_inf)
+}
+
+fn push_anime_pre_keyframes(
+    keyframes: &mut Vec<BezierSpeedKeyframe>,
+    dt_pre: Flicks,
+    knee_ticks: Option<i64>,
+    v_low: f64,
+    out_inf_pre: f64,
+) {
+    let _ = dt_pre;
+    if let Some(k) = knee_ticks {
+        keyframes.push(
+            BezierSpeedKeyframe::speed(Flicks::ZERO, v_low).with_out_ease(KeyframeEase {
+                speed: 0.0,
+                influence: 0.333,
+            }),
+        );
+        keyframes.push(
+            BezierSpeedKeyframe::speed(Flicks(k), v_low)
+                .with_in_ease(KeyframeEase {
+                    speed: 0.0,
+                    influence: 0.333,
+                })
+                .with_out_ease(KeyframeEase {
+                    speed: 0.0,
+                    influence: out_inf_pre,
+                }),
+        );
+    } else {
+        keyframes.push(
+            BezierSpeedKeyframe::speed(Flicks::ZERO, v_low).with_out_ease(KeyframeEase {
+                speed: 0.0,
+                influence: out_inf_pre,
+            }),
+        );
+    }
+}
+
+fn push_anime_post_keyframes(
+    keyframes: &mut Vec<BezierSpeedKeyframe>,
+    post_start: Flicks,
+    total_dt: Flicks,
+    settle_offset: Option<i64>,
+    v_settle: f64,
+    in_inf_post: f64,
+) {
+    if let Some(off) = settle_offset {
+        keyframes.push(
+            BezierSpeedKeyframe::speed(Flicks(post_start.0 + off), v_settle)
+                .with_in_ease(KeyframeEase {
+                    speed: 0.0,
+                    influence: in_inf_post,
+                })
+                .with_out_ease(KeyframeEase {
+                    speed: 0.0,
+                    influence: 0.333,
+                }),
+        );
+        keyframes.push(
+            BezierSpeedKeyframe::speed(total_dt, v_settle).with_in_ease(KeyframeEase {
+                speed: 0.0,
+                influence: 0.333,
+            }),
+        );
+    } else {
+        keyframes.push(
+            BezierSpeedKeyframe::speed(total_dt, v_settle).with_in_ease(KeyframeEase {
+                speed: 0.0,
+                influence: in_inf_post,
+            }),
+        );
+    }
+}
+
+fn build_anime_snap_spec(
+    dt_pre: Flicks,
+    dt_post: Flicks,
+    v_pre: f64,
+    v_post: f64,
+    peak_bias: f64,
+    influence: f64,
+    req: &ImpactSolveRequest,
+) -> SpeedCurveSpec {
+    let total_dt = dt_pre + dt_post;
+    let bias = peak_bias.clamp(0.0, 1.0);
+    let inf = influence.clamp(0.0, 1.0);
+
+    let alpha_target = 0.65 * bias;
+    let out_inf_pre = inf;
+    let in_inf_pre = (1.0 - bias) * inf;
+    let w_pre = bezier_speed_ramp_weight(out_inf_pre, in_inf_pre);
+
+    let gamma_target = 0.25 + 0.45 * (1.0 - bias);
+    let out_inf_post = (1.0 - bias) * inf;
+    let in_inf_post = inf;
+    let w_post = bezier_speed_ramp_weight(out_inf_post, in_inf_post);
+
+    let knee_ticks = if dt_pre.0 >= 4 {
+        let mut alpha = alpha_target;
+        let desired_peak = (v_pre.max(v_post) * 1.15).min(req.max_speed);
+        if desired_peak > v_pre + 1e-9 && v_pre > req.min_speed + 1e-9 {
+            let max_k = (v_pre - req.min_speed) / (desired_peak - req.min_speed);
+            let needed_alpha = 1.0 - max_k / w_pre;
+            if needed_alpha > alpha {
+                alpha = needed_alpha.min(0.85);
+            }
+        }
+        Some(((alpha * dt_pre.0 as f64).round() as i64).clamp(1, dt_pre.0 - 1))
+    } else {
+        None
+    };
+    let k_pre = match knee_ticks {
+        Some(k) => (1.0 - (k as f64 / dt_pre.0 as f64)) * w_pre,
+        None => w_pre,
+    };
+
+    let post_geometry = |span: i64, target_v: f64| -> (Option<i64>, f64) {
+        if span >= 4 {
+            let mut gamma = gamma_target;
+            let desired_peak = (v_pre.max(target_v) * 1.15).min(req.max_speed);
+            if desired_peak > target_v + 1e-9 && target_v > req.min_speed + 1e-9 {
+                let max_k = (target_v - req.min_speed) / (desired_peak - req.min_speed);
+                let needed_gamma = max_k / (1.0 - w_post);
+                if needed_gamma < gamma {
+                    gamma = needed_gamma.max(0.15);
+                }
+            }
+            let off = ((gamma * span as f64).round() as i64).clamp(1, span - 1);
+            let actual_gamma = off as f64 / span as f64;
+            (Some(off), actual_gamma * (1.0 - w_post))
+        } else {
+            (None, 1.0 - w_post)
+        }
+    };
+
+    let v_peak_pre_max = if dt_pre > Flicks::ZERO {
+        req.max_speed
+            .min(req.min_speed + (v_pre - req.min_speed) / k_pre)
+    } else {
+        req.max_speed
+    };
+
+    let (settle_offset_full, k_post_full) = post_geometry(dt_post.0, v_post);
+    let v_peak_post_max = if dt_post > Flicks::ZERO {
+        req.max_speed
+            .min(req.min_speed + (v_post - req.min_speed) / k_post_full)
+    } else {
+        req.max_speed
+    };
+
+    let mut keyframes = Vec::with_capacity(6);
+
+    if dt_pre == Flicks::ZERO {
+        if dt_post.0 < 2 {
+            return SpeedCurveSpec::Constant { speed: v_post };
+        }
+        let v_peak = v_peak_post_max.max(v_post).min(req.max_speed);
+        let v_settle = ((v_post - k_post_full * v_peak) / (1.0 - k_post_full))
+            .clamp(req.min_speed, req.max_speed);
+        keyframes.push(
+            BezierSpeedKeyframe::speed(Flicks::ZERO, v_peak).with_out_ease(KeyframeEase {
+                speed: 0.0,
+                influence: out_inf_post,
+            }),
+        );
+        push_anime_post_keyframes(
+            &mut keyframes,
+            Flicks::ZERO,
+            total_dt,
+            settle_offset_full,
+            v_settle,
+            in_inf_post,
+        );
+        return SpeedCurveSpec::CubicBezierSpeed { keyframes };
+    }
+
+    if dt_post == Flicks::ZERO {
+        if dt_pre.0 < 2 {
+            return SpeedCurveSpec::Constant { speed: v_pre };
+        }
+        let v_peak = v_peak_pre_max.max(v_pre).min(req.max_speed);
+        let v_low =
+            ((v_pre - k_pre * v_peak) / (1.0 - k_pre)).clamp(req.min_speed, req.max_speed);
+        push_anime_pre_keyframes(&mut keyframes, dt_pre, knee_ticks, v_low, out_inf_pre);
+        keyframes.push(
+            BezierSpeedKeyframe::speed(dt_pre, v_peak).with_in_ease(KeyframeEase {
+                speed: 0.0,
+                influence: in_inf_pre,
+            }),
+        );
+        return SpeedCurveSpec::CubicBezierSpeed { keyframes };
+    }
+
+    let lo = v_pre.max(v_post);
+    let hi = v_peak_pre_max.min(v_peak_post_max);
+
+    if lo <= hi + 1e-12 {
+        // C0-continuous peak shared across impact at `dt_pre`.
+        let v_peak = hi.max(lo).min(req.max_speed);
+        let v_low =
+            ((v_pre - k_pre * v_peak) / (1.0 - k_pre)).clamp(req.min_speed, req.max_speed);
+        let v_settle = ((v_post - k_post_full * v_peak) / (1.0 - k_post_full))
+            .clamp(req.min_speed, req.max_speed);
+
+        push_anime_pre_keyframes(&mut keyframes, dt_pre, knee_ticks, v_low, out_inf_pre);
+        keyframes.push(
+            BezierSpeedKeyframe::speed(dt_pre, v_peak)
+                .with_in_ease(KeyframeEase {
+                    speed: 0.0,
+                    influence: in_inf_pre,
+                })
+                .with_out_ease(KeyframeEase {
+                    speed: 0.0,
+                    influence: out_inf_post,
+                }),
+        );
+        push_anime_post_keyframes(
+            &mut keyframes,
+            dt_pre,
+            total_dt,
+            settle_offset_full,
+            v_settle,
+            in_inf_post,
+        );
+        return SpeedCurveSpec::CubicBezierSpeed { keyframes };
+    }
+
+    // Disjoint feasible peak ranges (e.g. one segment hugs min_speed while the other hugs max_speed):
+    // lock pre-impact integral at `dt_pre` and use a 1-tick bridge at `[dt_pre, dt_pre + 1]`.
+    let v_peak_pre = v_peak_pre_max.max(v_pre).min(req.max_speed);
+    let v_low =
+        ((v_pre - k_pre * v_peak_pre) / (1.0 - k_pre)).clamp(req.min_speed, req.max_speed);
+    push_anime_pre_keyframes(&mut keyframes, dt_pre, knee_ticks, v_low, out_inf_pre);
+
+    if dt_post.0 >= 4 {
+        let post_start = Flicks(dt_pre.0 + 1);
+        let rem_span = dt_post.0 - 1;
+        let (settle_off_rem, k_post_rem) = post_geometry(rem_span, v_post);
+        let v_peak_post_est = v_peak_post_max.max(v_post).min(req.max_speed);
+        let bridge_ticks = 0.5 * (v_peak_pre + v_peak_post_est);
+        let v_post_rem_raw = (v_post * dt_post.0 as f64 - bridge_ticks) / rem_span as f64;
+        let v_post_eff = if (req.min_speed..=req.max_speed).contains(&v_post_rem_raw) {
+            v_post_rem_raw
+        } else {
+            v_post
+        };
+        let v_peak_post = req
+            .max_speed
+            .min(req.min_speed + (v_post_eff - req.min_speed) / k_post_rem)
+            .max(v_post_eff);
+        let v_settle = ((v_post_eff - k_post_rem * v_peak_post) / (1.0 - k_post_rem))
+            .clamp(req.min_speed, req.max_speed);
+
+        keyframes.push(
+            BezierSpeedKeyframe::speed(dt_pre, v_peak_pre).with_in_ease(KeyframeEase {
+                speed: 0.0,
+                influence: in_inf_pre,
+            }),
+        );
+        keyframes.push(
+            BezierSpeedKeyframe::speed(post_start, v_peak_post).with_out_ease(KeyframeEase {
+                speed: 0.0,
+                influence: out_inf_post,
+            }),
+        );
+        push_anime_post_keyframes(
+            &mut keyframes,
+            post_start,
+            total_dt,
+            settle_off_rem,
+            v_settle,
+            in_inf_post,
+        );
+    } else {
+        keyframes.push(
+            BezierSpeedKeyframe::speed(dt_pre, v_peak_pre).with_in_ease(KeyframeEase {
+                speed: 0.0,
+                influence: in_inf_pre,
+            }),
+        );
+        keyframes.push(BezierSpeedKeyframe::speed(total_dt, v_post));
+    }
+
+    SpeedCurveSpec::CubicBezierSpeed { keyframes }
 }

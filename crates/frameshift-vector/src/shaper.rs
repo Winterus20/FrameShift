@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use frameshift_schema::{TextAlign2D, TextAnimatorDef, TextSelectorUnit, WritingMode2D};
+use frameshift_schema::{
+    TextAlign2D, TextAnimatorDef, TextRangeShape, TextSelectorUnit, WritingMode2D,
+};
 use harfrust::{Buffer, Direction, Feature, ShapeOptions, ShaperFont, Tag};
 use lyon_tessellation::math::{Point, point};
 use lyon_tessellation::path::Path as LyonPath;
@@ -100,6 +102,8 @@ pub struct GlyphAnimationState {
     pub position_norm: [f32; 2],
     pub scale: f32,
     pub opacity: f32,
+    pub rotation_deg: f32,
+    pub tracking_em: f32,
 }
 
 impl Default for GlyphAnimationState {
@@ -108,6 +112,49 @@ impl Default for GlyphAnimationState {
             position_norm: [0.0, 0.0],
             scale: 1.0,
             opacity: 1.0,
+            rotation_deg: 0.0,
+            tracking_em: 0.0,
+        }
+    }
+}
+
+#[inline]
+fn hash_animator_unit_01(seed: u64, unit_idx: u32) -> f32 {
+    let s32 = (seed as u32) ^ ((seed >> 32) as u32);
+    let mut x = unit_idx.wrapping_mul(0x9E37_79B9u32) ^ s32 ^ 0x85EB_CA6Bu32;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352Du32);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846C_A68Bu32);
+    x ^= x >> 16;
+    ((x >> 8) as f32) / 16_777_216.0
+}
+
+#[inline]
+fn ease_animator_progress(t: f32, ease_high: f32, ease_low: f32) -> f32 {
+    let u = t.clamp(0.0, 1.0);
+    if ease_high == 0.0 && ease_low == 0.0 {
+        return u;
+    }
+    let eh = (ease_high / 100.0).clamp(-1.0, 1.0);
+    let el = (ease_low / 100.0).clamp(-1.0, 1.0);
+    let m0 = (if el >= 0.0 { 1.0 - el } else { 1.0 - 0.5 * el }).clamp(0.0, 1.5);
+    let m1 = (if eh >= 0.0 { 1.0 - eh } else { 1.0 - 0.5 * eh }).clamp(0.0, 1.5);
+    let u2 = u * u;
+    let u3 = u2 * u;
+    ((u3 - 2.0 * u2 + u) * m0 + (-2.0 * u3 + 3.0 * u2) + (u3 - u2) * m1).clamp(0.0, 1.0)
+}
+
+#[inline]
+fn evaluate_range_shape_weight(shape: TextRangeShape, u: f32) -> f32 {
+    let x = u.clamp(0.0, 1.0);
+    match shape {
+        TextRangeShape::Square => 1.0,
+        TextRangeShape::RampUp => x,
+        TextRangeShape::RampDown => 1.0 - x,
+        TextRangeShape::Triangle => (1.0 - (2.0 * x - 1.0).abs()).clamp(0.0, 1.0),
+        TextRangeShape::Smooth => {
+            0.5 * (1.0 - (std::f32::consts::TAU * x).cos()).clamp(0.0, 2.0)
         }
     }
 }
@@ -117,6 +164,18 @@ pub fn evaluate_text_animator(
     animator: Option<&TextAnimatorDef>,
     grapheme_range: (u32, u32),
     word_range: (u32, u32),
+    tick: Flicks,
+) -> GlyphAnimationState {
+    evaluate_text_animator_with_total(animator, grapheme_range, word_range, None, tick)
+}
+
+/// Evaluates a text animator with an optional known `total_units` count for open-ended
+/// (`range_end: None`) range shapes and deterministic stagger randomization.
+pub fn evaluate_text_animator_with_total(
+    animator: Option<&TextAnimatorDef>,
+    grapheme_range: (u32, u32),
+    word_range: (u32, u32),
+    total_units: Option<u32>,
     tick: Flicks,
 ) -> GlyphAnimationState {
     let Some(animator) = animator else {
@@ -132,16 +191,43 @@ pub fn evaluate_text_animator(
     }
 
     let selected_start = unit_start.max(animator.range_start);
-    let stagger = i128::from(selected_start.saturating_sub(animator.range_start))
-        * i128::from(animator.delay_ticks.max(0));
-    let begin = i128::from(animator.start_tick).saturating_add(stagger);
-    let elapsed = i128::from(tick.0) - begin;
-    let progress = if animator.duration_ticks <= 0 {
-        if elapsed >= 0 { 1.0 } else { 0.0 }
+    let rel_idx = selected_start.saturating_sub(animator.range_start);
+    let effective_end = animator.range_end.or(total_units);
+    let range_count = effective_end
+        .map(|e| e.saturating_sub(animator.range_start).max(1));
+
+    let stagger_f = if let Some(seed) = animator.randomize_seed {
+        let h = hash_animator_unit_01(seed, selected_start) as f64;
+        let span_slots = range_count
+            .map(|c| c.saturating_sub(1) as f64)
+            .unwrap_or(8.0);
+        h * span_slots * (animator.delay_ticks.max(0) as f64)
     } else {
-        (elapsed as f64 / animator.duration_ticks as f64).clamp(0.0, 1.0) as f32
+        (i128::from(rel_idx) * i128::from(animator.delay_ticks.max(0))) as f64
     };
-    let from_amount = 1.0 - progress;
+
+    let elapsed = (i128::from(tick.0) - i128::from(animator.start_tick)) as f64 - stagger_f;
+    let raw_progress = if animator.duration_ticks <= 0 {
+        if elapsed >= 0.0 { 1.0 } else { 0.0 }
+    } else {
+        (elapsed / animator.duration_ticks as f64).clamp(0.0, 1.0) as f32
+    };
+    let progress = ease_animator_progress(raw_progress, animator.ease_high, animator.ease_low);
+
+    let shape_weight = if animator.shape == TextRangeShape::Square {
+        1.0
+    } else {
+        let u = if let Some(seed) = animator.randomize_seed {
+            hash_animator_unit_01(seed ^ 0x517C_C1B7_2722_0A95u64, selected_start)
+        } else if let Some(count) = range_count {
+            (rel_idx as f32 + 0.5) / (count as f32)
+        } else {
+            (rel_idx as f32 + 0.5) / (rel_idx as f32 + 1.0)
+        };
+        evaluate_range_shape_weight(animator.shape, u)
+    };
+
+    let from_amount = (1.0 - progress) * shape_weight;
     GlyphAnimationState {
         position_norm: [
             animator.position_from_norm[0] * from_amount,
@@ -149,6 +235,8 @@ pub fn evaluate_text_animator(
         ],
         scale: 1.0 + (animator.scale_from - 1.0) * from_amount,
         opacity: 1.0 + (animator.opacity_from - 1.0) * from_amount,
+        rotation_deg: animator.rotation_deg_from * from_amount,
+        tracking_em: animator.tracking_em_from * from_amount,
     }
 }
 
@@ -571,8 +659,8 @@ pub fn shape_text_block(
 pub(crate) struct TextUnitMap {
     grapheme_by_char: Vec<u32>,
     word_by_char: Vec<Option<u32>>,
-    grapheme_count: u32,
-    word_count: u32,
+    pub(crate) grapheme_count: u32,
+    pub(crate) word_count: u32,
 }
 
 impl TextUnitMap {
@@ -967,8 +1055,8 @@ fn eval_cubic_deriv_ctrl(
 
 #[cfg(test)]
 mod selector_tests {
-    use super::{TextUnitMap, evaluate_text_animator};
-    use frameshift_schema::{TextAnimatorDef, TextSelectorUnit};
+    use super::{TextUnitMap, evaluate_text_animator, evaluate_text_animator_with_total};
+    use frameshift_schema::{TextAnimatorDef, TextRangeShape, TextSelectorUnit};
     use frameshift_time::Flicks;
 
     #[test]
@@ -1001,6 +1089,7 @@ mod selector_tests {
             position_from_norm: [0.2, -0.1],
             scale_from: 0.5,
             opacity_from: 0.0,
+            ..Default::default()
         };
 
         let unselected = evaluate_text_animator(
@@ -1010,6 +1099,8 @@ mod selector_tests {
             Flicks(0),
         );
         assert_eq!(unselected.opacity, 1.0);
+        assert_eq!(unselected.rotation_deg, 0.0);
+        assert_eq!(unselected.tracking_em, 0.0);
 
         let selected_first = evaluate_text_animator(
             Some(&animator),
@@ -1028,5 +1119,103 @@ mod selector_tests {
         assert!((selected_second.opacity - 0.5).abs() < 1e-6);
         assert!((selected_second.scale - 0.75).abs() < 1e-6);
         assert!((selected_second.position_norm[0] - 0.1).abs() < 1e-6);
+        assert_eq!(selected_second.rotation_deg, 0.0);
+        assert_eq!(selected_second.tracking_em, 0.0);
+    }
+
+    #[test]
+    fn text_range_shapes_easing_rotation_tracking_and_randomize_work() {
+        let base = TextAnimatorDef {
+            unit: TextSelectorUnit::Grapheme,
+            range_start: 0,
+            range_end: Some(5),
+            start_tick: 0,
+            duration_ticks: 100,
+            delay_ticks: 0,
+            position_from_norm: [0.0, 0.2],
+            scale_from: 2.0,
+            opacity_from: 0.0,
+            rotation_deg_from: -30.0,
+            tracking_em_from: 0.4,
+            ..Default::default()
+        };
+
+        let eval_shape = |shape: TextRangeShape, idx: u32, tick: i64| {
+            let mut anim = base.clone();
+            anim.shape = shape;
+            evaluate_text_animator(Some(&anim), (idx, idx + 1), (0, 1), Flicks(tick))
+        };
+
+        // Square at t=0 has full rotation & tracking from-values
+        let sq0 = eval_shape(TextRangeShape::Square, 0, 0);
+        assert!((sq0.rotation_deg - (-30.0)).abs() < 1e-6);
+        assert!((sq0.tracking_em - 0.4).abs() < 1e-6);
+        assert!((sq0.opacity - 0.0).abs() < 1e-6);
+
+        // RampUp increases weight from start to end
+        let ru_first = eval_shape(TextRangeShape::RampUp, 0, 0);
+        let ru_last = eval_shape(TextRangeShape::RampUp, 4, 0);
+        assert!(ru_last.rotation_deg.abs() > ru_first.rotation_deg.abs());
+        assert!(ru_last.tracking_em > ru_first.tracking_em);
+
+        // RampDown decreases weight from start to end
+        let rd_first = eval_shape(TextRangeShape::RampDown, 0, 0);
+        let rd_last = eval_shape(TextRangeShape::RampDown, 4, 0);
+        assert!(rd_first.rotation_deg.abs() > rd_last.rotation_deg.abs());
+
+        // Triangle and Smooth peak at center unit (idx = 2 of 0..5)
+        let tri_edge = eval_shape(TextRangeShape::Triangle, 0, 0);
+        let tri_mid = eval_shape(TextRangeShape::Triangle, 2, 0);
+        assert!(tri_mid.rotation_deg.abs() > tri_edge.rotation_deg.abs());
+        assert!((tri_mid.rotation_deg - (-30.0)).abs() < 1e-5);
+
+        let sm_edge0 = eval_shape(TextRangeShape::Smooth, 0, 0);
+        let sm_off = eval_shape(TextRangeShape::Smooth, 1, 0);
+        let sm_mid = eval_shape(TextRangeShape::Smooth, 2, 0);
+        assert!(sm_mid.rotation_deg.abs() > sm_off.rotation_deg.abs());
+        assert!((sm_edge0.rotation_deg - tri_edge.rotation_deg).abs() < 5.0);
+        // Smooth vs Triangle differ off-center (idx 1 -> u=0.3 -> Tri=0.6, Smooth=sin^2(0.3*pi)~0.6545)
+        let tri_off = eval_shape(TextRangeShape::Triangle, 1, 0);
+        assert!((sm_off.rotation_deg - tri_off.rotation_deg).abs() > 0.5);
+
+        // Easing shifts mid-animation values while preserving endpoints (t=0 and t=100)
+        let mut eased = base.clone();
+        eased.ease_high = 85.0;
+        eased.ease_low = 0.0;
+        let lin_mid = eval_shape(TextRangeShape::Square, 0, 25);
+        let eased_mid = evaluate_text_animator(Some(&eased), (0, 1), (0, 1), Flicks(25));
+        assert_ne!(lin_mid.opacity, eased_mid.opacity);
+        let eased_end = evaluate_text_animator(Some(&eased), (0, 1), (0, 1), Flicks(100));
+        assert!((eased_end.opacity - 1.0).abs() < 1e-6);
+        assert!(eased_end.rotation_deg.abs() < 1e-6);
+
+        // Deterministic randomize_seed reorders stagger reproducibly
+        let mut rand_anim = base;
+        rand_anim.delay_ticks = 25;
+        rand_anim.randomize_seed = Some(42);
+        let r0_a = evaluate_text_animator_with_total(
+            Some(&rand_anim),
+            (0, 1),
+            (0, 1),
+            Some(5),
+            Flicks(60),
+        );
+        let r0_b = evaluate_text_animator_with_total(
+            Some(&rand_anim),
+            (0, 1),
+            (0, 1),
+            Some(5),
+            Flicks(60),
+        );
+        assert_eq!(r0_a, r0_b);
+        rand_anim.randomize_seed = Some(99);
+        let r0_diff = evaluate_text_animator_with_total(
+            Some(&rand_anim),
+            (0, 1),
+            (0, 1),
+            Some(5),
+            Flicks(60),
+        );
+        assert_ne!(r0_a, r0_diff);
     }
 }

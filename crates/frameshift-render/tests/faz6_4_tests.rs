@@ -63,6 +63,8 @@ fn make_test_project(
             resolution: Resolution { width, height },
             clips: vec![],
             audio_clips: vec![],
+            ducking_rules: vec![],
+            micro_silences: vec![],
         },
         events: vec![],
         graph,

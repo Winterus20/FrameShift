@@ -15,8 +15,9 @@ pub use expr::{
 };
 pub use flicks::{Flicks, FLICKS_PER_MILLISECOND, FLICKS_PER_SECOND};
 pub use impact_solver::{
-    ConstraintFailure, ConstraintViolation, ImpactCurveStyle, ImpactSolution, ImpactSolveRequest,
-    ImpactSolver, SegmentSide, SourceFitMode, SuggestedAlternative,
+    anime_snap_in, anime_snap_out, twixtor_ramp, ConstraintFailure, ConstraintViolation,
+    ImpactCurveStyle, ImpactSolution, ImpactSolveRequest, ImpactSolver, SegmentSide,
+    SourceFitMode, SuggestedAlternative,
 };
 pub use pts_index::{FrameMatch, PtsIndex};
 pub use rational::{
@@ -24,4 +25,7 @@ pub use rational::{
     ticks_to_audio_samples_nearest, Rational32, AUDIO_44_1_KHZ, AUDIO_48_KHZ, AUDIO_96_KHZ,
     FPS_23_976, FPS_24, FPS_25, FPS_29_97, FPS_30, FPS_59_94, FPS_60,
 };
-pub use speed_curve::{SpeedCurve, SpeedCurveSpec, SpeedKeyframe, SpeedLutEntry};
+pub use speed_curve::{
+    apply_time_quantize, BezierSpeedKeyframe, KeyframeEase, SpeedCurve, SpeedCurveSpec,
+    SpeedKeyframe, SpeedLutEntry, TimeQuantizeSpec,
+};

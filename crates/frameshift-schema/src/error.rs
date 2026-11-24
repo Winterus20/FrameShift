@@ -102,6 +102,24 @@ pub enum SchemaError {
     #[error("invalid vector_path_hud node '{node_id}': {message}")]
     InvalidVectorPathHud { node_id: NodeId, message: String },
 
+    #[error("invalid mask_matte node '{node_id}': {message}")]
+    InvalidMaskMatte { node_id: NodeId, message: String },
+
+    #[error("invalid transform3_d node '{node_id}': {message}")]
+    InvalidTransform3D { node_id: NodeId, message: String },
+
+    #[error("invalid adjustment_layer node '{node_id}': {message}")]
+    InvalidAdjustmentLayer { node_id: NodeId, message: String },
+
+    #[error("invalid blur_mo_curves node '{node_id}': {message}")]
+    InvalidBlurMoCurves { node_id: NodeId, message: String },
+
+    #[error("invalid null3_d node '{node_id}': {message}")]
+    InvalidNull3D { node_id: NodeId, message: String },
+
+    #[error("invalid depth_matte node '{node_id}': {message}")]
+    InvalidDepthMatte { node_id: NodeId, message: String },
+
     #[error("render graph contains a cycle involving nodes: {cycle:?}")]
     CycleDetected { cycle: Vec<NodeId> },
 

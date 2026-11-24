@@ -7,15 +7,15 @@ use crate::font::{
     GLYPH_CELL_WIDTH,
 };
 use crate::font_locator::{
-    draw_ttf_text_with_fallbacks, rasterize_ttf_text_rgba16f as rasterize_ttf_rgba16f_impl,
-    resolve_font_chain, FontQuery, TtfTextAlign, TtfTextConfig,
+    rasterize_ttf_text_rgba16f as rasterize_ttf_rgba16f_impl, resolve_font_chain, FontQuery,
+    TtfTextAlign, TtfTextConfig,
 };
 use crate::hud_path::{
     render_vector_path_hud_rgba16f, CubicBezierHudSegment, VectorPathHudConfig,
 };
-use crate::shaper::VariationAxes;
+use crate::shaper::{TextUnitMap, VariationAxes, evaluate_text_animator_with_total};
 use frameshift_media::{AlphaMode, Rgba16fFrame, Rgba8Frame};
-use frameshift_schema::{NodeKind, TextAlign2D, WritingMode2D};
+use frameshift_schema::{NodeKind, TextAlign2D, TextAnimatorDef, TextSelectorUnit, WritingMode2D};
 use frameshift_time::Flicks;
 use serde::{Deserialize, Serialize};
 
@@ -112,6 +112,8 @@ pub struct VectorTextConfig {
     pub outline_gap_norm: f32,
     #[serde(default = "default_one")]
     pub hdr_intensity: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_animator: Option<TextAnimatorDef>,
 }
 
 impl Default for VectorTextConfig {
@@ -151,6 +153,7 @@ impl Default for VectorTextConfig {
             outer_outline_width_norm: 0.0,
             outline_gap_norm: 0.0,
             hdr_intensity: 1.0,
+            text_animator: None,
         }
     }
 }
@@ -192,7 +195,7 @@ impl VectorTextConfig {
                 glow_rgba,
                 hdr_intensity,
                 gpu_slug: _,
-                text_animator: _,
+                text_animator,
             } => Some(Self {
                 text: text.clone(),
                 font_size_norm: *font_size_norm,
@@ -227,6 +230,7 @@ impl VectorTextConfig {
                 outer_outline_width_norm: *outer_outline_width_norm,
                 outline_gap_norm: *outline_gap_norm,
                 hdr_intensity: *hdr_intensity,
+                text_animator: text_animator.clone(),
                 ..Self::default()
             }),
             _ => None,
@@ -295,6 +299,7 @@ impl VectorTextConfig {
             outer_outline_width_norm: self.outer_outline_width_norm,
             outline_gap_norm: self.outline_gap_norm,
             hdr_intensity: self.hdr_intensity,
+            text_animator: self.text_animator.clone(),
         }
     }
 }
@@ -353,6 +358,8 @@ struct PlacedGlyph {
     /// Top-left of the 8x12 glyph cell in canvas pixels.
     origin_x: f32,
     origin_y: f32,
+    grapheme_range: (u32, u32),
+    word_range: (u32, u32),
 }
 
 /// Deterministic kerning adjustment in glyph grid units (`8` units = 1 em cap height).
@@ -439,7 +446,7 @@ pub fn render_vector_text_rgba8(
     alpha_mode: AlphaMode,
 ) -> Result<Rgba8Frame, VectorError> {
     let mut canvas = VectorCanvas::new(width, height)?;
-    draw_vector_text(&mut canvas, config)?;
+    draw_vector_text_at(&mut canvas, config, pts)?;
     canvas.to_rgba8_frame(pts, alpha_mode)
 }
 
@@ -456,7 +463,7 @@ pub fn render_vector_text_rgba16f(
         return rasterize_ttf_rgba16f_impl(&ttf_cfg, width, height, pts, alpha_mode, None);
     }
     let mut canvas = VectorCanvas::new(width, height)?;
-    draw_vector_text(&mut canvas, config)?;
+    draw_vector_text_at(&mut canvas, config, pts)?;
     canvas.to_rgba16f_frame(pts, alpha_mode)
 }
 
@@ -580,6 +587,15 @@ pub fn draw_vector_text(
     canvas: &mut VectorCanvas,
     config: &VectorTextConfig,
 ) -> Result<(), VectorError> {
+    draw_vector_text_at(canvas, config, Flicks::ZERO)
+}
+
+/// Draws SDF-antialiased, kerning-aware typography onto `canvas` at `tick` (supporting `text_animator`).
+pub fn draw_vector_text_at(
+    canvas: &mut VectorCanvas,
+    config: &VectorTextConfig,
+    tick: Flicks,
+) -> Result<(), VectorError> {
     if config.uses_ttf_font() {
         let ttf_cfg = config.to_ttf_config();
         let query = FontQuery {
@@ -588,7 +604,9 @@ pub fn draw_vector_text(
             font_weight: ttf_cfg.font_weight,
         };
         let (resolved, fallbacks) = resolve_font_chain(&query, &ttf_cfg.fallback_fonts, None)?;
-        return draw_ttf_text_with_fallbacks(canvas, &ttf_cfg, &resolved, &fallbacks);
+        return crate::font_locator::draw_ttf_text_with_fallbacks_at(
+            canvas, &ttf_cfg, &resolved, &fallbacks, tick,
+        );
     }
 
     if !config.font_size_norm.is_finite()
@@ -631,6 +649,122 @@ pub fn draw_vector_text(
     let has_shadow = config.shadow_rgba[3] > 0.0
         && (shadow_dx.abs() > 0.0 || shadow_dy.abs() > 0.0 || shadow_blur_px > 0.0);
     let has_glow = glow_radius_px > 0.0 && config.glow_rgba[3] > 0.0;
+
+    let fill_premul = premultiply_rgba(config.color_rgba);
+    let outline_premul = premultiply_rgba(config.outline_rgba);
+    let shadow_premul = premultiply_rgba(config.shadow_rgba);
+    let glow_premul = premultiply_rgba(config.glow_rgba);
+    let apply_opacity = (op - 1.0).abs() > 0.0;
+
+    if let Some(anim) = config.text_animator.as_ref() {
+        let total_units = match anim.unit {
+            TextSelectorUnit::Grapheme => layout.grapheme_count,
+            TextSelectorUnit::Word => layout.word_count,
+        };
+        let end = anim.range_end.unwrap_or(total_units).min(total_units);
+        let range_count = end.saturating_sub(anim.range_start).max(1);
+        let mid_off = 0.5 * ((range_count - 1) as f32);
+        let font_px = config.font_size_norm * h_f;
+        let cell_w_px = (GLYPH_CELL_WIDTH as f32) * scale;
+        let cell_h_px = (GLYPH_CELL_HEIGHT as f32) * scale;
+
+        for placed in &layout.glyphs {
+            if placed.ch == ' ' || placed.ch == '\t' {
+                continue;
+            }
+            let state = evaluate_text_animator_with_total(
+                Some(anim),
+                placed.grapheme_range,
+                placed.word_range,
+                Some(total_units),
+                tick,
+            );
+            let g_op = (state.opacity * op).clamp(0.0, 1.0);
+            let g_scale = state.scale.max(0.0);
+            if g_op <= 1e-4 || g_scale <= 1e-4 {
+                continue;
+            }
+
+            let (u_start, u_end) = match anim.unit {
+                TextSelectorUnit::Grapheme => placed.grapheme_range,
+                TextSelectorUnit::Word => placed.word_range,
+            };
+            let tracking_shift_px = if u_end > u_start && u_end > anim.range_start && u_start < end {
+                let sel = u_start.max(anim.range_start);
+                let rel = (sel - anim.range_start) as f32 - mid_off;
+                rel * state.tracking_em * font_px
+            } else {
+                0.0
+            };
+
+            let cx = placed.origin_x + cell_w_px * 0.5 + state.position_norm[0] * h_f + tracking_shift_px;
+            let cy = placed.origin_y + cell_h_px * 0.5 + state.position_norm[1] * h_f;
+            let half_w = cell_w_px * 0.5 * g_scale;
+            let half_h = cell_h_px * 0.5 * g_scale;
+            let eff_scale = scale * g_scale;
+            let glyph_pad = outline_px.max(glow_radius_px) + 2.5 * eff_scale + 2.0;
+            let diag = (half_w * half_w + half_h * half_h).sqrt() + glyph_pad;
+
+            let gx0 = ((cx - diag).floor() as i64).clamp(0, (width - 1) as i64) as u32;
+            let gy0 = ((cy - diag).floor() as i64).clamp(0, (height - 1) as i64) as u32;
+            let gx1 = ((cx + diag).ceil() as i64).clamp(0, (width - 1) as i64) as u32;
+            let gy1 = ((cy + diag).ceil() as i64).clamp(0, (height - 1) as i64) as u32;
+            if gx1 < gx0 || gy1 < gy0 {
+                continue;
+            }
+
+            let sdf_tile = glyph_sdf(placed.ch);
+            let inv_eff_scale = 1.0 / eff_scale;
+            let use_exact = eff_scale >= 3.0;
+            let (sin_r, cos_r) = state.rotation_deg.to_radians().sin_cos();
+
+            for py in gy0..=gy1 {
+                let dy = (py as f32 + 0.5) - cy;
+                for px in gx0..=gx1 {
+                    let dx = (px as f32 + 0.5) - cx;
+                    // Inverse rotate back into glyph cell local space
+                    let rx = dx * cos_r - dy * sin_r;
+                    let ry = dx * sin_r + dy * cos_r;
+                    let local_x = rx * inv_eff_scale + (GLYPH_CELL_WIDTH as f32) * 0.5;
+                    let local_y = ry * inv_eff_scale + (GLYPH_CELL_HEIGHT as f32) * 0.5;
+                    let dist = if use_exact {
+                        sdf_tile.eval_exact(local_x, local_y)
+                    } else {
+                        sdf_tile.sample(local_x, local_y)
+                    };
+                    let d_px = dist * eff_scale;
+
+                    let mut acc = [0.0_f32; 4];
+                    if has_glow {
+                        let d_outer = (d_px - outline_px).max(0.0);
+                        if d_outer < glow_radius_px {
+                            let t = 1.0 - (d_outer / glow_radius_px);
+                            acc = source_over_premul(acc, scale_premul(glow_premul, t * t));
+                        }
+                    }
+                    if has_outline {
+                        let outer_cov = sdf_coverage(d_px - outline_px);
+                        if outer_cov > 0.0 {
+                            acc = source_over_premul(acc, scale_premul(outline_premul, outer_cov));
+                        }
+                    }
+                    if fill_premul[3] > 0.0 {
+                        let fill_cov = sdf_coverage(d_px);
+                        if fill_cov > 0.0 {
+                            acc = source_over_premul(acc, scale_premul(fill_premul, fill_cov));
+                        }
+                    }
+                    if acc[3] > 0.0 {
+                        if (g_op - 1.0).abs() > 0.0 {
+                            acc = scale_premul(acc, g_op);
+                        }
+                        canvas.blend_pixel_premul(px, py, acc, 1.0);
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
 
     let extra_pad = outline_px
         .max(glow_radius_px)
@@ -702,12 +836,6 @@ pub fn draw_vector_text(
             }
         }
     }
-
-    let fill_premul = premultiply_rgba(config.color_rgba);
-    let outline_premul = premultiply_rgba(config.outline_rgba);
-    let shadow_premul = premultiply_rgba(config.shadow_rgba);
-    let glow_premul = premultiply_rgba(config.glow_rgba);
-    let apply_opacity = (op - 1.0).abs() > 0.0;
 
     for py in region_y0..=region_y1 {
         let ry = (py - region_y0) as usize;
@@ -868,6 +996,8 @@ struct TextLayout {
     scale: f32,
     glyphs: Vec<PlacedGlyph>,
     bounds: Option<(f32, f32, f32, f32)>,
+    grapheme_count: u32,
+    word_count: u32,
 }
 
 fn layout_text(config: &VectorTextConfig, width: u32, height: u32) -> TextLayout {
@@ -880,8 +1010,14 @@ fn layout_text(config: &VectorTextConfig, width: u32, height: u32) -> TextLayout
             scale: 0.0,
             glyphs: Vec::new(),
             bounds: None,
+            grapheme_count: 0,
+            word_count: 0,
         };
     }
+
+    let normalized = config.text.replace("\r\n", "\n");
+    let unit_map = TextUnitMap::new(&normalized);
+    let lines: Vec<&str> = normalized.split('\n').collect();
 
     let tracking_em = config.tracking_em_override.unwrap_or(config.tracking_em);
     let line_height_em = config
@@ -890,11 +1026,6 @@ fn layout_text(config: &VectorTextConfig, width: u32, height: u32) -> TextLayout
     let tracking_units = tracking_em * GLYPH_CAP_HEIGHT;
     let line_step_px = line_height_em.max(0.5) * font_px;
 
-    let lines: Vec<&str> = config
-        .text
-        .split('\n')
-        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .collect();
     let total_block_h = if lines.len() <= 1 {
         font_px
     } else {
@@ -917,10 +1048,14 @@ fn layout_text(config: &VectorTextConfig, width: u32, height: u32) -> TextLayout
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut max_y = f32::NEG_INFINITY;
+    let mut global_char_idx = 0u32;
 
     for (line_idx, line) in lines.iter().enumerate() {
         let chars: Vec<char> = line.chars().collect();
         if chars.is_empty() {
+            if line_idx + 1 < lines.len() {
+                global_char_idx = global_char_idx.saturating_add(1);
+            }
             continue;
         }
 
@@ -941,14 +1076,20 @@ fn layout_text(config: &VectorTextConfig, width: u32, height: u32) -> TextLayout
                 0.0
             };
             cursor_units += sdf.bitmap.advance + extra_track;
-            line_advances_units.push((ch, start_u, sdf.bitmap.left_col as f32, sdf.bitmap.ink_width as f32));
+            line_advances_units.push((
+                ch,
+                start_u,
+                sdf.bitmap.left_col as f32,
+                sdf.bitmap.ink_width as f32,
+                global_char_idx + i as u32,
+            ));
         }
 
         // Trim trailing inter-glyph space from visual line width so centering is exact.
         let last_ch = *chars.last().unwrap();
         let last_bmp = bitmap_glyph(last_ch);
         let visual_end_units = if last_bmp.ink_width > 0 {
-            let (_, start_u, _, ink_w) = line_advances_units.last().copied().unwrap();
+            let (_, start_u, _, ink_w, _) = line_advances_units.last().copied().unwrap();
             start_u + ink_w
         } else {
             cursor_units
@@ -963,12 +1104,14 @@ fn layout_text(config: &VectorTextConfig, width: u32, height: u32) -> TextLayout
         let cap_top_y = first_cap_top_y + (line_idx as f32) * line_step_px;
         let cell_origin_y = cap_top_y - GLYPH_CAP_TOP * scale;
 
-        for (ch, start_u, left_col_u, ink_w_u) in line_advances_units {
+        for (ch, start_u, left_col_u, ink_w_u, char_idx) in line_advances_units {
             let origin_x = line_start_x + (start_u - left_col_u) * scale;
             glyphs.push(PlacedGlyph {
                 ch,
                 origin_x,
                 origin_y: cell_origin_y,
+                grapheme_range: unit_map.grapheme_range(char_idx, char_idx + 1),
+                word_range: unit_map.word_range(char_idx, char_idx + 1),
             });
             if ink_w_u > 0.0 {
                 let gx0 = line_start_x + start_u * scale;
@@ -980,6 +1123,10 @@ fn layout_text(config: &VectorTextConfig, width: u32, height: u32) -> TextLayout
                 max_x = max_x.max(gx1);
                 max_y = max_y.max(gy1);
             }
+        }
+        global_char_idx = global_char_idx.saturating_add(chars.len() as u32);
+        if line_idx + 1 < lines.len() {
+            global_char_idx = global_char_idx.saturating_add(1);
         }
     }
 
@@ -993,6 +1140,8 @@ fn layout_text(config: &VectorTextConfig, width: u32, height: u32) -> TextLayout
         scale,
         glyphs,
         bounds,
+        grapheme_count: unit_map.grapheme_count,
+        word_count: unit_map.word_count,
     }
 }
 

@@ -26,7 +26,10 @@ pub use proposal::{
     PreviewArtifactState, ProjectPreviewSnapshot, ReceiptPreview, ReviewNote, ReviewNoteFreshness,
     ReviewNoteStore, ReviewNoteView, TickRange, apply_agent_command,
 };
-pub use snapshot::render_desktop_ui_snapshot;
+pub use snapshot::{
+    node_kind_accent, node_kind_label, render_desktop_ui_snapshot, template_slot_kind_accent,
+    template_slot_kind_label,
+};
 pub use timeline::{
     PreviewRequestGate, PreviewTicket, SnapKind, SnapResult, SpeedGraphPoint,
     TimelineAudioClipProjection, TimelineClipProjection, TimelineEventProjection,

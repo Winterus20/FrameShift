@@ -3,13 +3,12 @@ use crate::error::RenderError;
 use crate::pool::WORKING_TEXTURE_FORMAT;
 use crate::uniforms::{
     AnimeImpactFrameUniform, AnimeSharpenUniform, BackdropScrimUniform, BlendUniform,
-    BloomPassUniform,
-    ColorBasicUniform, CustomWgslUniform, DofBokehUniform, DofCocUniform, FilmHalationUniform,
-    FilmOpticsUniform, FxaaUniform, GpuMeshVertex3D, GpuSlugVertex, HalftoneGlowUniform,
-    Lut3DUniform, MaskMatteUniform, MotionBlurUniform, MotionTileShakeUniform,
-    ParticleField3DUniform, RadialShockwaveUniform, RibbonTrail3DUniform, SlugUniform,
-    Text2DFxUniform, Text2DJfaUniform, Text3DUniform, Transform3DUniform, TransformUniform,
-    WhipTransitionUniform,
+    BloomPassUniform, BlurMoCurvesUniform, ColorBasicUniform, CustomWgslUniform, DofBokehUniform,
+    DofCocUniform, FilmHalationUniform, FilmOpticsUniform, FxaaUniform, GpuMeshVertex3D,
+    GpuSlugVertex, HalftoneGlowUniform, Lut3DUniform, MaskMatteUniform, MotionBlurUniform,
+    MotionTileShakeUniform, ParticleField3DUniform, RadialShockwaveUniform, RibbonTrail3DUniform,
+    SlugUniform, Text2DFxUniform, Text2DJfaUniform, Text3DUniform, Transform3DUniform,
+    TransformUniform, WhipTransitionUniform,
 };
 use crate::warp2d::{CornerPinUniform, GridWarpUniform};
 use std::collections::HashMap;
@@ -35,6 +34,7 @@ const SHADER_TRANSITION_RIPPLE: &str = include_str!("../shaders/transition_rippl
 const SHADER_TRANSITION_KALEIDOSCOPE: &str =
     include_str!("../shaders/transition_kaleidoscope.wgsl");
 const SHADER_FX_MOTION_TILE_SHAKE: &str = include_str!("../shaders/fx_motion_tile_shake.wgsl");
+const SHADER_FX_BLUR_MOCURVES: &str = include_str!("../shaders/fx_blur_mocurves.wgsl");
 const SHADER_FX_ANIME_IMPACT_FRAME: &str = include_str!("../shaders/fx_anime_impact_frame.wgsl");
 const SHADER_FX_RADIAL_SHOCKWAVE: &str = include_str!("../shaders/fx_radial_shockwave.wgsl");
 const SHADER_FX_HALFTONE_GLOW: &str = include_str!("../shaders/fx_halftone_glow.wgsl");
@@ -101,6 +101,7 @@ pub struct ShaderPipelines {
     pub transition_ripple: ShaderProgram,
     pub transition_kaleidoscope: ShaderProgram,
     pub fx_motion_tile_shake: ShaderProgram,
+    pub fx_blur_mocurves: ShaderProgram,
     pub fx_anime_impact_frame: ShaderProgram,
     pub fx_radial_shockwave: ShaderProgram,
     pub fx_halftone_glow: ShaderProgram,
@@ -311,6 +312,16 @@ impl ShaderPipelines {
             "fs_main",
             1,
             Some(size_non_zero::<MotionTileShakeUniform>()),
+            WORKING_TEXTURE_FORMAT,
+        )?;
+
+        let fx_blur_mocurves = build_program(
+            device,
+            "fx_blur_mocurves",
+            SHADER_FX_BLUR_MOCURVES,
+            "fs_main",
+            1,
+            Some(size_non_zero::<BlurMoCurvesUniform>()),
             WORKING_TEXTURE_FORMAT,
         )?;
 
@@ -829,6 +840,7 @@ impl ShaderPipelines {
             transition_ripple,
             transition_kaleidoscope,
             fx_motion_tile_shake,
+            fx_blur_mocurves,
             fx_anime_impact_frame,
             fx_radial_shockwave,
             fx_halftone_glow,

@@ -887,3 +887,95 @@ fn vector_path_hud_bezier_trim_dash_dots_and_data_readout() {
         "node dots + data_label should add visible pixels over bare path"
     );
 }
+
+#[test]
+fn vector_text_node_animator_shapes_rotation_tracking_and_opacity() {
+    use frameshift_schema::{TextAnimatorDef, TextRangeShape, TextSelectorUnit, WritingMode2D};
+    use frameshift_time::FLICKS_PER_SECOND;
+
+    let make_node = |shape: TextRangeShape, rotation_deg_from: f32, tracking_em_from: f32, randomize_seed: Option<u64>| NodeKind::VectorText {
+        text: "SHIFT".into(),
+        font_size_norm: 0.25,
+        color_rgba: [1.0, 1.0, 1.0, 1.0],
+        outline_rgba: [0.0; 4],
+        outline_width_norm: 0.0,
+        align_center: true,
+        y_offset_norm: 0.5,
+        font_family: None,
+        font_path: None,
+        font_weight: 400,
+        align: Some(TextAlign2D::Center),
+        x_offset_norm: None,
+        tracking_em: Some(0.05),
+        line_height_em: None,
+        opacity: 1.0,
+        fallback_fonts: vec![],
+        writing_mode: WritingMode2D::HorizontalTb,
+        var_wght: None,
+        var_wdth: None,
+        var_slnt: None,
+        color_bottom_rgba: None,
+        gradient_angle_deg: 0.0,
+        outer_outline_rgba: [0.0; 4],
+        outer_outline_width_norm: 0.0,
+        outline_gap_norm: 0.0,
+        shadow_offset_norm: [0.0; 2],
+        shadow_blur_norm: 0.0,
+        shadow_rgba: [0.0; 4],
+        glow_radius_norm: 0.0,
+        glow_rgba: [0.0; 4],
+        hdr_intensity: 1.0,
+        gpu_slug: false,
+        text_animator: Some(TextAnimatorDef {
+            unit: TextSelectorUnit::Grapheme,
+            range_start: 0,
+            range_end: Some(5),
+            start_tick: 0,
+            duration_ticks: FLICKS_PER_SECOND,
+            delay_ticks: FLICKS_PER_SECOND / 10,
+            position_from_norm: [0.0, 0.1],
+            scale_from: 1.25,
+            opacity_from: 0.2,
+            rotation_deg_from,
+            tracking_em_from,
+            shape,
+            ease_high: 60.0,
+            ease_low: 20.0,
+            randomize_seed,
+        }),
+    };
+
+    let sq = render_vector_text_node_rgba16f(
+        &make_node(TextRangeShape::Square, -20.0, 0.3, None),
+        240,
+        120,
+        Flicks(FLICKS_PER_SECOND / 4),
+    )
+    .unwrap();
+    let tri = render_vector_text_node_rgba16f(
+        &make_node(TextRangeShape::Triangle, -20.0, 0.3, None),
+        240,
+        120,
+        Flicks(FLICKS_PER_SECOND / 4),
+    )
+    .unwrap();
+    let rand_a = render_vector_text_node_rgba16f(
+        &make_node(TextRangeShape::Smooth, -20.0, 0.3, Some(42)),
+        240,
+        120,
+        Flicks(FLICKS_PER_SECOND / 4),
+    )
+    .unwrap();
+    let rand_b = render_vector_text_node_rgba16f(
+        &make_node(TextRangeShape::Smooth, -20.0, 0.3, Some(42)),
+        240,
+        120,
+        Flicks(FLICKS_PER_SECOND / 4),
+    )
+    .unwrap();
+
+    assert_ne!(sq.fnv1a_hash64(), tri.fnv1a_hash64());
+    assert_eq!(rand_a.fnv1a_hash64(), rand_b.fnv1a_hash64());
+    assert_ne!(tri.fnv1a_hash64(), rand_a.fnv1a_hash64());
+    assert!(tri.data.iter().any(|p| p[3] > 0.2));
+}

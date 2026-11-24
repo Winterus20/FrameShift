@@ -9,7 +9,10 @@ use crate::error::CoreError;
 use crate::progress::{RenderProgress, RenderStage};
 use crate::range::RenderRange;
 use crate::report::VideoRenderSummary;
-use frameshift_media::{FfmpegBridge, FileContentIdentity, MediaProbeInfo, VideoEncodingSettings};
+use frameshift_media::{
+    ExportEncodingProfile, FfmpegBridge, FileContentIdentity, MediaProbeInfo, VideoCodec,
+    VideoEncodingSettings,
+};
 use frameshift_render::{OcioColorPipeline, OcioTransform, RenderOptions};
 use frameshift_schema::{AssetKind, LutSourceDef, NodeKind, Project, RenderProfileKind};
 use frameshift_vector::{FontQuery, ResolvedFont, resolve_font_chain};
@@ -35,6 +38,8 @@ pub struct ExportTarget {
     pub range: Option<RenderRange>,
     #[serde(default)]
     pub encoding: VideoEncodingSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_preset: Option<String>,
 }
 
 impl ExportTarget {
@@ -44,8 +49,25 @@ impl ExportTarget {
             profile,
             range: None,
             encoding: VideoEncodingSettings::default(),
+            platform_preset: None,
         }
     }
+}
+
+/// Resolves and validates an optional `ExportTarget::platform_preset` into an [`ExportEncodingProfile`].
+pub fn resolve_target_encoding_profile(
+    target: &ExportTarget,
+) -> Result<Option<ExportEncodingProfile>, CoreError> {
+    let Some(ref name) = target.platform_preset else {
+        return Ok(None);
+    };
+    let profile = ExportEncodingProfile::from_platform_name(name).ok_or_else(|| {
+        CoreError::InvalidArgument(format!(
+            "unknown platform preset '{name}'; expected tiktok_1080p60, reels_1080p30, youtube_1080p60, anime_10bit_hevc, or prores_422hq"
+        ))
+    })?;
+    profile.validate()?;
+    Ok(Some(profile))
 }
 
 /// A cloneable handle that can request cancellation while a queue worker renders.
@@ -127,6 +149,8 @@ pub struct ExportOutputReport {
     pub profile: RenderProfileKind,
     pub range: Option<RenderRange>,
     pub encoding: VideoEncodingSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_preset: Option<String>,
     pub state: ExportOutputState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<VideoRenderSummary>,
@@ -194,14 +218,18 @@ impl ExportQueue {
         let cwd = std::env::current_dir()?;
         let mut unique_outputs = std::collections::HashSet::new();
         for target in &mut normalized_targets {
+            let resolved_profile = resolve_target_encoding_profile(target)?;
+            let expected_ext = resolved_profile
+                .as_ref()
+                .map_or("mp4", |p| p.codec.default_extension());
             if target
                 .output_path
                 .extension()
                 .and_then(|v| v.to_str())
-                .is_none_or(|ext| !ext.eq_ignore_ascii_case("mp4"))
+                .is_none_or(|ext| !ext.eq_ignore_ascii_case(expected_ext))
             {
                 return Err(CoreError::InvalidArgument(format!(
-                    "export output must use .mp4: {}",
+                    "export output must use .{expected_ext}: {}",
                     target.output_path.display()
                 )));
             }
@@ -263,6 +291,7 @@ impl ExportQueue {
                 profile: target.profile,
                 range: target.range,
                 encoding: target.encoding.clone(),
+                platform_preset: target.platform_preset.clone(),
                 state: ExportOutputState::Pending,
                 summary: None,
                 probe: None,
@@ -487,6 +516,10 @@ fn render_and_publish(
             total: event.total,
         });
     };
+    let resolved_profile = resolve_target_encoding_profile(target)?;
+    let expected_codec = resolved_profile
+        .as_ref()
+        .map_or(VideoCodec::H264, |p| p.codec);
     let render_options = RenderOptions {
         output_alpha_mode: frameshift_render::OutputAlphaMode::Straight,
         ..Default::default()
@@ -494,6 +527,7 @@ fn render_and_publish(
     let render_settings = VideoRenderSettings {
         options: &render_options,
         encoding: &target.encoding,
+        encoding_profile: resolved_profile.as_ref(),
         cancel: Some(cancelled.as_ref()),
     };
     let summary = engine.render_video_mp4_cancellable(
@@ -510,7 +544,13 @@ fn render_and_publish(
     let probe_info = FfmpegBridge::probe_media_info(&staging_path)?;
     let expected_frames = summary.frame_count;
     let expected_audio = summary.has_audio;
-    let verified = probe_matches_summary(&probe_info, &summary, expected_frames, expected_audio);
+    let verified = probe_matches_summary(
+        &probe_info,
+        &summary,
+        expected_frames,
+        expected_audio,
+        expected_codec,
+    );
     if !verified {
         return Err(CoreError::VerificationFailed(format!(
             "ffprobe output mismatch for {}: expected {}x{}, {} frames, audio={}, found {}x{}, {} frames, audio={}",
@@ -537,14 +577,40 @@ fn probe_matches_summary(
     summary: &VideoRenderSummary,
     expected_frames: usize,
     expected_audio: bool,
+    expected_codec: VideoCodec,
 ) -> bool {
     probe.width == summary.width
         && probe.height == summary.height
         && probe.pts_index.len() == expected_frames
         && probe.has_audio == expected_audio
-        && probe.video_codec.as_deref() == Some("h264")
-        && (!expected_audio || probe.audio_codec.as_deref() == Some("aac"))
+        && expected_video_codec_matches(expected_codec, probe.video_codec.as_deref())
+        && (!expected_audio
+            || expected_audio_codec_matches(expected_codec, probe.audio_codec.as_deref()))
         && probe.fps.is_none_or(|fps| fps == summary.fps)
+}
+
+fn expected_video_codec_matches(expected: VideoCodec, probed: Option<&str>) -> bool {
+    let Some(codec) = probed else {
+        return false;
+    };
+    match expected {
+        VideoCodec::H264 => codec.eq_ignore_ascii_case("h264"),
+        VideoCodec::Hevc => codec.eq_ignore_ascii_case("hevc") || codec.eq_ignore_ascii_case("h265"),
+        VideoCodec::ProRes422Hq | VideoCodec::ProRes4444 => {
+            codec.eq_ignore_ascii_case("prores") || codec.to_ascii_lowercase().starts_with("prores")
+        }
+    }
+}
+
+fn expected_audio_codec_matches(expected_video: VideoCodec, probed_audio: Option<&str>) -> bool {
+    let Some(codec) = probed_audio else {
+        return false;
+    };
+    if expected_video.is_prores() {
+        codec.eq_ignore_ascii_case("pcm_s16le") || codec.to_ascii_lowercase().starts_with("pcm_")
+    } else {
+        codec.eq_ignore_ascii_case("aac")
+    }
 }
 
 fn probe_report(
@@ -633,8 +699,13 @@ impl Drop for StagingFileGuard {
 fn staging_path(output_path: &Path, job_id: &str, target_index: usize) -> PathBuf {
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
     let stage_index = STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ext = output_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty())
+        .unwrap_or("mp4");
     parent.join(format!(
-        ".frameshift-{job_id}-{target_index}-{stage_index}.mp4"
+        ".frameshift-{job_id}-{target_index}-{stage_index}.{ext}"
     ))
 }
 
@@ -1084,5 +1155,98 @@ mod tests {
             Err(CoreError::VerificationFailed(_))
         ));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_target_platform_presets_and_probe_codec_matching() {
+        use frameshift_time::PtsIndex;
+
+        // Backward-compatible deserialization without platform_preset.
+        let legacy: ExportTarget = serde_json::from_str(
+            r#"{"output_path":"out.mp4","profile":"final"}"#,
+        )
+        .expect("legacy ExportTarget deserializes");
+        assert_eq!(legacy.platform_preset, None);
+        assert!(resolve_target_encoding_profile(&legacy).unwrap().is_none());
+
+        // Valid platform presets resolve to expected VideoCodec.
+        let mut tiktok = ExportTarget::new("tiktok.mp4", RenderProfileKind::Final);
+        tiktok.platform_preset = Some("tiktok_1080p60".into());
+        assert_eq!(
+            resolve_target_encoding_profile(&tiktok).unwrap().unwrap().codec,
+            VideoCodec::H264
+        );
+
+        let mut hevc = ExportTarget::new("anime.mp4", RenderProfileKind::Final);
+        hevc.platform_preset = Some("anime_10bit_hevc".into());
+        assert_eq!(
+            resolve_target_encoding_profile(&hevc).unwrap().unwrap().codec,
+            VideoCodec::Hevc
+        );
+
+        let mut prores = ExportTarget::new("master.mov", RenderProfileKind::Final);
+        prores.platform_preset = Some("prores_422hq".into());
+        assert_eq!(
+            resolve_target_encoding_profile(&prores).unwrap().unwrap().codec,
+            VideoCodec::ProRes422Hq
+        );
+
+        // Unknown platform preset and mismatched container extension are rejected cleanly.
+        let mut bad_preset = ExportTarget::new("out.mp4", RenderProfileKind::Final);
+        bad_preset.platform_preset = Some("unknown_platform".into());
+        assert!(resolve_target_encoding_profile(&bad_preset).is_err());
+
+        let project = Project::golden_scene_preset();
+        let mut queue = ExportQueue::default();
+        let mut bad_ext = ExportTarget::new("master.mp4", RenderProfileKind::Final);
+        bad_ext.platform_preset = Some("prores_422hq".into());
+        assert!(queue.enqueue(&project, Path::new("."), vec![bad_ext]).is_err());
+
+        // Flexible probe matching across H264, HEVC, and ProRes + PCM.
+        let summary = VideoRenderSummary {
+            out_path: PathBuf::from("test.mp4"),
+            profile: RenderProfileKind::Final,
+            width: 1920,
+            height: 1080,
+            frame_count: 1,
+            fps: project.timeline.fps,
+            duration_ticks: project.timeline.duration_ticks,
+            has_audio: true,
+            range: None,
+            frame_hashes: vec![1],
+            cache_hits: 0,
+            cache_misses: 0,
+            cache_evictions: 0,
+        };
+        let pts = PtsIndex::new(vec![frameshift_time::Flicks::ZERO]).unwrap();
+        let hevc_probe = MediaProbeInfo {
+            video_codec: Some("hevc".into()),
+            audio_codec: Some("aac".into()),
+            pixel_format: Some("yuv420p10le".into()),
+            width: 1920,
+            height: 1080,
+            fps: Some(project.timeline.fps),
+            duration_ticks: Some(project.timeline.duration_ticks),
+            pts_index: pts.clone(),
+            has_audio: true,
+            audio_sample_rate: Some(48_000),
+            audio_channels: Some(2),
+        };
+        assert!(probe_matches_summary(&hevc_probe, &summary, 1, true, VideoCodec::Hevc));
+        assert!(!probe_matches_summary(&hevc_probe, &summary, 1, true, VideoCodec::H264));
+
+        let prores_probe = MediaProbeInfo {
+            video_codec: Some("prores".into()),
+            audio_codec: Some("pcm_s16le".into()),
+            pixel_format: Some("yuv422p10le".into()),
+            ..hevc_probe
+        };
+        assert!(probe_matches_summary(
+            &prores_probe,
+            &summary,
+            1,
+            true,
+            VideoCodec::ProRes422Hq
+        ));
     }
 }
