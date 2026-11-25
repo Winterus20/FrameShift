@@ -2,6 +2,8 @@
 
 **Son Güncelleme:** 2026-11-25
 
+**OpenDesign Motion Kalıpları & Stil Rehberi (2026-11-25):** Apache-2.0 lisanslı `nexu-io/open-design` deposundan HyperFrames motion guardrails (`Build/Breathe/Resolve`, easing/süre çeşitliliği), `data-in-motion` ilkeleri, 8 görsel stil arketipinin FrameShift `NodeKind`/`SafeExpr`/WGSL karşılıkları ve 286 referanslık OpenMotion kataloğu özeti [open-design-motion-patterns.md](research/open-design-motion-patterns.md) dosyasına eklendi ([günlük](log/2026-11-25-open-design-motion-integration.md)). HTML/GSAP render katmanı alınmadı.
+
 **Lufas Maphaahl × Kesha Blow (`SC-0006`, 2026-11-25):** `@_okotcu` TikTok referansı (`7554984925942811924`) incelenerek [SC-0006](style-cards/SC-0006-okotcu-dark-glow-anime-flow.md) stil kartı çıkarıldı ve *Yasei no Last Boss ga Arawareta!* (**Lufas Maphaahl**) için **1080×1080 60fps** (`16.50 sn`, `990` kare) edit FrameShift ile renderlandı: `local_media/lufas_blow/lufas_blow_final.mp4` (`43` düğüm, `15` temiz 4K/1080p kesit, `107.5 BPM` / `4.88s` ana drop, sıfır bindirmeli beat-locked hard-cut + `BlurMoCurves` whip/zoom ramp + `MotionTileShake` zoom-punch + `OpticalFlowBlur` + `DeepGlow` + `RadialShockwave` + `FilmOptics`; `lint` 0 hata, `ffprobe` 990 kare @ 60fps + AAC, `blackdetect` 0 siyah segment ve `final_sheet_v2_4fps.png` görsel doğrulaması PASS; [günlük](log/2026-11-25-lufas-maphaahl-kesha-blow.md)).
 
 **Anime & Raw Clip Arama Kaynakları (2026-11-25):** Ajanların editler için ham klip, sakuga ve Twixtor scene pack ararken sırayla tarayacağı 5 kaynak (Sakugabooru, Animédia/AnimeClipsRaw, RingWitDaTwixtor, Hii Twixtor, 411 Scenepacks) kök [CLAUDE.md](../CLAUDE.md) ve [AGENTS.md](../AGENTS.md) belgelerine eklendi ([günlük](log/2026-11-25-anime-clip-sources.md)).

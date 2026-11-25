@@ -17,7 +17,23 @@ impl GpuContext {
     /// Tries a high-performance hardware adapter first, then any available adapter,
     /// and finally falls back to a software/WARP adapter if needed.
     pub fn new_headless() -> Result<Self, RenderError> {
-        let instance = wgpu::Instance::default();
+        // Optional explicit backend selection for headless/CI machines where the
+        // OpenGL adapter is enumerated before a working Vulkan software adapter.
+        // Example: `FRAMESHIFT_WGPU_BACKEND=vulkan`.
+        let backends = match std::env::var("FRAMESHIFT_WGPU_BACKEND")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "vulkan" | "vk" => wgpu::Backends::VULKAN,
+            "gl" | "gles" | "opengl" => wgpu::Backends::GL,
+            "metal" => wgpu::Backends::METAL,
+            "dx12" => wgpu::Backends::DX12,
+            _ => wgpu::Backends::all(),
+        };
+        let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_descriptor.backends = backends;
+        let instance = wgpu::Instance::new(instance_descriptor);
 
         let adapter = pollster::block_on(request_headless_adapter(&instance))?;
         let adapter_info = adapter.get_info();
